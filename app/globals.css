@@ -1,0 +1,173 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #f8fafc;
+  --foreground: #111827;
+  --card: #ffffff;
+  --card-foreground: #111827;
+  --popover: #ffffff;
+  --popover-foreground: #111827;
+  --primary: #0f766e;
+  --primary-foreground: #ffffff;
+  --secondary: #e5e7eb;
+  --secondary-foreground: #111827;
+  --muted: #eef2f7;
+  --muted-foreground: #64748b;
+  --accent: #ff8a33;
+  --accent-foreground: #111827;
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+  --border: #d8dee8;
+  --input: #ffffff;
+  --ring: #0f766e;
+  --chart-1: #0f766e;
+  --chart-2: #2563eb;
+  --chart-3: #9333ea;
+  --chart-4: #ca8a04;
+  --chart-5: #dc2626;
+  --radius: 0.625rem;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #111827;
+  --sidebar-primary: #0f766e;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #eef2f7;
+  --sidebar-accent-foreground: #111827;
+  --sidebar-border: #d8dee8;
+  --sidebar-ring: #0f766e;
+  --status-pending: #b45309;
+  --status-pending-bg: rgb(245 158 11 / 0.14);
+  --status-under-review: #0369a1;
+  --status-under-review-bg: rgb(14 165 233 / 0.14);
+  --status-confirmed: #dc2626;
+  --status-confirmed-bg: rgb(220 38 38 / 0.12);
+  --status-false-alarm: #2563eb;
+  --status-false-alarm-bg: rgb(37 99 235 / 0.12);
+  --status-dispatched: #7c3aed;
+  --status-dispatched-bg: rgb(124 58 237 / 0.12);
+  --status-resolved: #15803d;
+  --status-resolved-bg: rgb(21 128 61 / 0.12);
+  --status-live: #dc2626;
+  --status-live-bg: rgb(220 38 38 / 0.14);
+  --status-online: #15803d;
+  --status-online-bg: rgb(21 128 61 / 0.12);
+  --status-warning: #b45309;
+  --status-warning-bg: rgb(245 158 11 / 0.14);
+  --media-background: #0f172a;
+  --media-foreground: #f8fafc;
+  --media-muted-foreground: rgb(248 250 252 / 0.72);
+  --media-overlay: rgb(15 23 42 / 0.72);
+  --media-border: rgb(248 250 252 / 0.18);
+  --scrim: rgb(15 23 42 / 0.45);
+}
+
+.dark {
+  --background: #070707;
+  --foreground: #f5f5f5;
+  --card: #111111;
+  --card-foreground: #f5f5f5;
+  --popover: #111111;
+  --popover-foreground: #f5f5f5;
+  --primary: #ff6a00;
+  --primary-foreground: #090909;
+  --secondary: #1d1d1d;
+  --secondary-foreground: #f5f5f5;
+  --muted: #1d1d1d;
+  --muted-foreground: #9a9a9a;
+  --accent: #ff8a33;
+  --accent-foreground: #090909;
+  --destructive: #dc2626;
+  --destructive-foreground: #f5f5f5;
+  --border: #2a2a2a;
+  --input: #1a1a1a;
+  --ring: #ff6a00;
+  --chart-1: #ff6a00;
+  --chart-2: #38bdf8;
+  --chart-3: #6366f1;
+  --chart-4: #facc15;
+  --chart-5: #f59e0b;
+  --sidebar: #0b0b0b;
+  --sidebar-foreground: #f5f5f5;
+  --sidebar-primary: #ff6a00;
+  --sidebar-primary-foreground: #090909;
+  --sidebar-accent: #1d1d1d;
+  --sidebar-accent-foreground: #f5f5f5;
+  --sidebar-border: #2a2a2a;
+  --sidebar-ring: #ff6a00;
+  --status-pending: #fbbf24;
+  --status-pending-bg: rgb(251 191 36 / 0.16);
+  --status-under-review: #38bdf8;
+  --status-under-review-bg: rgb(56 189 248 / 0.16);
+  --status-confirmed: #f87171;
+  --status-confirmed-bg: rgb(248 113 113 / 0.16);
+  --status-false-alarm: #60a5fa;
+  --status-false-alarm-bg: rgb(96 165 250 / 0.16);
+  --status-dispatched: #c084fc;
+  --status-dispatched-bg: rgb(192 132 252 / 0.16);
+  --status-resolved: #4ade80;
+  --status-resolved-bg: rgb(74 222 128 / 0.16);
+  --status-live: #f87171;
+  --status-live-bg: rgb(248 113 113 / 0.18);
+  --status-online: #4ade80;
+  --status-online-bg: rgb(74 222 128 / 0.16);
+  --status-warning: #fbbf24;
+  --status-warning-bg: rgb(251 191 36 / 0.16);
+  --media-background: #050505;
+  --media-foreground: #f5f5f5;
+  --media-muted-foreground: rgb(245 245 245 / 0.72);
+  --media-overlay: rgb(0 0 0 / 0.68);
+  --media-border: rgb(245 245 245 / 0.16);
+  --scrim: rgb(0 0 0 / 0.56);
+}
+
+@theme inline {
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Cascadia Code', Consolas, 'Liberation Mono', monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}

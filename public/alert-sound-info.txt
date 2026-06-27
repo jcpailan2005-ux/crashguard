@@ -1,0 +1,12 @@
+<!-- Alert Sound Placeholder
+This is a placeholder for the alert notification sound.
+You can replace this with a real MP3 file by uploading to public/alert-sound.mp3
+
+To generate a simple alert sound, you can use:
+1. Use an online tool like Audacity to create a beep sound
+2. Use FFmpeg: ffmpeg -f lavfi -i "sine=frequency=1000:duration=0.5" alert-sound.mp3
+3. Use any sound from a free library like Freesound.org
+4. Replace the placeholder with your chosen sound file
+
+The app will attempt to play this sound on accident detection.
+-->

@@ -1,0 +1,52 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && userDoc().data.role == "admin"
+        && userDoc().data.active == true;
+    }
+
+    function isResponder() {
+      return isSignedIn()
+        && userDoc().data.role == "responder"
+        && userDoc().data.active == true;
+    }
+
+    function sameArea(areaId) {
+      return isResponder() && userDoc().data.areaId == areaId;
+    }
+
+    match /users/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /live_camera_sessions/{areaId} {
+      allow read: if isAdmin() || sameArea(areaId);
+      allow write: if sameArea(areaId);
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isAdmin() || sameArea(resource.data.areaId);
+      allow create: if isAdmin() || sameArea(request.resource.data.areaId);
+      allow update: if isAdmin() || sameArea(resource.data.areaId);
+    }
+
+    match /incidents/{incidentId} {
+      allow read: if isAdmin() || sameArea(resource.data.areaId);
+      allow create: if isAdmin() || sameArea(request.resource.data.areaId);
+      allow update: if isAdmin() || sameArea(resource.data.areaId);
+      allow delete: if isAdmin();
+    }
+  }
+}

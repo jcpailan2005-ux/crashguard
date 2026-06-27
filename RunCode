@@ -1,0 +1,7 @@
+cd C:\Users\Lenovo\Desktop\MyCrushguard\backend
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8000
+
+
+
+cd C:\Users\Lenovo\Desktop\MyCrushguard
+npm.cmd run dev

@@ -1,0 +1,8 @@
+path: car_crash_yolo
+train: images/train
+val: images/validation
+test: images/test
+
+names:
+  0: accident
+  1: vehicle
