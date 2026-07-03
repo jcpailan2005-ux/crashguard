@@ -99,6 +99,7 @@ export default function IpCameraPage() {
   const areaId = profile?.areaId ?? 'talomo'
   const normalizedRole = String(profile?.role ?? '').toLowerCase()
   const canEditCameraSettings = normalizedRole === 'admin' && isAdvancedMode
+  const showAdvancedCameraControls = canEditCameraSettings
   const [cameras, setCameras] = useState<CctvCamera[]>([])
   const [activeCamera, setActiveCamera] = useState<CctvCamera | null>(null)
   const [form, setForm] = useState<CameraFormState>(() => emptyCameraForm(areaId))
@@ -112,6 +113,11 @@ export default function IpCameraPage() {
   const activeCameraName =
     form.cameraName.trim() || activeCamera?.label || 'Manual CCTV Camera'
   const activeCameraSource = activeCameraName
+  const activeStatusLabel = cameraError
+    ? 'Needs Attention'
+    : activeCamera
+      ? cameraStatusLabel(activeCamera)
+      : 'Offline'
   const shouldAutoStartCctv = Boolean(
     activeCamera?.isActive &&
       activeCamera.detectionEnabled &&
@@ -245,7 +251,7 @@ export default function IpCameraPage() {
           <div>
             <h1 className="mb-2 text-3xl font-bold">CCTV Monitoring</h1>
             <p className="text-muted-foreground">
-              Monitor saved traffic cameras.
+              Monitoring active traffic camera.
             </p>
           </div>
 
@@ -253,9 +259,9 @@ export default function IpCameraPage() {
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-lg font-semibold">Choose CCTV / Area</h2>
+                  <h2 className="text-lg font-semibold">Active Camera</h2>
                   <Badge variant="outline">
-                    {activeCamera ? cameraStatusLabel(activeCamera) : 'Offline'}
+                    {activeStatusLabel}
                   </Badge>
                 </div>
                 <p className="mt-1 text-sm text-muted-foreground">
@@ -265,14 +271,16 @@ export default function IpCameraPage() {
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setShowAllCameras((current) => !current)}
-                >
-                  <Grid2X2 className="mr-2 h-4 w-4" />
-                  {showAllCameras ? 'Hide All Cameras' : 'View All Cameras'}
-                </Button>
+                {showAdvancedCameraControls ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setShowAllCameras((current) => !current)}
+                  >
+                    <Grid2X2 className="mr-2 h-4 w-4" />
+                    {showAllCameras ? 'Hide All Cameras' : 'View All Cameras'}
+                  </Button>
+                ) : null}
                 <Button
                   type="button"
                   variant="outline"
@@ -296,13 +304,14 @@ export default function IpCameraPage() {
               </Alert>
             ) : null}
 
-            {cameraMessage ? (
+            {cameraMessage && (showAdvancedCameraControls || !activeCamera) ? (
               <Alert>
                 <CheckCircle2 className="h-4 w-4" />
                 <AlertDescription>{cameraMessage}</AlertDescription>
               </Alert>
             ) : null}
 
+            {showAdvancedCameraControls ? (
             <div className="grid gap-3 md:grid-cols-3">
               {cameraSlots.slice(0, showAllCameras ? undefined : 3).map(({ camera, slotNumber }) => {
                 if (!camera) {
@@ -363,6 +372,7 @@ export default function IpCameraPage() {
                 )
               })}
             </div>
+            ) : null}
 
             <div className="rounded-lg border border-border bg-background p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -375,11 +385,11 @@ export default function IpCameraPage() {
                     Area/location: {cameraLocationLabel(activeCamera, activeAreaId)}
                   </p>
                 </div>
-                <Badge variant="outline">{cameraStatusLabel(activeCamera)}</Badge>
+                <Badge variant="outline">{activeStatusLabel}</Badge>
               </div>
             </div>
 
-            {canEditCameraSettings ? (
+            {showAdvancedCameraControls ? (
               <div className="space-y-4 rounded-lg border border-dashed border-border bg-background/60 p-4">
                 <div>
                   <h3 className="font-semibold">Advanced Camera Settings</h3>

@@ -520,7 +520,9 @@ export async function testCameraConnection(
 
 export interface CameraMonitoringStatus {
   cameraId?: string | null
-  cameraIp: string
+  cameraIp?: string | null
+  monitorKey?: string | null
+  streamUrlConfigured?: boolean
   label?: string
   status:
     | 'disconnected'
@@ -566,6 +568,7 @@ export interface CameraMonitoringStatus {
   latestResult?: DetectionResponse | null
   previewAvailable?: boolean
   existingCaseMessage?: string | null
+  reconnecting?: boolean
 }
 
 export async function getCameraMonitoringStatus(
@@ -579,6 +582,10 @@ export async function getCameraMonitoringStatus(
 export function getCameraPreviewFrameUrl(cameraIp: string): string {
   const encodedIp = encodeURIComponent(cameraIp.trim())
   return `${NORMALIZED_BACKEND_URL}/api/cameras/${encodedIp}/latest-frame.jpg?t=${Date.now()}`
+}
+
+export function getCameraMjpegPreviewUrl(cameraIdOrIp: string): string {
+  return `${NORMALIZED_BACKEND_URL}/api/cameras/${encodeURIComponent(cameraIdOrIp.trim())}/preview.mjpeg`
 }
 
 export async function fetchCameraPreviewFrameObjectUrl(
@@ -638,8 +645,8 @@ export async function enableCctvCamera(cameraId: string): Promise<CctvCamera> {
   })
 }
 
-export async function startCctvMonitoring(cameraId: string): Promise<{ connected: boolean; cameraId: string; status: string }> {
-  return apiCall<{ connected: boolean; cameraId: string; status: string }>(
+export async function startCctvMonitoring(cameraId: string): Promise<CameraMonitoringStatus> {
+  return apiCall<CameraMonitoringStatus>(
     `/api/cameras/${encodeURIComponent(cameraId)}/monitor/start`,
     { method: 'POST' }
   )

@@ -34,6 +34,7 @@ import {
   fetchCameraPreviewFrameObjectUrl,
   getCameraMonitoringStatus,
   resolveBackendMediaUrl,
+  startCctvMonitoring,
   stopCctvMonitoring,
   testCameraConnection,
 } from '@/lib/api-client'
@@ -843,12 +844,12 @@ export function LiveCamera({
     })
   }
 
-  const stopDetection = () => {
+  const stopDetection = (stopBackend = false) => {
     if (sourceTabRef.current === 'cctv') {
       cctvAutoStartSuppressedRef.current = true
     }
 
-    if (cctvMonitorIdRef.current) {
+    if (stopBackend && cctvMonitorIdRef.current) {
       void stopCctvMonitoring(cctvMonitorIdRef.current).catch(() => {
         // The UI should still stop locally if the backend worker is already gone.
       })
@@ -891,7 +892,7 @@ export function LiveCamera({
   }
 
   const handleSourceTabChange = (value: string) => {
-    stopDetection()
+    stopDetection(false)
 
     if (stream) {
       stream.getTracks().forEach((track) => track.stop())
@@ -910,7 +911,7 @@ export function LiveCamera({
   }
 
   const stopCamera = () => {
-    stopDetection()
+    stopDetection(true)
 
     if (stream) {
       stream.getTracks().forEach((track) => track.stop())
@@ -1207,20 +1208,23 @@ export function LiveCamera({
 
   const startIpCctvMonitor = async () => {
     const cameraIp = cctvIpRef.current.trim()
-    if (!cameraIp) {
+    const savedCameraId = cameraId?.trim() ?? ''
+    if (!cameraIp && !savedCameraId) {
       return false
     }
 
     setCctvConnectionStatus('Connecting')
     const resolvedCameraName = sourceCamera ?? cameraName ?? 'CCTV Camera'
     const resolvedAreaId = areaId ?? 'demo'
-    const connection = await testCameraConnection(cameraIp, {
-      cameraId: cameraId ?? undefined,
-      label: resolvedCameraName,
-      areaId: resolvedAreaId,
-      location: resolvedCameraName,
-    })
-    const monitorId = connection.cameraId || connection.cameraIp || cameraIp
+    const connection = savedCameraId
+      ? await startCctvMonitoring(savedCameraId)
+      : await testCameraConnection(cameraIp, {
+          cameraId: cameraId ?? undefined,
+          label: resolvedCameraName,
+          areaId: resolvedAreaId,
+          location: resolvedCameraName,
+        })
+    const monitorId = connection.cameraId || connection.cameraIp || savedCameraId || cameraIp
     cctvMonitorIdRef.current = monitorId
     cctvStartedAtRef.current = Date.now()
     cctvLastFrameAtRef.current = null
@@ -1245,7 +1249,8 @@ export function LiveCamera({
 
   const startDetection = async (skipCameraBoot = false) => {
     if (sourceTabRef.current === 'cctv') {
-      if (!cctvIpRef.current.trim() && !streamUrlRef.current.trim()) {
+      const savedCameraId = cameraId?.trim() ?? ''
+      if (!savedCameraId && !cctvIpRef.current.trim() && !streamUrlRef.current.trim()) {
         const message = 'Enter a CCTV IP address or stream URL.'
         setError(message)
         onError?.(message)
@@ -1256,7 +1261,7 @@ export function LiveCamera({
         return
       }
 
-      if (cctvIpRef.current.trim()) {
+      if (savedCameraId || cctvIpRef.current.trim()) {
         try {
           await startIpCctvMonitor()
         } catch (monitorError) {
@@ -1421,6 +1426,7 @@ export function LiveCamera({
           onValueChange={handleSourceTabChange}
           className="gap-0 rounded-none border-0 bg-transparent shadow-none"
         >
+          {(!managedCctvMode || isAdvancedMode) ? (
           <div className="border-b border-border px-4 pt-4">
             <TabsList className="h-auto w-full flex-wrap justify-start gap-1 sm:w-auto">
               <TabsTrigger value="device" className="gap-1.5">
@@ -1433,6 +1439,7 @@ export function LiveCamera({
               </TabsTrigger>
             </TabsList>
           </div>
+          ) : null}
 
           <CctvVideoOverlay
             annotatedPreviewUrl={resolvedAnnotatedMediaUrl}
@@ -1680,7 +1687,11 @@ export function LiveCamera({
             {error && (
               <Alert variant="destructive">
                 <AlertTriangle className="h-4 w-4" />
-                <AlertDescription>{error}</AlertDescription>
+                <AlertDescription>
+                  {managedCctvMode && !isAdvancedMode
+                    ? 'Unable to connect. Ask admin to check this camera.'
+                    : error}
+                </AlertDescription>
               </Alert>
             )}
 
@@ -1734,6 +1745,8 @@ export function LiveCamera({
             </TabsContent>
 
             <TabsContent value="cctv" className="mt-0 space-y-4 outline-none">
+              {managedCctvMode && !isAdvancedMode ? null : (
+              <>
               {!managedCctvMode || isAdvancedMode ? (
                 <>
                   <div className="space-y-2">
@@ -1849,13 +1862,15 @@ export function LiveCamera({
                   ? 'Needs Review alerts appear when a possible crash is detected.'
                   : 'The backend reads the CCTV feed and runs crash detection in the background. Possible crashes remain pending review until a responder confirms them.'}
               </p>
+              </>
+              )}
             </TabsContent>
 
             {(!managedCctvMode || isAdvancedMode || sourceTab !== 'cctv') ? (
               <Button
                 type="button"
                 variant="secondary"
-                onClick={stopDetection}
+                onClick={() => stopDetection(true)}
                 disabled={!isDetecting}
                 className="w-full sm:w-auto"
               >

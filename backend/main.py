@@ -1369,8 +1369,9 @@ class LiveCameraMonitor:
     def __init__(
         self,
         *,
+        monitor_key: str,
         camera_id: str | None,
-        camera_ip: str,
+        camera_ip: str | None,
         stream_url: str,
         label: str,
         area_id: str | None,
@@ -1382,6 +1383,7 @@ class LiveCameraMonitor:
         redacted_stream_url: str,
         output_base: str,
     ) -> None:
+        self.monitor_key = monitor_key
         self.camera_id = camera_id
         self.camera_ip = camera_ip
         self.stream_url = stream_url
@@ -1412,6 +1414,7 @@ class LiveCameraMonitor:
         self.last_created_notification_id: str | None = None
         self.alert_blocked_reason: str | None = None
         self.active_blocking_case_id: str | None = None
+        self.reconnecting = False
         self.hit_window = deque(maxlen=max(3, LIVE_CAMERA_REQUIRED_HITS))
         self.running = False
         self.lock = threading.Lock()
@@ -1462,15 +1465,22 @@ class LiveCameraMonitor:
 
             while self.running:
                 self._set_status("reconnecting", "Reconnecting")
-                cap = cv2.VideoCapture(self.stream_url)
+                with self.lock:
+                    self.reconnecting = True
+                cap = cv2.VideoCapture()
                 try:
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, max(1, LIVE_CAMERA_BUFFER_SIZE))
+                    cap.open(self.stream_url, cv2.CAP_FFMPEG)
                     if not cap.isOpened():
                         with self.lock:
                             self.last_error = "Camera stream could not be opened."
                         time.sleep(2)
                         continue
                     self._set_status("monitoring-live", "Monitoring Live")
+                    with self.lock:
+                        self.reconnecting = False
                     while self.running:
                         ok, frame = cap.read()
                         if not ok or frame is None:
@@ -1487,6 +1497,18 @@ class LiveCameraMonitor:
                 time.sleep(1)
         finally:
             self.capture_worker_running = False
+            with self.lock:
+                self.reconnecting = False
+
+    def seed_first_frame(self, frame: np.ndarray) -> None:
+        with self.lock:
+            self.latest_frame = frame.copy()
+            self.last_frame_at = time.time()
+            self.last_error = None
+            self.reconnecting = False
+            if self.status in {"connecting", "reconnecting"}:
+                self.status = "monitoring-live"
+                self.message = "Monitoring Live"
 
     def latest_jpeg(self) -> bytes | None:
         with self.lock:
@@ -1537,7 +1559,7 @@ class LiveCameraMonitor:
             frame_height = int(self.latest_frame.shape[0]) if self.latest_frame is not None else None
             latest_frame_url = (
                 f"{self.output_base}/api/cameras/"
-                f"{quote(self.camera_id or self.camera_ip, safe='')}/latest-frame.jpg"
+                f"{quote(self.camera_id or self.camera_ip or self.monitor_key, safe='')}/latest-frame.jpg"
                 if self.latest_frame is not None
                 else None
             )
@@ -1549,9 +1571,11 @@ class LiveCameraMonitor:
                 status = "connection-lost"
                 message = "Connection Lost"
             return {
+                "monitorKey": self.monitor_key,
                 "cameraIp": self.camera_ip,
                 "cameraId": self.camera_id,
                 "label": self.label,
+                "streamUrlConfigured": bool(self.stream_url),
                 "cameraConnected": self.latest_frame is not None and status != "connection-lost",
                 "monitoringLive": status in {"monitoring-live", "possible-crash-detected", "demo"},
                 "latestFrameReceived": self.latest_frame is not None,
@@ -1562,6 +1586,11 @@ class LiveCameraMonitor:
                 "frameWidth": frame_width,
                 "frameHeight": frame_height,
                 "lastFrameTimestamp": (
+                    datetime.fromtimestamp(self.last_frame_at).isoformat()
+                    if self.last_frame_at is not None
+                    else None
+                ),
+                "lastFrameAt": (
                     datetime.fromtimestamp(self.last_frame_at).isoformat()
                     if self.last_frame_at is not None
                     else None
@@ -1586,6 +1615,7 @@ class LiveCameraMonitor:
                 "lastCreatedCaseId": self.last_created_case_id,
                 "lastCreatedNotificationId": self.last_created_notification_id,
                 "lastError": self.last_error,
+                "reconnecting": self.reconnecting or status == "reconnecting",
                 "latestResult": result,
                 "previewAvailable": self.latest_frame is not None,
                 "existingCaseMessage": (
@@ -1598,8 +1628,14 @@ class LiveCameraMonitor:
     def analyze_current_frame(self, *, manual: bool = False) -> dict:
         with self.lock:
             frame = None if self.latest_frame is None else self.latest_frame.copy()
+            last_frame_at = self.last_frame_at
         if frame is None:
             raise ValueError("No live camera frame is available for detection yet.")
+        if (
+            last_frame_at is not None
+            and time.time() - last_frame_at > LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS
+        ):
+            raise ValueError("Latest camera frame is stale; waiting for reconnect.")
 
         detection_frame = cv2.resize(
             frame,
@@ -1876,10 +1912,53 @@ LIVE_CAMERA_WORKERS: dict[str, LiveCameraMonitor] = {}
 LIVE_CAMERA_WORKERS_LOCK = threading.Lock()
 
 
+def live_camera_stream_key(stream_url: str | None) -> str | None:
+    if not stream_url:
+        return None
+    return f"stream:{hashlib.sha1(stream_url.strip().encode('utf-8')).hexdigest()[:16]}"
+
+
+def live_camera_worker_keys(
+    *,
+    camera_id: str | None,
+    camera_ip: str | None,
+    stream_url: str | None,
+    label: str | None = None,
+) -> list[str]:
+    keys: list[str] = []
+    for candidate in (
+        camera_id,
+        camera_ip,
+        live_camera_stream_key(stream_url),
+        f"source:{label.strip().lower()}" if label and label.strip() else None,
+    ):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    return keys
+
+
+def live_camera_primary_key(
+    *,
+    camera_id: str | None,
+    camera_ip: str | None,
+    stream_url: str | None,
+    label: str | None = None,
+) -> str:
+    keys = live_camera_worker_keys(
+        camera_id=camera_id,
+        camera_ip=camera_ip,
+        stream_url=stream_url,
+        label=label,
+    )
+    if keys:
+        return keys[0]
+    return f"stream:{uuid.uuid4().hex}"
+
+
 def start_live_camera_monitor(
     *,
     camera_id: str | None,
-    camera_ip: str,
+    camera_ip: str | None,
     stream_url: str,
     label: str,
     area_id: str | None,
@@ -1890,12 +1969,33 @@ def start_live_camera_monitor(
     location: str,
     redacted_stream_url: str,
     output_base: str,
+    first_frame: np.ndarray | None = None,
 ) -> LiveCameraMonitor:
     with LIVE_CAMERA_WORKERS_LOCK:
-        existing = LIVE_CAMERA_WORKERS.get(camera_ip)
-        if existing:
+        keys = live_camera_worker_keys(
+            camera_id=camera_id,
+            camera_ip=camera_ip,
+            stream_url=stream_url,
+            label=label,
+        )
+        primary_key = live_camera_primary_key(
+            camera_id=camera_id,
+            camera_ip=camera_ip,
+            stream_url=stream_url,
+            label=label,
+        )
+        existing_workers = {
+            LIVE_CAMERA_WORKERS[key]
+            for key in keys
+            if key in LIVE_CAMERA_WORKERS
+        }
+        for existing in existing_workers:
             existing.stop()
+        for key, worker in list(LIVE_CAMERA_WORKERS.items()):
+            if worker in existing_workers:
+                LIVE_CAMERA_WORKERS.pop(key, None)
         worker = LiveCameraMonitor(
+            monitor_key=primary_key,
             camera_id=camera_id,
             camera_ip=camera_ip,
             stream_url=stream_url,
@@ -1909,21 +2009,32 @@ def start_live_camera_monitor(
             redacted_stream_url=redacted_stream_url,
             output_base=output_base,
         )
-        LIVE_CAMERA_WORKERS[camera_ip] = worker
+        for key in keys or [primary_key]:
+            LIVE_CAMERA_WORKERS[key] = worker
+        if primary_key not in LIVE_CAMERA_WORKERS:
+            LIVE_CAMERA_WORKERS[primary_key] = worker
+        if first_frame is not None:
+            worker.seed_first_frame(first_frame)
         worker.start()
         return worker
 
 
-def get_live_camera_monitor(camera_ip: str) -> LiveCameraMonitor | None:
-    return LIVE_CAMERA_WORKERS.get(validate_camera_ip(camera_ip))
+def get_live_camera_monitor(identifier: str) -> LiveCameraMonitor | None:
+    if identifier in LIVE_CAMERA_WORKERS:
+        return LIVE_CAMERA_WORKERS[identifier]
+    try:
+        return LIVE_CAMERA_WORKERS.get(validate_camera_ip(identifier))
+    except ValueError:
+        return None
 
 
 def get_requested_or_default_monitor(camera_ip: str | None = None) -> LiveCameraMonitor | None:
     if camera_ip:
         return get_live_camera_monitor(camera_ip)
     with LIVE_CAMERA_WORKERS_LOCK:
-        if len(LIVE_CAMERA_WORKERS) == 1:
-            return next(iter(LIVE_CAMERA_WORKERS.values()))
+        unique_workers = list({id(worker): worker for worker in LIVE_CAMERA_WORKERS.values()}.values())
+        if len(unique_workers) == 1:
+            return unique_workers[0]
     return None
 
 
@@ -2869,6 +2980,7 @@ def _test_camera_connection_sync(body: CameraConnectionIn, output_base: str) -> 
         location=location,
         redacted_stream_url=build_redacted_camera_stream_label(camera_ip),
         output_base=output_base,
+        first_frame=frame,
     )
     return {
         "connected": True,
@@ -2929,13 +3041,36 @@ def resolve_camera_identifier(identifier: str) -> dict | None:
 
 
 def monitor_for_camera(camera: dict) -> LiveCameraMonitor | None:
+    for key in live_camera_worker_keys(
+        camera_id=camera.get("cameraId"),
+        camera_ip=camera.get("cameraIp"),
+        stream_url=camera.get("streamUrl"),
+        label=camera.get("label"),
+    ):
+        worker = get_live_camera_monitor(key)
+        if worker:
+            return worker
     camera_ip = camera.get("cameraIp")
-    if not camera_ip:
-        return None
-    try:
-        return get_live_camera_monitor(camera_ip)
-    except ValueError:
-        return None
+    return get_live_camera_monitor(camera_ip) if camera_ip else None
+
+
+def stop_live_camera_monitor(worker: LiveCameraMonitor) -> None:
+    worker.stop()
+    with LIVE_CAMERA_WORKERS_LOCK:
+        for key, candidate in list(LIVE_CAMERA_WORKERS.items()):
+            if candidate is worker:
+                LIVE_CAMERA_WORKERS.pop(key, None)
+
+
+def resolve_saved_camera_stream(camera: dict) -> tuple[str, str | None]:
+    camera_ip = camera.get("cameraIp")
+    if camera_ip:
+        return build_tapo_rtsp_url(camera_ip), camera_ip
+    stream_url = (camera.get("streamUrl") or "").strip()
+    if stream_url:
+        validate_stream_url(stream_url)
+        return stream_url, None
+    raise ValueError("Camera stream is not configured.")
 
 
 @app.post("/api/cameras/{camera_id}/monitor/start")
@@ -2945,17 +3080,10 @@ async def api_start_camera_monitor(camera_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Camera is inactive.")
     if not camera.get("detectionEnabled"):
         raise HTTPException(status_code=400, detail="Detection is disabled for this camera.")
-    camera_ip = camera.get("cameraIp")
-    stream_url = None
-    if camera_ip and camera_ip.count(".") == 3:
-        try:
-            stream_url = build_tapo_rtsp_url(camera_ip)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-    elif camera.get("streamUrl"):
-        stream_url = camera["streamUrl"]
-    if not stream_url or not camera_ip:
-        raise HTTPException(status_code=400, detail="Camera stream is not configured.")
+    try:
+        stream_url, camera_ip = resolve_saved_camera_stream(camera)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     try:
         frame = await asyncio.to_thread(grab_frame_from_stream_url, stream_url)
     except ValueError as error:
@@ -2971,18 +3099,24 @@ async def api_start_camera_monitor(camera_id: str, request: Request):
         latitude=camera.get("latitude"),
         longitude=camera.get("longitude"),
         location=camera.get("location") or camera.get("locationDescription") or camera.get("roadName") or camera["label"],
-        redacted_stream_url=camera.get("streamUrl") or build_redacted_camera_stream_label(camera_ip),
+        redacted_stream_url=(
+            build_redacted_camera_stream_label(camera_ip)
+            if camera_ip
+            else stream_source_label(stream_url)
+        ),
         output_base=str(request.base_url).rstrip("/"),
+        first_frame=frame,
     )
-    upsert_camera({**camera, "status": "connected"})
-    return {
-        "connected": True,
-        "cameraId": camera["cameraId"],
-        "label": camera["label"],
-        "width": int(frame.shape[1]),
-        "height": int(frame.shape[0]),
-        "status": worker.snapshot_status()["status"],
-    }
+    upsert_camera({
+        **camera,
+        "cameraIp": camera_ip,
+        "streamUrl": camera.get("streamUrl") or (build_redacted_camera_stream_label(camera_ip) if camera_ip else stream_url),
+        "status": "monitoring",
+        "isActive": True,
+        "detectionEnabled": True,
+        "updatedAt": datetime.now().isoformat(),
+    })
+    return worker.snapshot_status()
 
 
 @app.post("/api/cameras/{camera_id}/monitor/stop")
@@ -2990,8 +3124,8 @@ def api_stop_camera_monitor(camera_id: str, request: Request):
     _, camera = require_camera_access(request, camera_id)
     worker = monitor_for_camera(camera)
     if worker:
-        worker.stop()
-    upsert_camera({**camera, "status": "offline"})
+        stop_live_camera_monitor(worker)
+    upsert_camera({**camera, "status": "offline", "updatedAt": datetime.now().isoformat()})
     return {"ok": True, "cameraId": camera_id, "status": "offline"}
 
 
@@ -3060,6 +3194,24 @@ def api_live_camera_latest_frame(camera_identifier: str, request: Request):
     return Response(
         content=image_bytes,
         media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/cameras/{camera_identifier}/preview.mjpeg")
+def api_live_camera_preview_mjpeg(camera_identifier: str, request: Request):
+    user = verify_firebase_user(request)
+    camera = resolve_camera_identifier(camera_identifier)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    if not can_access_camera(user, camera):
+        raise HTTPException(status_code=403, detail="You are not authorized to access this camera.")
+    worker = monitor_for_camera(camera)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Camera is not connected.")
+    return StreamingResponse(
+        worker.mjpeg_stream(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-store"},
     )
 
