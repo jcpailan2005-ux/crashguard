@@ -379,13 +379,13 @@ export default function LiveMapPage() {
       <div className="flex-1 md:ml-0">
         <DashboardHeader />
 
-        <main className="grid min-h-[calc(100vh-96px)] gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_24rem] lg:p-6">
-          <section className="min-h-[22rem] overflow-hidden rounded-md border border-border lg:min-h-0">
+        <main className="grid min-h-[calc(100vh-96px)] gap-4 overflow-x-hidden p-4 lg:grid-cols-[minmax(0,1fr)_24rem] lg:p-6">
+          <section className="relative z-0 min-h-[22rem] overflow-hidden rounded-md border border-border lg:h-full lg:min-h-0">
             <MapComponent cases={visibleCases} selectedCase={selectedCase} />
           </section>
 
-          <aside className="flex min-w-0 flex-col gap-4">
-            <div>
+          <aside className="relative z-20 flex min-w-0 flex-col gap-4 lg:max-h-[calc(100vh-144px)] lg:overflow-hidden">
+            <div className="shrink-0">
               <h1 className="text-xl font-bold">Map Evidence Review</h1>
               <p className="text-sm text-muted-foreground">
                 Review location, camera context, and detection media before confirming.
@@ -407,9 +407,9 @@ export default function LiveMapPage() {
             ) : null}
 
             {loading ? (
-              <Card className="p-4 text-center text-muted-foreground">Loading cases...</Card>
+              <Card className="relative z-30 p-4 text-center text-muted-foreground">Loading cases...</Card>
             ) : !selectedCase ? (
-              <Card className="p-5">
+              <Card className="relative z-30 min-h-0 overflow-y-auto p-5 lg:flex-1">
                 <div className="mb-4 flex items-center gap-2">
                   <MapPin className="h-5 w-5 text-muted-foreground" />
                   <p className="font-semibold">Select a possible crash</p>
@@ -436,13 +436,13 @@ export default function LiveMapPage() {
               </Card>
             ) : (
               <>
-                <Card className="space-y-4 border border-border p-4">
+                <Card className="relative z-30 min-h-0 space-y-4 overflow-y-auto border border-border p-4 lg:flex-1">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="text-sm text-muted-foreground">
                         Case {shortCaseId(selectedCase.caseId)}
                       </p>
-                      <h2 className="truncate text-lg font-semibold">
+                      <h2 className="break-words text-lg font-semibold [overflow-wrap:anywhere]">
                         {selectedCase.location.label}
                       </h2>
                     </div>
@@ -506,7 +506,7 @@ export default function LiveMapPage() {
                       <Video className="h-4 w-4 text-muted-foreground" />
                       <p className="font-medium">Camera / Source Context</p>
                     </div>
-                    <p className="mt-1 text-sm text-muted-foreground">
+                    <p className="mt-1 break-words text-sm text-muted-foreground [overflow-wrap:anywhere]">
                       {selectedCase.media.source.replace('-', ' ')}
                       {selectedCase.media.sourceFile ? `: ${selectedCase.media.sourceFile}` : ''}
                     </p>
@@ -516,7 +516,7 @@ export default function LiveMapPage() {
                     </p>
                   </div>
 
-                  <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="grid min-w-0 gap-2 sm:grid-cols-2">
                     <Button
                       type="button"
                       disabled={!canDecide || deciding != null}
@@ -538,7 +538,7 @@ export default function LiveMapPage() {
                     </Button>
                   </div>
 
-                  <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="grid min-w-0 gap-2 sm:grid-cols-2">
                     {media.fullUrl ? (
                       <Button asChild variant="outline">
                         <a href={media.fullUrl} target="_blank" rel="noreferrer">
@@ -559,7 +559,7 @@ export default function LiveMapPage() {
                   ) : null}
                 </Card>
 
-                <Card className="max-h-56 overflow-y-auto border border-border p-3">
+                <Card className="relative z-30 max-h-56 shrink-0 overflow-y-auto border border-border p-3">
                   <p className="mb-2 font-semibold">Active Map Queue</p>
                   <div className="space-y-2">
                     {activeCases.map((caseItem) => (
@@ -573,8 +573,8 @@ export default function LiveMapPage() {
                             : 'border-border hover:bg-muted/50'
                         }`}
                       >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="truncate">{caseItem.location.label}</span>
+                        <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                          <span className="min-w-0 flex-1 truncate">{caseItem.location.label}</span>
                           <Badge className={getCaseStatusClass(caseItem.status)} variant="outline">
                             {getCaseStatusLabel(caseItem.status)}
                           </Badge>

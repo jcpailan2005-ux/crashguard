@@ -109,5 +109,5 @@ export default function LiveMap({ cases, selectedCase }: LiveMapProps) {
     }
   }, [cases, selectedCase])
 
-  return <div id="map" className="h-full w-full" />
+  return <div id="map" className="relative z-0 h-full w-full" />
 }
