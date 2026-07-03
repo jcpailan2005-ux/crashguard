@@ -1272,7 +1272,7 @@ export function LiveCamera({
     if (sourceTabRef.current === 'cctv') {
       const savedCameraId = cameraId?.trim() ?? ''
       if (!savedCameraId && !cctvIpRef.current.trim() && !streamUrlRef.current.trim()) {
-        const message = 'Enter a CCTV IP address or stream URL.'
+        const message = 'Enter a CCTV IP address or source.'
         setError(message)
         onError?.(message)
         return
@@ -1288,8 +1288,8 @@ export function LiveCamera({
         } catch (monitorError) {
           const detail = monitorError instanceof Error ? monitorError.message : ''
           const message = detail
-            ? `Unable to connect to CCTV stream. Check camera IP/stream URL. ${detail}`
-            : 'Unable to connect to CCTV stream. Check camera IP/stream URL.'
+            ? `Unable to connect to CCTV stream. Check camera IP/source. ${detail}`
+            : 'Unable to connect to CCTV stream. Check camera IP/source.'
           setCctvConnectionStatus('Connection failed')
           setError(message)
           onError?.(message)
@@ -1302,7 +1302,7 @@ export function LiveCamera({
       setIsDetecting(true)
       cctvStartedAtRef.current = Date.now()
       cctvLastFrameAtRef.current = null
-      setCctvConnectionStatus('Monitoring stream URL')
+      setCctvConnectionStatus('Monitoring CCTV source')
       setCctvFrameError('')
       setError('')
       await runDetectionFrame()
@@ -1404,7 +1404,7 @@ export function LiveCamera({
     sourceTab === 'cctv'
       ? managedCctvMode
         ? 'Choose an available CCTV and start monitoring.'
-        : 'Enter a stream URL below. The backend pulls frames (same model as uploads).'
+        : 'Enter a CCTV source below. The backend pulls frames (same model as uploads).'
       : 'Start the device camera; live detection runs automatically.'
   const crashAlertReviewCaseId = crashAlert ? getCrashAlertReviewCaseId(crashAlert) : null
   const crashAlertReviewHref = crashAlertReviewCaseId
@@ -1458,7 +1458,7 @@ export function LiveCamera({
               </TabsTrigger>
               <TabsTrigger value="cctv" className="gap-1.5">
                 <Link2 className="size-4" />
-                CCTV / stream URL
+                CCTV source
               </TabsTrigger>
             </TabsList>
           </div>
@@ -1521,16 +1521,12 @@ export function LiveCamera({
                   <div className="px-6 text-center text-sm text-[var(--media-muted-foreground)]">
                     <p className="font-medium text-[var(--media-foreground)]">
                       {cctvFrameError
-                        ? managedCctvMode && !isAdvancedMode
-                          ? 'Unable to load CCTV frame'
-                          : cctvFrameError
+                        ? 'Camera preview unavailable'
                         : 'Loading camera feed'}
                     </p>
                     <p className="mt-1">
                       {cctvFrameError
-                        ? managedCctvMode && !isAdvancedMode
-                          ? 'Ask admin to check this camera.'
-                          : 'Check camera connection and frame preview status.'
+                        ? 'Monitoring may still be running in the backend.'
                         : 'Waiting for the first video frame.'}
                     </p>
                   </div>
@@ -1791,10 +1787,10 @@ export function LiveCamera({
                   </div>
 
                   <div className="space-y-2">
-                    <Label htmlFor="cctv-stream-url">Stream URL</Label>
+                    <Label htmlFor="cctv-stream-url">Secure Source</Label>
                     <Input
                       id="cctv-stream-url"
-                      placeholder="Optional: rtsp://user:pass@192.168.1.100:554/stream"
+                      placeholder="Optional secure source"
                       value={streamUrl}
                       onChange={(event) => setStreamUrl(event.target.value)}
                       disabled={isCctvLive || (managedCctvMode && !isAdvancedMode)}
