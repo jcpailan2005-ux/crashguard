@@ -40,6 +40,58 @@ function isDemoCamera(camera: CctvCamera) {
   )
 }
 
+function isSensitiveCameraText(value?: string | null) {
+  const text = value?.trim()
+  if (!text) return false
+
+  return (
+    /rtsp:\/\//i.test(text) ||
+    /https?:\/\//i.test(text) ||
+    /@/.test(text) ||
+    /:554\b/i.test(text) ||
+    /\b[^\s:/]+:[^\s@/]+@/.test(text) ||
+    /crashguardadmin/i.test(text) ||
+    /cctv\s*\([^)]*(?:@|:\d{2,5}|rtsp|https?|crashguardadmin|[0-9]{1,3}(?:\.[0-9]{1,3}){3})/i.test(text)
+  )
+}
+
+function sanitizeCameraDisplayName(value?: string | null) {
+  const text = value?.trim()
+  if (!text || isSensitiveCameraText(text)) return 'CCTV'
+  return text
+}
+
+function sanitizeCameraLocation(value?: string | null) {
+  const text = value?.trim()
+  if (!text || isSensitiveCameraText(text)) return null
+  return text
+}
+
+function safeCameraName(camera: CctvCamera | null) {
+  if (!camera) return 'CCTV'
+  const rawCameraName = (camera as CctvCamera & { cameraName?: string | null }).cameraName
+  const safeLabel = camera.label && !isSensitiveCameraText(camera.label)
+    ? sanitizeCameraDisplayName(camera.label)
+    : null
+  const safeName = rawCameraName && !isSensitiveCameraText(rawCameraName)
+    ? sanitizeCameraDisplayName(rawCameraName)
+    : null
+  return safeLabel ?? safeName ?? 'CCTV'
+}
+
+function safeCameraLocation(camera: CctvCamera | null) {
+  if (!camera) return 'Not specified'
+
+  return (
+    sanitizeCameraLocation(camera.areaId) ??
+    sanitizeCameraLocation(camera.barangay) ??
+    sanitizeCameraLocation(camera.roadName) ??
+    sanitizeCameraLocation(camera.locationDescription) ??
+    sanitizeCameraLocation(camera.location) ??
+    'Not specified'
+  )
+}
+
 function emptyCameraForm(areaId: string): CameraFormState {
   return {
     cameraId: '',
@@ -54,12 +106,12 @@ function emptyCameraForm(areaId: string): CameraFormState {
 function cameraToForm(camera: CctvCamera, fallbackAreaId: string): CameraFormState {
   return {
     cameraId: camera.cameraId,
-    cameraName: camera.label,
+    cameraName: safeCameraName(camera),
     cameraIp: camera.cameraIp ?? '',
     // IP cameras use backend camera credentials, so avoid showing the redacted RTSP label as editable input.
     streamUrl: camera.cameraIp ? '' : camera.streamUrl ?? '',
     areaId: camera.areaId ?? fallbackAreaId,
-    location: camera.location ?? camera.locationDescription ?? camera.roadName ?? '',
+    location: safeCameraLocation(camera),
   }
 }
 
@@ -75,8 +127,8 @@ function pickDefaultCamera(cameras: CctvCamera[], areaId: string) {
 }
 
 function cameraLocationLabel(camera: CctvCamera | null, fallbackAreaId: string) {
-  if (!camera) return fallbackAreaId
-  return camera.location ?? camera.locationDescription ?? camera.roadName ?? camera.areaId ?? fallbackAreaId
+  if (!camera) return 'Not specified'
+  return safeCameraLocation(camera)
 }
 
 function cameraStatusLabel(camera: CctvCamera | null) {
@@ -111,7 +163,11 @@ export default function IpCameraPage() {
 
   const activeAreaId = form.areaId.trim() || activeCamera?.areaId || areaId
   const activeCameraName =
-    form.cameraName.trim() || activeCamera?.label || 'Manual CCTV Camera'
+    form.cameraName.trim()
+      ? sanitizeCameraDisplayName(form.cameraName)
+      : activeCamera
+        ? safeCameraName(activeCamera)
+        : 'Manual CCTV Camera'
   const activeCameraSource = activeCameraName
   const activeStatusLabel = cameraError
     ? 'Needs Attention'
@@ -158,7 +214,7 @@ export default function IpCameraPage() {
 
       if (defaultCamera) {
         applyCamera(defaultCamera)
-        setCameraMessage(`Monitoring ${defaultCamera.label}`)
+        setCameraMessage(`Monitoring ${safeCameraName(defaultCamera)}`)
         window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(defaultCamera))
       } else {
         applyCamera(null)
@@ -233,7 +289,7 @@ export default function IpCameraPage() {
         return [saved, ...withoutSaved]
       })
       window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(saved))
-      setCameraMessage(`Saved camera: ${saved.label}`)
+      setCameraMessage(`Saved camera: ${safeCameraName(saved)}`)
     } catch (error) {
       setCameraError(error instanceof Error ? error.message : 'Could not save camera.')
     } finally {
@@ -266,7 +322,7 @@ export default function IpCameraPage() {
                 </div>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {activeCamera
-                    ? `${activeCamera.label} - ${cameraLocationLabel(activeCamera, activeAreaId)}`
+                    ? safeCameraName(activeCamera)
                     : 'No saved CCTV cameras yet. Ask admin to add cameras.'}
                 </p>
               </div>
@@ -355,7 +411,7 @@ export default function IpCameraPage() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <p className="truncate font-semibold">{camera.label}</p>
+                        <p className="truncate font-semibold">{safeCameraName(camera)}</p>
                         <p className="mt-1 flex items-center gap-1 text-sm text-muted-foreground">
                           <MapPin className="h-3.5 w-3.5" />
                           <span className="truncate">{cameraLocationLabel(camera, areaId)}</span>
@@ -468,7 +524,7 @@ export default function IpCameraPage() {
                 </div>
                 <p className="mt-1 text-muted-foreground">
                   {activeCamera
-                    ? `${activeCamera.label} - ${activeCamera.areaId ?? activeAreaId}`
+                    ? `${safeCameraName(activeCamera)} - ${cameraLocationLabel(activeCamera, activeAreaId)}`
                     : savedCameraCount > 0
                       ? 'Edit or save these values to make them the default.'
                       : 'No saved camera yet. Manual CCTV input still works below.'}

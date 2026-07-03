@@ -136,6 +136,27 @@ function getUnexpectedLabels(detections: DetectionResponse['detections']): strin
   return unique.filter((label) => normalizeProjectLabel(label) === null)
 }
 
+function isSensitiveCameraDisplayText(value?: string | null) {
+  const text = value?.trim()
+  if (!text) return false
+
+  return (
+    /rtsp:\/\//i.test(text) ||
+    /https?:\/\//i.test(text) ||
+    /@/.test(text) ||
+    /:554\b/i.test(text) ||
+    /\b[^\s:/]+:[^\s@/]+@/.test(text) ||
+    /crashguardadmin/i.test(text) ||
+    /cctv\s*\([^)]*(?:@|:\d{2,5}|rtsp|https?|crashguardadmin|[0-9]{1,3}(?:\.[0-9]{1,3}){3})/i.test(text)
+  )
+}
+
+function sanitizeCameraDisplayText(value?: string | null, fallback = 'CCTV') {
+  const text = value?.trim()
+  if (!text || isSensitiveCameraDisplayText(text)) return fallback
+  return text
+}
+
 function getCameraErrorMessage(error: unknown): string {
   if (!(error instanceof DOMException)) {
     return error instanceof Error ? error.message : 'Failed to access the camera.'
@@ -1390,14 +1411,16 @@ export function LiveCamera({
     ? `/dashboard/map?caseId=${encodeURIComponent(crashAlertReviewCaseId)}`
     : null
   const crashAlertCameraLabel = crashAlert
-    ? crashAlert.result.sourceCamera ??
-      crashAlert.result.cameraName ??
-      sourceCamera ??
-      cameraName ??
-      (sourceTab === 'cctv' ? 'CCTV Camera' : 'Device Live Camera')
+    ? sanitizeCameraDisplayText(
+        crashAlert.result.sourceCamera ??
+          crashAlert.result.cameraName ??
+          sourceCamera ??
+          cameraName,
+        sourceTab === 'cctv' ? 'CCTV' : 'Device Live Camera'
+      )
     : ''
   const crashAlertArea = crashAlert
-    ? crashAlert.result.areaId ?? areaId ?? 'demo'
+    ? sanitizeCameraDisplayText(crashAlert.result.areaId ?? areaId, 'Not specified')
     : ''
   const crashAlertConfidence = crashAlert
     ? getHighestDetectionConfidence(crashAlert.result)

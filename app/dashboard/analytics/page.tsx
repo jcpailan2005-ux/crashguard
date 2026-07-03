@@ -45,12 +45,15 @@ function formatDuration(seconds: number | null) {
 
 export default function AnalyticsPage() {
   const { profile } = useAuth()
+  const isAdmin = profile?.role === 'admin'
   const [summary, setSummary] = useState<AnalyticsSummary | null>(null)
   const [monthly, setMonthly] = useState<MonthlyAnalyticsPoint[]>([])
   const [areas, setAreas] = useState<AreaAnalyticsPoint[]>([])
   const [error, setError] = useState('')
 
   useEffect(() => {
+    if (!isAdmin) return
+
     Promise.all([
       getAnalyticsSummary(),
       getMonthlyAnalytics(),
@@ -65,7 +68,7 @@ export default function AnalyticsPage() {
       .catch((loadError) => {
         setError(loadError instanceof Error ? loadError.message : 'Could not load analytics.')
       })
-  }, [])
+  }, [isAdmin])
 
   const decisionData = useMemo(
     () => [
@@ -75,7 +78,7 @@ export default function AnalyticsPage() {
     [summary]
   )
 
-  if (profile?.role !== 'admin') {
+  if (!isAdmin) {
     return <PermissionMessage />
   }
 

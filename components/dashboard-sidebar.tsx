@@ -89,7 +89,7 @@ export function Sidebar() {
     ? navItems.filter((item) => item.href === '/samples')
     : responderArea
       ? navItems.filter((item) =>
-          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/dashboard/analytics', '/samples'].includes(
+          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/samples'].includes(
             item.href
           )
         )
