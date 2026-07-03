@@ -49,7 +49,7 @@ const navItems: NavItem[] = [
   { name: 'Analytics', href: '/dashboard/analytics', icon: <BarChart3 className="w-5 h-5" /> },
   { name: 'Settings', href: '/dashboard/settings', icon: <Settings className="w-5 h-5" /> },
   {
-    name: 'CCTV Samples',
+    name: 'CCTV',
     href: '/samples',
     icon: <ImageIcon className="w-5 h-5" />,
     children: [
