@@ -68,6 +68,7 @@ function SamplesPageContent() {
   const lastLiveSessionPublishAtRef = useRef(0)
 
   const { toast } = useToast()
+  const isResponder = profile?.role === 'responder'
   const responderArea = profile?.role === 'responder' ? profile.areaId : null
   const canReviewIncidents = isDashboardRole(profile?.role)
   const canReadLiveSessions = profile?.role === 'admin' || Boolean(responderArea)
@@ -79,10 +80,15 @@ function SamplesPageContent() {
       : 'talomo')
 
   useEffect(() => {
-    if (responderArea && requestedArea !== responderArea) {
-      router.replace(`/samples?area=${responderArea}`)
+    if (isResponder) {
+      router.replace(
+        responderArea
+          ? `/dashboard/ip-camera?area=${responderArea}`
+          : '/dashboard/ip-camera'
+      )
+      return
     }
-  }, [requestedArea, responderArea, router])
+  }, [isResponder, responderArea, router])
 
   const visibleLocationTabs = useMemo(() => {
     if (!responderArea) return LOCATION_TABS
@@ -251,6 +257,10 @@ function SamplesPageContent() {
   }
 
   if (!firebaseUser || !profile || !profile.active) {
+    return null
+  }
+
+  if (isResponder) {
     return null
   }
 

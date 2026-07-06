@@ -90,7 +90,7 @@ export function Sidebar() {
     ? navItems.filter((item) => item.href === '/samples')
     : isResponder
       ? navItems.filter((item) =>
-          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/samples', '/dashboard/settings'].includes(
+          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/dashboard/settings'].includes(
             item.href
           )
         )

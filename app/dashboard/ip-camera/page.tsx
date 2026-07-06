@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, MapPin, RefreshCw, Save, Video } from 'lucide-react'
+import { AlertTriangle, MapPin, Plus, RefreshCw, Save, Video } from 'lucide-react'
 
 import { Sidebar } from '@/components/dashboard-sidebar'
 import { LiveCamera } from '@/components/live-camera'
@@ -9,6 +9,12 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useAuth } from '@/components/auth-provider'
@@ -34,6 +40,11 @@ type CameraFormState = {
 type CameraSlot = {
   camera: CctvCamera | null
   slotNumber: number
+}
+
+type AddCameraFormState = {
+  streamUrl: string
+  location: string
 }
 
 const CAMERA_CACHE_KEY = 'mycrushguard.savedCctvCamera'
@@ -90,11 +101,11 @@ function safeCameraLocation(camera: CctvCamera | null) {
   if (!camera) return 'Not specified'
 
   return (
-    sanitizeCameraLocation(camera.areaId) ??
-    sanitizeCameraLocation(camera.barangay) ??
-    sanitizeCameraLocation(camera.roadName) ??
-    sanitizeCameraLocation(camera.locationDescription) ??
     sanitizeCameraLocation(camera.location) ??
+    sanitizeCameraLocation(camera.locationDescription) ??
+    sanitizeCameraLocation(camera.roadName) ??
+    sanitizeCameraLocation(camera.barangay) ??
+    sanitizeCameraLocation(camera.areaId) ??
     'Not specified'
   )
 }
@@ -106,6 +117,13 @@ function emptyCameraForm(areaId: string): CameraFormState {
     cameraIp: '',
     streamUrl: '',
     areaId,
+    location: '',
+  }
+}
+
+function emptyAddCameraForm(): AddCameraFormState {
+  return {
+    streamUrl: '',
     location: '',
   }
 }
@@ -136,6 +154,10 @@ function pickDefaultCamera(cameras: CctvCamera[], areaId: string) {
 function cameraLocationLabel(camera: CctvCamera | null, fallbackAreaId: string) {
   if (!camera) return 'Not specified'
   return safeCameraLocation(camera)
+}
+
+function isRtspStreamUrl(value: string) {
+  return /^rtsps?:\/\/\S+$/i.test(value.trim())
 }
 
 function cameraStatusFrameUrl(status?: CameraMonitoringStatus) {
@@ -191,11 +213,15 @@ export default function IpCameraPage() {
   const { isAdvancedMode } = useDisplayMode(profile)
   const areaId = profile?.areaId ?? 'talomo'
   const normalizedRole = String(profile?.role ?? '').toLowerCase()
+  const isResponder = normalizedRole === 'responder'
   const canEditCameraSettings = normalizedRole === 'admin' && isAdvancedMode
   const showAdvancedCameraControls = canEditCameraSettings
   const [cameras, setCameras] = useState<CctvCamera[]>([])
   const [activeCamera, setActiveCamera] = useState<CctvCamera | null>(null)
   const [form, setForm] = useState<CameraFormState>(() => emptyCameraForm(areaId))
+  const [addCameraForm, setAddCameraForm] = useState<AddCameraFormState>(() => emptyAddCameraForm())
+  const [isAddCameraOpen, setIsAddCameraOpen] = useState(false)
+  const [addCameraError, setAddCameraError] = useState('')
   const [loadingCameras, setLoadingCameras] = useState(true)
   const [savingCamera, setSavingCamera] = useState(false)
   const [cameraError, setCameraError] = useState('')
@@ -212,6 +238,9 @@ export default function IpCameraPage() {
         ? safeCameraName(activeCamera)
         : 'Manual CCTV Camera'
   const activeCameraSource = activeCameraName
+  const activeCameraLocation = activeCamera
+    ? cameraLocationLabel(activeCamera, activeAreaId)
+    : form.location.trim() || activeAreaId
   const shouldAutoStartCctv = Boolean(
     activeCamera?.isActive &&
       activeCamera.detectionEnabled &&
@@ -437,6 +466,70 @@ export default function IpCameraPage() {
     }
   }
 
+  const openAddCameraDialog = () => {
+    setAddCameraForm(emptyAddCameraForm())
+    setAddCameraError('')
+    setIsAddCameraOpen(true)
+  }
+
+  const saveResponderCamera = async () => {
+    const streamUrl = addCameraForm.streamUrl.trim()
+    const location = addCameraForm.location.trim()
+
+    if (!streamUrl) {
+      setAddCameraError('RTSP stream link is required.')
+      return
+    }
+
+    if (!isRtspStreamUrl(streamUrl)) {
+      setAddCameraError('Enter a valid RTSP stream link, for example rtsp://username:password@camera-ip:554/stream.')
+      return
+    }
+
+    if (!location) {
+      setAddCameraError('Camera location is required.')
+      return
+    }
+
+    if (isSensitiveCameraText(location)) {
+      setAddCameraError('Camera location must describe the physical placement, not an RTSP link, IP address, or credentials.')
+      return
+    }
+
+    setSavingCamera(true)
+    setAddCameraError('')
+    setCameraError('')
+
+    try {
+      const saved = await saveCctvCamera({
+        label: `Responder CCTV Camera ${savedCameraCount + 1}`,
+        streamUrl,
+        areaId,
+        barangay: areaId,
+        location,
+        locationDescription: location,
+        cameraType: 'RTSP Stream',
+        status: 'offline',
+        isActive: true,
+        detectionEnabled: true,
+      })
+
+      setActiveCamera(saved)
+      setForm(cameraToForm(saved, areaId))
+      setCameras((previous) => {
+        const withoutSaved = previous.filter((camera) => camera.cameraId !== saved.cameraId)
+        return [saved, ...withoutSaved]
+      })
+      window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(saved))
+      setAddCameraForm(emptyAddCameraForm())
+      setIsAddCameraOpen(false)
+    } catch (error) {
+      setAddCameraError(error instanceof Error ? error.message : 'Could not save camera.')
+    } finally {
+      setSavingCamera(false)
+    }
+  }
+
   return (
     <div className="flex min-h-screen bg-background">
       <Sidebar />
@@ -488,6 +581,7 @@ export default function IpCameraPage() {
                   accidentOnlyMode
                   areaId={activeAreaId}
                   cameraId={activeCamera.cameraId}
+                  cameraLocation={activeCameraLocation}
                   cameraName={activeCameraName}
                   sourceCamera={activeCameraSource}
                   initialCctvIp={form.cameraIp}
@@ -517,16 +611,24 @@ export default function IpCameraPage() {
                     Select a feed to open it.
                   </p>
                 </div>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="outline"
-                  onClick={() => void loadSavedCameras()}
-                  disabled={loadingCameras}
-                  aria-label="Refresh camera feeds"
-                >
-                  <RefreshCw className={`h-4 w-4 ${loadingCameras ? 'animate-spin' : ''}`} />
-                </Button>
+                <div className="flex shrink-0 gap-2">
+                  {isResponder ? (
+                    <Button type="button" size="sm" onClick={openAddCameraDialog}>
+                      <Plus className="h-4 w-4" />
+                      Add New Camera
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="outline"
+                    onClick={() => void loadSavedCameras()}
+                    disabled={loadingCameras}
+                    aria-label="Refresh camera feeds"
+                  >
+                    <RefreshCw className={`h-4 w-4 ${loadingCameras ? 'animate-spin' : ''}`} />
+                  </Button>
+                </div>
               </div>
               <div className="grid gap-3 p-3 sm:grid-cols-2 xl:max-h-[calc(100vh-220px)] xl:grid-cols-1 xl:overflow-y-auto">
                 {cameraSlots.map(({ camera, slotNumber }) => {
@@ -717,6 +819,78 @@ export default function IpCameraPage() {
             </Card>
           ) : null}
         </main>
+
+        <Dialog open={isAddCameraOpen} onOpenChange={setIsAddCameraOpen}>
+          <DialogContent className="border border-border bg-card sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Add New Camera</DialogTitle>
+            </DialogHeader>
+
+            <div className="space-y-4">
+              {addCameraError ? (
+                <Alert variant="destructive">
+                  <AlertTriangle className="h-4 w-4" />
+                  <AlertDescription>{addCameraError}</AlertDescription>
+                </Alert>
+              ) : null}
+
+              <div className="space-y-2">
+                <Label htmlFor="new-camera-stream">RTSP Stream Link</Label>
+                <Input
+                  id="new-camera-stream"
+                  type="password"
+                  value={addCameraForm.streamUrl}
+                  onChange={(event) =>
+                    setAddCameraForm((current) => ({
+                      ...current,
+                      streamUrl: event.target.value,
+                    }))
+                  }
+                  placeholder="rtsp://username:password@camera-ip:554/stream"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="new-camera-location">Camera Location</Label>
+                <Input
+                  id="new-camera-location"
+                  value={addCameraForm.location}
+                  onChange={(event) =>
+                    setAddCameraForm((current) => ({
+                      ...current,
+                      location: event.target.value,
+                    }))
+                  }
+                  placeholder="Talomo Road, Main Gate, Parking Area"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Use the physical placement of the camera. Do not enter an IP address or stream link here.
+                </p>
+              </div>
+
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setIsAddCameraOpen(false)}
+                  disabled={savingCamera}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => void saveResponderCamera()}
+                  disabled={savingCamera}
+                >
+                  <Save className="h-4 w-4" />
+                  {savingCamera ? 'Saving...' : 'Save Camera'}
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   )

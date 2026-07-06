@@ -54,6 +54,7 @@ interface LiveCameraProps {
   accidentOnlyMode?: boolean
   areaId?: string | null
   cameraId?: string | null
+  cameraLocation?: string | null
   cameraName?: string | null
   sourceCamera?: string | null
   initialCctvIp?: string | null
@@ -414,6 +415,7 @@ export function LiveCamera({
   accidentOnlyMode = false,
   areaId,
   cameraId,
+  cameraLocation,
   cameraName,
   sourceCamera,
   initialCctvIp,
@@ -1087,12 +1089,13 @@ export function LiveCamera({
       if (isCctv) {
         const resolvedCameraName = sourceCamera ?? cameraName ?? 'CCTV Camera'
         const resolvedAreaId = areaId ?? 'demo'
+        const resolvedCameraLocation = cameraLocation ?? resolvedCameraName
         result = await detectFromStreamUrl(streamUrlRef.current, {
           cameraId: cameraId ?? undefined,
           cameraIp: cctvIpRef.current.trim() || undefined,
           label: resolvedCameraName,
           areaId: resolvedAreaId,
-          location: resolvedCameraName,
+          location: resolvedCameraLocation,
           cameraType: 'CCTV stream',
         })
       } else {
@@ -1239,13 +1242,14 @@ export function LiveCamera({
     setCctvConnectionStatus('Connecting')
     const resolvedCameraName = sourceCamera ?? cameraName ?? 'CCTV Camera'
     const resolvedAreaId = areaId ?? 'demo'
+    const resolvedCameraLocation = cameraLocation ?? resolvedCameraName
     const connection = savedCameraId
       ? await startCctvMonitoring(savedCameraId)
       : await testCameraConnection(cameraIp, {
           cameraId: cameraId ?? undefined,
           label: resolvedCameraName,
           areaId: resolvedAreaId,
-          location: resolvedCameraName,
+          location: resolvedCameraLocation,
         })
     const monitorId = connection.cameraId || connection.cameraIp || savedCameraId || cameraIp
     cctvMonitorIdRef.current = monitorId
