@@ -1,11 +1,22 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, MapPin, Plus, RefreshCw, Save, Video } from 'lucide-react'
+import { AlertTriangle, MapPin, Plus, RefreshCw, Save, Trash2, Video } from 'lucide-react'
 
 import { Sidebar } from '@/components/dashboard-sidebar'
 import { LiveCamera } from '@/components/live-camera'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -48,6 +59,8 @@ type AddCameraFormState = {
 }
 
 const CAMERA_CACHE_KEY = 'mycrushguard.savedCctvCamera'
+const RESPONDER_CAMERA_IDS_KEY = 'mycrushguard.responderCameraIds'
+const RESPONDER_CAMERA_TYPE = 'Responder RTSP Stream'
 
 function isDemoCamera(camera: CctvCamera) {
   return (
@@ -160,6 +173,29 @@ function isRtspStreamUrl(value: string) {
   return /^rtsps?:\/\/\S+$/i.test(value.trim())
 }
 
+function isResponderCreatedCamera(camera: CctvCamera) {
+  return (
+    camera.cameraType === RESPONDER_CAMERA_TYPE ||
+    (camera.cameraType === 'RTSP Stream' && camera.label.startsWith('Responder CCTV Camera'))
+  )
+}
+
+function readResponderCameraIds() {
+  if (typeof window === 'undefined') return new Set<string>()
+
+  try {
+    const raw = window.localStorage.getItem(RESPONDER_CAMERA_IDS_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return new Set(Array.isArray(parsed) ? parsed.filter((value) => typeof value === 'string') : [])
+  } catch {
+    return new Set<string>()
+  }
+}
+
+function writeResponderCameraIds(ids: Set<string>) {
+  window.localStorage.setItem(RESPONDER_CAMERA_IDS_KEY, JSON.stringify([...ids]))
+}
+
 function cameraStatusFrameUrl(status?: CameraMonitoringStatus) {
   return status?.latestFrameUrl ?? status?.frameUrl ?? status?.previewUrl ?? status?.imageUrl ?? null
 }
@@ -224,6 +260,8 @@ export default function IpCameraPage() {
   const [addCameraError, setAddCameraError] = useState('')
   const [loadingCameras, setLoadingCameras] = useState(true)
   const [savingCamera, setSavingCamera] = useState(false)
+  const [removingCameraId, setRemovingCameraId] = useState<string | null>(null)
+  const [responderCameraIds, setResponderCameraIds] = useState<Set<string>>(() => new Set())
   const [cameraError, setCameraError] = useState('')
   const [cameraStatuses, setCameraStatuses] = useState<Record<string, CameraMonitoringStatus>>({})
   const [cameraPreviewUrls, setCameraPreviewUrls] = useState<Record<string, string>>({})
@@ -275,6 +313,13 @@ export default function IpCameraPage() {
     () => cameraStatusBadges(activeCameraStatus, activeCamera),
     [activeCamera, activeCameraStatus]
   )
+  const canRemoveCamera = useCallback(
+    (camera: CctvCamera) =>
+      isResponder &&
+      !isDemoCamera(camera) &&
+      (responderCameraIds.has(camera.cameraId) || isResponderCreatedCamera(camera)),
+    [isResponder, responderCameraIds]
+  )
 
   const applyCamera = useCallback((camera: CctvCamera | null) => {
     setActiveCamera(camera)
@@ -321,6 +366,10 @@ export default function IpCameraPage() {
   useEffect(() => {
     void loadSavedCameras()
   }, [loadSavedCameras])
+
+  useEffect(() => {
+    setResponderCameraIds(readResponderCameraIds())
+  }, [])
 
   const setPreviewUrl = useCallback((cameraId: string, objectUrl: string) => {
     setCameraPreviewUrls((previous) => {
@@ -508,7 +557,7 @@ export default function IpCameraPage() {
         barangay: areaId,
         location,
         locationDescription: location,
-        cameraType: 'RTSP Stream',
+        cameraType: RESPONDER_CAMERA_TYPE,
         status: 'offline',
         isActive: true,
         detectionEnabled: true,
@@ -521,12 +570,72 @@ export default function IpCameraPage() {
         return [saved, ...withoutSaved]
       })
       window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(saved))
+      setResponderCameraIds((current) => {
+        const next = new Set(current)
+        next.add(saved.cameraId)
+        writeResponderCameraIds(next)
+        return next
+      })
       setAddCameraForm(emptyAddCameraForm())
       setIsAddCameraOpen(false)
     } catch (error) {
       setAddCameraError(error instanceof Error ? error.message : 'Could not save camera.')
     } finally {
       setSavingCamera(false)
+    }
+  }
+
+  const removeResponderCamera = async (camera: CctvCamera) => {
+    if (!canRemoveCamera(camera)) {
+      setCameraError('Only cameras added by this responder can be removed.')
+      return
+    }
+
+    setRemovingCameraId(camera.cameraId)
+    setCameraError('')
+
+    try {
+      await saveCctvCamera({
+        cameraId: camera.cameraId,
+        label: camera.label,
+        cameraIp: camera.cameraIp ?? undefined,
+        streamUrl: camera.streamUrl ?? undefined,
+        areaId: camera.areaId ?? areaId,
+        barangay: camera.barangay ?? camera.areaId ?? areaId,
+        roadName: camera.roadName ?? undefined,
+        location: camera.location ?? camera.locationDescription ?? undefined,
+        locationDescription: camera.locationDescription ?? camera.location ?? undefined,
+        latitude: camera.latitude ?? undefined,
+        longitude: camera.longitude ?? undefined,
+        cameraType: camera.cameraType ?? RESPONDER_CAMERA_TYPE,
+        status: 'inactive',
+        isActive: false,
+        detectionEnabled: false,
+      })
+
+      const nextCameras = cameras.filter((item) => item.cameraId !== camera.cameraId)
+      setCameras(nextCameras)
+      setResponderCameraIds((current) => {
+        const next = new Set(current)
+        next.delete(camera.cameraId)
+        writeResponderCameraIds(next)
+        return next
+      })
+      clearPreviewUrl(camera.cameraId)
+
+      if (activeCamera?.cameraId === camera.cameraId) {
+        const replacement = pickDefaultCamera(nextCameras, areaId)
+        applyCamera(replacement)
+        if (replacement) {
+          window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(replacement))
+        } else {
+          window.localStorage.removeItem(CAMERA_CACHE_KEY)
+        }
+      }
+    } catch (error) {
+      setCameraError(error instanceof Error ? error.message : 'Could not remove camera.')
+    } finally {
+      setRemovingCameraId(null)
     }
   }
 
@@ -661,17 +770,25 @@ export default function IpCameraPage() {
                   const selected = activeCamera?.cameraId === camera.cameraId
                   const previewUrl = cameraPreviewUrls[camera.cameraId]
                   const alertId = latestAlertId(status)
+                  const removable = canRemoveCamera(camera)
 
                   return (
-                    <button
+                    <div
                       key={camera.cameraId}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       className={`overflow-hidden rounded-lg border text-left transition-colors ${
                         selected
                           ? 'border-primary bg-primary/10'
                           : 'border-border bg-background hover:border-primary/50'
                       }`}
                       onClick={() => applyCamera(camera)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault()
+                          applyCamera(camera)
+                        }
+                      }}
                       aria-label={`Select ${safeCameraName(camera)}`}
                     >
                       <div className="relative aspect-video overflow-hidden bg-zinc-950">
@@ -701,6 +818,49 @@ export default function IpCameraPage() {
                             ALERT
                           </Badge>
                         ) : null}
+                        {removable ? (
+                          <div className="absolute bottom-2 right-2">
+                            <AlertDialog>
+                              <AlertDialogTrigger asChild>
+                                <Button
+                                  type="button"
+                                  size="icon-sm"
+                                  variant="outline"
+                                  className="border-destructive/40 bg-background/95 text-destructive hover:border-destructive/60 hover:bg-destructive/10 hover:text-destructive"
+                                  disabled={removingCameraId === camera.cameraId}
+                                  aria-label={`Remove ${safeCameraName(camera)}`}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onKeyDown={(event) => event.stopPropagation()}
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </AlertDialogTrigger>
+                              <AlertDialogContent className="sm:max-w-md">
+                                <AlertDialogHeader>
+                                  <AlertDialogTitle>Remove camera?</AlertDialogTitle>
+                                  <AlertDialogDescription>
+                                    Are you sure you want to remove this camera?
+                                  </AlertDialogDescription>
+                                </AlertDialogHeader>
+                                <AlertDialogFooter>
+                                  <AlertDialogCancel disabled={removingCameraId === camera.cameraId}>
+                                    Cancel
+                                  </AlertDialogCancel>
+                                  <AlertDialogAction
+                                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                                    disabled={removingCameraId === camera.cameraId}
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      void removeResponderCamera(camera)
+                                    }}
+                                  >
+                                    {removingCameraId === camera.cameraId ? 'Removing...' : 'Remove Camera'}
+                                  </AlertDialogAction>
+                                </AlertDialogFooter>
+                              </AlertDialogContent>
+                            </AlertDialog>
+                          </div>
+                        ) : null}
                       </div>
                       <div className="space-y-2 p-3">
                         <div className="min-w-0">
@@ -719,7 +879,7 @@ export default function IpCameraPage() {
                           {alertId ? <span>Case: {alertId}</span> : null}
                         </div>
                       </div>
-                    </button>
+                    </div>
                   )
                 })}
               </div>
