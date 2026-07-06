@@ -99,3 +99,10 @@ desktop.ini
 # =========================
 .vscode/settings.json
 .idea/
+backend/datasets/crash_classification/train/
+backend/datasets/crash_classification/val/
+backend/datasets/crash_classification/test/
+
+backend/datasets/crash_classification/train/
+backend/datasets/crash_classification/val/
+backend/datasets/crash_classification/test/
