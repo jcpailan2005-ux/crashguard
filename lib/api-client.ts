@@ -74,19 +74,36 @@ function normalizeDetectionResponse(result: DetectionResponse): DetectionRespons
     result.accident_detected ||
     projectDetections.some((d) => d.label.toLowerCase() === 'accident')
 
-  const derivedConfidence =
-    projectDetections.length > 0
-      ? Math.max(result.confidence, ...projectDetections.map((d) => d.score))
-      : result.confidence
+  const backendConfidence = Number.isFinite(Number(result.confidence))
+    ? Number(result.confidence)
+    : 0
+  const rawCrashConfidence =
+    result.rawCrashConfidence != null && Number.isFinite(Number(result.rawCrashConfidence))
+      ? Number(result.rawCrashConfidence)
+      : result.accident_detected
+        ? backendConfidence
+        : result.rawCrashConfidence
 
   return {
     ...result,
     accident_detected: derivedAccidentDetected,
-    confidence: derivedConfidence,
+    confidence: backendConfidence,
+    rawCrashConfidence,
     annotated_media_url: result.annotated_media_url ?? frameUrl,
     latestFrameUrl: result.latestFrameUrl ?? frameUrl,
     frameUrl: result.frameUrl ?? frameUrl,
     detections: projectDetections,
+  }
+}
+
+function normalizeCameraMonitoringStatus(
+  status: CameraMonitoringStatus
+): CameraMonitoringStatus {
+  return {
+    ...status,
+    latestResult: status.latestResult
+      ? normalizeDetectionResponse(status.latestResult)
+      : status.latestResult,
   }
 }
 
@@ -574,9 +591,10 @@ export interface CameraMonitoringStatus {
 export async function getCameraMonitoringStatus(
   cameraIdOrIp: string
 ): Promise<CameraMonitoringStatus> {
-  return apiCall<CameraMonitoringStatus>(
+  const status = await apiCall<CameraMonitoringStatus>(
     `/api/cameras/${encodeURIComponent(cameraIdOrIp.trim())}/status`
   )
+  return normalizeCameraMonitoringStatus(status)
 }
 
 export function getCameraPreviewFrameUrl(cameraIp: string): string {
@@ -646,10 +664,11 @@ export async function enableCctvCamera(cameraId: string): Promise<CctvCamera> {
 }
 
 export async function startCctvMonitoring(cameraId: string): Promise<CameraMonitoringStatus> {
-  return apiCall<CameraMonitoringStatus>(
+  const status = await apiCall<CameraMonitoringStatus>(
     `/api/cameras/${encodeURIComponent(cameraId)}/monitor/start`,
     { method: 'POST' }
   )
+  return normalizeCameraMonitoringStatus(status)
 }
 
 export async function stopCctvMonitoring(cameraId: string): Promise<{ ok: boolean; cameraId: string; status: string }> {

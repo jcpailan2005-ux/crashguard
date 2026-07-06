@@ -50,7 +50,7 @@ export function localCaseToCrashCase(caseItem: LocalCrashCase): CrashCase {
       mediaType: caseItem.videoPath ? 'video' : 'image',
       source: sourceFromLocalCase(caseItem),
       sourceFile: caseItem.cameraName ?? caseItem.sourceCamera ?? null,
-      annotatedKeyFrameUrl: annotatedUrl ?? keyFrameUrl ?? thumbnailUrl,
+      annotatedKeyFrameUrl: keyFrameUrl ?? thumbnailUrl ?? annotatedUrl,
       keyFrameUrl,
       thumbnailUrl,
       videoUrl,
@@ -96,13 +96,14 @@ export function caseMedia(caseItem: CrashCase | null) {
   }
 
   const previewPath =
-    caseItem.media.annotatedKeyFrameUrl ||
-    caseItem.annotatedPath ||
     caseItem.media.keyFrameUrl ||
     caseItem.keyFramePath ||
+    caseItem.media.annotatedKeyFrameUrl ||
     caseItem.thumbnailPath ||
-    caseItem.videoPath ||
+    caseItem.media.thumbnailUrl ||
+    caseItem.annotatedPath ||
     caseItem.media.annotatedMediaUrl ||
+    caseItem.videoPath ||
     null
   const fullPath =
     caseItem.media.videoUrl ||

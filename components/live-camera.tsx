@@ -72,6 +72,7 @@ interface LiveCameraProps {
 
 const MEANINGFUL_CONFIDENCE_THRESHOLD =
   APP_CONFIG.detection.meaningfulConfidenceThreshold
+const CRASH_ALERT_REQUIRED_THRESHOLD = 0.2
 const ALERT_DEBOUNCE_MS = APP_CONFIG.detection.alertDebounceMs
 const CRASH_ALERT_VISIBLE_MS = 60_000
 const DEVICE_DETECTION_INTERVAL_MS = 1800
@@ -198,6 +199,46 @@ function getHighestDetectionConfidence(result: DetectionResponse): number {
   )
 }
 
+function normalizeConfidenceFraction(value: number | null | undefined): number | null {
+  if (value == null) return null
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return numeric > 1 ? numeric / 100 : numeric
+}
+
+function formatConfidencePercent(value: number, digits = 1): string {
+  return `${(value * 100).toFixed(digits)}%`
+}
+
+function getCrashConfidence(result: DetectionResponse): number | null {
+  return (
+    normalizeConfidenceFraction(result.rawCrashConfidence) ??
+    normalizeConfidenceFraction(result.lastConfidence) ??
+    normalizeConfidenceFraction(result.confidence)
+  )
+}
+
+function getRequiredCrashThreshold(result: DetectionResponse): number | null {
+  void result
+  return CRASH_ALERT_REQUIRED_THRESHOLD
+}
+
+function hasPassedCrashAlertThreshold(result: DetectionResponse): boolean {
+  const confidence = getCrashConfidence(result)
+  return confidence != null && confidence >= CRASH_ALERT_REQUIRED_THRESHOLD
+}
+
+function getCrashThresholdLine(result: DetectionResponse): string {
+  const confidence = getCrashConfidence(result)
+  const threshold = getRequiredCrashThreshold(result)
+
+  if (confidence == null || threshold == null) {
+    return ''
+  }
+
+  return `Confidence: ${formatConfidencePercent(confidence)} / Required: ${formatConfidencePercent(threshold, threshold * 100 === Math.round(threshold * 100) ? 0 : 1)}`
+}
+
 function hasMeaningfulDetection(result: DetectionResponse): boolean {
   if (result.accident_detected) {
     return true
@@ -238,7 +279,7 @@ function buildDisplayResult(result: DetectionResponse): DetectionResponse {
       detections: [
         {
           label: 'accident',
-          score: Math.max(result.confidence, 0.01),
+          score: Math.max(getCrashConfidence(result) ?? 0, 0.01),
           box: [0, 0, 0, 0],
         },
       ],
@@ -257,10 +298,7 @@ function buildDisplayResult(result: DetectionResponse): DetectionResponse {
   return {
     ...result,
     accident_detected: derivedAccidentDetected,
-    confidence: Math.max(
-      result.confidence,
-      ...projectDetections.map((d) => d.score)
-    ),
+    confidence: result.confidence,
     detections: projectDetections,
   }
 }
@@ -327,7 +365,7 @@ function getPrimaryConfidenceDisplay(result: DetectionResponse): {
       .filter((d) => d.label.toLowerCase() === 'accident')
       .map((d) => d.score)
     const v =
-      fromBoxes.length > 0 ? Math.max(...fromBoxes) : Math.max(result.confidence, 0)
+      fromBoxes.length > 0 ? Math.max(...fromBoxes) : Math.max(getCrashConfidence(result) ?? 0, 0)
     return {
       value: v > 0 ? v : null,
       caption: 'Crash-class confidence',
@@ -355,10 +393,24 @@ function getPersistenceStatus(result: DetectionResponse): string | null {
   return result.persistenceStatus ?? result.casePersistenceStatus ?? null
 }
 
+function getReviewCaseId(result: DetectionResponse): string | null {
+  return (
+    result.caseId ??
+    (result as DetectionResponse & { reviewCaseId?: string | null }).reviewCaseId ??
+    (result as DetectionResponse & { case_id?: string | null }).case_id ??
+    null
+  )
+}
+
 function getCrashAlertKind(result: DetectionResponse): CrashAlertKind {
   const persistenceStatus = getPersistenceStatus(result)
+  const reviewCaseId = getReviewCaseId(result)
 
-  if (persistenceStatus === 'created' && result.caseId && result.notificationId) {
+  if (!hasPassedCrashAlertThreshold(result)) {
+    return 'skipped'
+  }
+
+  if (reviewCaseId && persistenceStatus !== 'blocked_existing_case') {
     return 'created'
   }
 
@@ -371,35 +423,53 @@ function getCrashAlertKind(result: DetectionResponse): CrashAlertKind {
 
 function getCrashAlertReviewCaseId(alert: CrashAlertState): string | null {
   if (alert.kind === 'created') {
-    return alert.result.caseId && alert.result.notificationId
-      ? alert.result.caseId
-      : null
+    return getReviewCaseId(alert.result)
   }
 
   if (alert.kind === 'blocked') {
-    return alert.result.activeBlockingCaseId ?? null
+    return alert.result.activeBlockingCaseId ?? getReviewCaseId(alert.result)
   }
 
   return null
 }
 
 function getCrashAlertStatusText(alert: CrashAlertState): string {
+  const thresholdLine = getCrashThresholdLine(alert.result)
+  const withThreshold = (message: string) =>
+    thresholdLine ? `${message} ${thresholdLine}` : message
+
+  if (!hasPassedCrashAlertThreshold(alert.result)) {
+    return withThreshold(
+      'Detection did not create alert because confidence is below the required 20% threshold.'
+    )
+  }
+
   if (alert.kind === 'created') {
-    return 'Notification created'
+    return withThreshold('Crash detection saved. Review case created.')
   }
 
   if (alert.kind === 'blocked') {
-    return (
+    return withThreshold(
       alert.result.alertBlockedReason ??
       alert.result.persistenceSkippedReason ??
       'An active crash case already exists for this camera.'
     )
   }
 
-  return (
+  const staleBelowThresholdReason =
+    alert.result.persistenceSkippedReason?.toLowerCase().includes('below') &&
+    alert.result.persistenceSkippedReason.toLowerCase().includes('threshold')
+
+  if (staleBelowThresholdReason) {
+    return withThreshold(
+      `Review case was not created. Persistence status: ${getPersistenceStatus(alert.result) ?? 'not saved'}`
+    )
+  }
+
+  return withThreshold(
     alert.result.persistenceSkippedReason ??
-    alert.result.alertBlockedReason ??
-    `Persistence status: ${getPersistenceStatus(alert.result) ?? 'not saved'}`
+      alert.result.alertBlockedReason ??
+      `Review case was not created. Persistence status: ${getPersistenceStatus(alert.result) ?? 'not saved'}`
   )
 }
 
@@ -636,8 +706,8 @@ export function LiveCamera({
     const kind = getCrashAlertKind(result)
     const reviewCaseId =
       kind === 'blocked'
-        ? result.activeBlockingCaseId ?? result.caseId
-        : result.caseId
+        ? result.activeBlockingCaseId ?? getReviewCaseId(result)
+        : getReviewCaseId(result)
     const id = [
       kind,
       reviewCaseId,
@@ -726,7 +796,7 @@ export function LiveCamera({
               (item) =>
                 item.accidentDetected &&
                 getPersistenceStatus(item.result) === 'created' &&
-                item.result.caseId
+                getReviewCaseId(item.result)
             ) ?? sample
         : sample
 
@@ -1429,23 +1499,17 @@ export function LiveCamera({
     ? sanitizeCameraDisplayText(crashAlert.result.areaId ?? areaId, 'Not specified')
     : ''
   const crashAlertConfidence = crashAlert
-    ? getHighestDetectionConfidence(crashAlert.result)
+    ? getCrashConfidence(crashAlert.result)
     : null
   const crashAlertTime = crashAlert
     ? new Date(crashAlert.result.createdAt ?? crashAlert.result.timestamp)
     : null
   const crashAlertCaseId = crashAlert
     ? crashAlert.kind === 'blocked'
-      ? crashAlert.result.activeBlockingCaseId ?? crashAlert.result.caseId
-      : crashAlert.result.caseId
+      ? crashAlert.result.activeBlockingCaseId ?? getReviewCaseId(crashAlert.result)
+      : getReviewCaseId(crashAlert.result)
     : null
-  const simpleCrashStatus = crashAlert
-    ? crashAlert.kind === 'created'
-      ? 'Notification created'
-      : crashAlert.kind === 'blocked'
-        ? 'Active case already exists'
-        : getCrashAlertStatusText(crashAlert)
-    : ''
+  const simpleCrashStatus = crashAlert ? getCrashAlertStatusText(crashAlert) : ''
 
   return (
     <div className="space-y-6">

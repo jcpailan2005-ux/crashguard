@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 import uuid
 
 from backend.db import get_connection
+from backend.media_store import copy_media_file, media_dir, relative_media_path
 
 
 CASE_STATUSES = {
@@ -283,12 +285,15 @@ def find_unresolved_camera_case(
     source_camera: str | None = None,
     *,
     area_id: str | None = None,
+    location: str | None = None,
     block_minutes: int | None = None,
+    block_seconds: int | None = None,
 ) -> dict | None:
     camera_ip = (camera_ip or "").strip() or None
     camera_id = (camera_id or "").strip() or None
     source_camera = (source_camera or "").strip() or None
     area_id = (area_id or "").strip() or None
+    location = (location or "").strip() or None
     if not camera_ip and not camera_id and not source_camera:
         return None
     if camera_id:
@@ -306,15 +311,25 @@ def find_unresolved_camera_case(
         if area_id:
             area_clause = "AND areaId = ?"
             params.append(area_id)
+        location_clause = ""
+        if location:
+            location_clause = "AND location = ?"
+            params.append(location)
         age_clause = ""
-        if block_minutes is not None and block_minutes > 0:
-            age_clause = "AND datetime(detectedAt) >= datetime('now', ?)"
-            params.append(f"-{block_minutes} minutes")
+        if block_seconds is not None and block_seconds > 0:
+            cutoff = datetime.now() - timedelta(seconds=block_seconds)
+            age_clause = "AND datetime(detectedAt) >= datetime(?)"
+            params.append(cutoff.isoformat())
+        elif block_minutes is not None and block_minutes > 0:
+            cutoff = datetime.now() - timedelta(minutes=block_minutes)
+            age_clause = "AND datetime(detectedAt) >= datetime(?)"
+            params.append(cutoff.isoformat())
         row = conn.execute(
             f"""
             SELECT * FROM crash_cases
             WHERE {camera_clause}
               {area_clause}
+              {location_clause}
               AND triggerStatus = 'camera_detection'
               AND status IN ('pending_review', 'under_review')
               {age_clause}
@@ -449,6 +464,63 @@ def save_detection_boxes(
         )
 
 
+def replace_case_evidence(
+    case_id: str,
+    *,
+    key_frame_path: Path | None,
+    thumbnail_path: Path | None = None,
+    annotated_path: Path | None = None,
+    boxes: list[dict] | None = None,
+    detected_at: str | None = None,
+) -> dict | None:
+    timestamp = detected_at or now_iso()
+    folder = media_dir(case_id)
+    suffix = uuid.uuid4().hex[:8]
+    key_frame = copy_media_file(key_frame_path, folder / f"keyframe_{suffix}.jpg")
+    thumbnail = copy_media_file(
+        thumbnail_path or key_frame_path,
+        folder / f"thumbnail_{suffix}.jpg",
+    )
+    annotated_suffix = (annotated_path.suffix if annotated_path else ".jpg") or ".jpg"
+    annotated = copy_media_file(
+        annotated_path,
+        folder / f"annotated_{suffix}{annotated_suffix}",
+    )
+
+    key_frame_relative = relative_media_path(key_frame)
+    thumbnail_relative = relative_media_path(thumbnail)
+    annotated_relative = relative_media_path(annotated)
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE crash_cases
+            SET keyFramePath = COALESCE(?, keyFramePath),
+                thumbnailPath = COALESCE(?, thumbnailPath),
+                annotatedPath = COALESCE(?, annotatedPath),
+                updatedAt = ?
+            WHERE caseId = ?
+            """,
+            (
+                key_frame_relative,
+                thumbnail_relative,
+                annotated_relative,
+                timestamp,
+                case_id,
+            ),
+        )
+        if boxes is not None:
+            conn.execute("DELETE FROM detection_boxes WHERE caseId = ?", (case_id,))
+            _insert_detection_boxes(
+                conn,
+                case_id,
+                boxes,
+                frame_path=key_frame_relative or annotated_relative,
+                detected_at=timestamp,
+            )
+    return get_crash_case(case_id)
+
+
 def apply_action(case_id: str, action: str, actor_id: str | None, notes: str | None) -> dict:
     case_item = get_crash_case(case_id)
     if case_item is None:
@@ -556,9 +628,9 @@ def list_notifications(
                    c.cameraName,
                    c.cameraIp,
                    c.triggerStatus,
-                   COALESCE(c.annotatedPath, c.keyFramePath, c.thumbnailPath) AS evidenceImageUrl,
+                   COALESCE(c.keyFramePath, c.thumbnailPath, c.annotatedPath) AS evidenceImageUrl,
                    c.annotatedPath AS annotatedImageUrl,
-                   COALESCE(c.videoPath, c.annotatedPath, c.keyFramePath, c.thumbnailPath) AS mediaUrl,
+                   COALESCE(c.videoPath, c.keyFramePath, c.thumbnailPath, c.annotatedPath) AS mediaUrl,
                    c.thumbnailPath AS thumbnailUrl,
                    CASE
                      WHEN c.videoPath IS NOT NULL

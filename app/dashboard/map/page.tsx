@@ -68,12 +68,16 @@ function caseMedia(caseItem: CrashCase | null) {
   return {
     previewUrl: resolveBackendMediaUrl(
       caseItem.media.annotatedKeyFrameUrl ||
-        caseItem.media.annotatedMediaUrl ||
+        caseItem.media.keyFrameUrl ||
+        caseItem.keyFramePath ||
         caseItem.media.annotatedMediaDownloadUrl ||
+        caseItem.media.annotatedMediaUrl ||
         null
     ),
     fullUrl: resolveBackendMediaUrl(
-      caseItem.media.annotatedMediaUrl ||
+      caseItem.media.keyFrameUrl ||
+        caseItem.keyFramePath ||
+        caseItem.media.annotatedMediaUrl ||
         caseItem.media.annotatedMediaDownloadUrl ||
         caseItem.media.annotatedKeyFrameUrl ||
         null
@@ -107,6 +111,7 @@ function localCaseToCrashCase(caseItem: LocalCrashCase): CrashCase {
       annotatedMediaUrl: caseItem.annotatedPath ? `/${caseItem.annotatedPath}` : null,
       annotatedMediaDownloadUrl: caseItem.videoPath ? `/${caseItem.videoPath}` : null,
       annotatedKeyFrameUrl: caseItem.keyFramePath ? `/${caseItem.keyFramePath}` : null,
+      keyFrameUrl: caseItem.keyFramePath ? `/${caseItem.keyFramePath}` : null,
     },
     confidence: caseItem.confidence,
     notes: caseItem.notes ?? '',
@@ -265,18 +270,7 @@ export default function LiveMapPage() {
     if (!caseId || handledUrlCaseIdRef.current === caseId) return
 
     setUrlCaseError(null)
-    const matchingCase = combinedCases.find((caseItem) => caseItem.caseId === caseId)
-    if (matchingCase) {
-      handledUrlCaseIdRef.current = caseId
-      openReviewCase(matchingCase)
-      return
-    }
-
-    if (
-      !matchingCase &&
-      caseId.startsWith('CASE-') &&
-      loadingUrlCaseId !== caseId
-    ) {
+    if (caseId.startsWith('CASE-') && loadingUrlCaseId !== caseId) {
       handledUrlCaseIdRef.current = caseId
       setLoadingUrlCaseId(caseId)
       getLocalCrashCase(caseId)
@@ -284,7 +278,9 @@ export default function LiveMapPage() {
           const mappedCase = mapLocalCaseToCrashCase(localCase)
           setLocalCases((previous) =>
             previous.some((caseItem) => caseItem.caseId === mappedCase.caseId)
-              ? previous
+              ? previous.map((caseItem) =>
+                  caseItem.caseId === mappedCase.caseId ? mappedCase : caseItem
+                )
               : [mappedCase, ...previous]
           )
           openReviewCase(mappedCase)
@@ -295,6 +291,13 @@ export default function LiveMapPage() {
         .finally(() => {
           setLoadingUrlCaseId(null)
         })
+      return
+    }
+
+    const matchingCase = combinedCases.find((caseItem) => caseItem.caseId === caseId)
+    if (matchingCase) {
+      handledUrlCaseIdRef.current = caseId
+      openReviewCase(matchingCase)
       return
     }
 

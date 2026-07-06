@@ -47,6 +47,7 @@ from backend.repositories.crash_cases import (
     list_crash_cases,
     list_notifications,
     get_crash_case,
+    replace_case_evidence,
     seed_demo_camera_data,
     set_camera_active,
     update_user_last_login,
@@ -613,15 +614,52 @@ MOTORCYCLE_IOU_THRESHOLD = get_env_float("MOTORCYCLE_IOU_THRESHOLD", 0.045)
 DEMO_FALLBACK_LATITUDE = get_env_float("DEMO_FALLBACK_LATITUDE", 7.1907)
 DEMO_FALLBACK_LONGITUDE = get_env_float("DEMO_FALLBACK_LONGITUDE", 125.4553)
 LIVE_CAMERA_DETECTION_INTERVAL_MS = get_env_int("LIVE_CAMERA_DETECTION_INTERVAL_MS", 500)
-LIVE_CAMERA_CONFIDENCE_THRESHOLD = get_env_float(
-    "LIVE_CAMERA_CRASH_CONFIDENCE_THRESHOLD",
-    get_env_float("LIVE_CAMERA_CONFIDENCE_THRESHOLD", 0.30),
-)
+CRASH_ALERT_CONFIDENCE_THRESHOLD = 0.20
+
+
+def normalize_confidence_fraction(value: float | int | None) -> float:
+    """Return confidence as a 0.0-1.0 fraction, accepting either 0.70 or 70.0."""
+    try:
+        confidence = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if confidence > 1.0:
+        confidence = confidence / 100.0
+
+    return max(0.0, min(1.0, confidence))
+
+
+LIVE_CAMERA_CONFIDENCE_THRESHOLD = CRASH_ALERT_CONFIDENCE_THRESHOLD
+
+
+def passes_crash_alert_threshold(
+    confidence: float | int | None,
+    *,
+    accident_detected: bool,
+) -> bool:
+    return bool(
+        accident_detected
+        and normalize_confidence_fraction(confidence) >= CRASH_ALERT_CONFIDENCE_THRESHOLD
+    )
 LIVE_CAMERA_VEHICLE_CONFIDENCE_THRESHOLD = get_env_float(
     "LIVE_CAMERA_VEHICLE_CONFIDENCE_THRESHOLD", 0.40
 )
 LIVE_CAMERA_ALERT_COOLDOWN_SECONDS = get_env_int("LIVE_CAMERA_ALERT_COOLDOWN_SECONDS", 30)
-LIVE_CAMERA_ACTIVE_CASE_BLOCK_MINUTES = get_env_int("LIVE_CAMERA_ACTIVE_CASE_BLOCK_MINUTES", 10)
+_legacy_active_case_block_minutes = get_env_int("LIVE_CAMERA_ACTIVE_CASE_BLOCK_MINUTES", 0)
+LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS = get_env_int(
+    "LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS",
+    get_env_int(
+        "LIVE_CAMERA_ACTIVE_CASE_BLOCK_SECONDS",
+        _legacy_active_case_block_minutes * 60
+        if _legacy_active_case_block_minutes > 0
+        else 60,
+    ),
+)
+LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS = max(
+    1,
+    min(120, LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS),
+)
 LIVE_CAMERA_FRAME_WIDTH = get_env_int("LIVE_CAMERA_FRAME_WIDTH", 640)
 LIVE_CAMERA_FRAME_HEIGHT = get_env_int("LIVE_CAMERA_FRAME_HEIGHT", 360)
 LIVE_CAMERA_REQUIRED_HITS = get_env_int("LIVE_CAMERA_REQUIRED_HITS", 1)
@@ -1075,7 +1113,8 @@ def persist_sqlite_crash_case(
             camera_id,
             source_camera,
             area_id=area_id,
-            block_minutes=LIVE_CAMERA_ACTIVE_CASE_BLOCK_MINUTES,
+            location=location,
+            block_seconds=LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS,
         )
         if existing_case:
             log_stream(
@@ -1086,7 +1125,7 @@ def persist_sqlite_crash_case(
             )
             existing_case["casePersistenceStatus"] = "blocked_existing_case"
             existing_case["alertBlockedReason"] = (
-                f"Alert blocked because active case already exists: {existing_case['caseId']}"
+                f"Alert blocked because an active case already exists for this same recent incident: {existing_case['caseId']}"
             )
             existing_case["activeBlockingCaseId"] = existing_case["caseId"]
             existing_case["activeBlockingStatus"] = existing_case["status"]
@@ -1544,7 +1583,8 @@ class LiveCameraMonitor:
             self.camera_id,
             self.label,
             area_id=self.area_id or "demo",
-            block_minutes=LIVE_CAMERA_ACTIVE_CASE_BLOCK_MINUTES,
+            location=self.location,
+            block_seconds=LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS,
         )
         with self.lock:
             result = self.latest_result
@@ -1664,7 +1704,10 @@ class LiveCameraMonitor:
             if detections
             else "No labels"
         )
-        threshold_hit = accident_detected and confidence >= LIVE_CAMERA_CONFIDENCE_THRESHOLD
+        threshold_hit = passes_crash_alert_threshold(
+            confidence,
+            accident_detected=accident_detected,
+        )
 
         if not manual:
             self.hit_window.append(threshold_hit)
@@ -1716,21 +1759,69 @@ class LiveCameraMonitor:
         status = "monitoring-live"
         message = "Monitoring Live"
 
+        def save_detection_snapshot() -> tuple[Path | None, str | None, Path | None, str | None]:
+            key_frame_name = f"live_camera_keyframe_{uuid.uuid4().hex[:8]}.jpg"
+            key_frame_path = OUTPUTS / key_frame_name
+            key_frame_write_succeeded = bool(cv2.imwrite(str(key_frame_path), frame))
+            key_frame_url = (
+                build_output_url_from_base(self.output_base, key_frame_name)
+                if key_frame_write_succeeded
+                else None
+            )
+
+            annotated_name = f"live_camera_{uuid.uuid4().hex[:8]}.jpg"
+            annotated_path = OUTPUTS / annotated_name
+            annotated_frame = draw_detection_boxes_overlay(frame, response_boxes)
+            annotated_write_succeeded = bool(cv2.imwrite(str(annotated_path), annotated_frame))
+            annotated_url = (
+                build_output_url_from_base(self.output_base, annotated_name)
+                if annotated_write_succeeded
+                else None
+            )
+
+            if not key_frame_write_succeeded:
+                log_stream(f"Failed to save live camera key frame: {key_frame_path.name}")
+            if not annotated_write_succeeded:
+                log_stream(f"Failed to save live camera evidence frame: {annotated_path.name}")
+
+            return (
+                key_frame_path if key_frame_write_succeeded else None,
+                key_frame_url,
+                annotated_path if annotated_write_succeeded else None,
+                annotated_url,
+            )
+
         if alert_ready:
             existing_case = find_unresolved_camera_case(
                 self.camera_ip,
                 self.camera_id,
                 self.label,
                 area_id=self.area_id or "demo",
-                block_minutes=LIVE_CAMERA_ACTIVE_CASE_BLOCK_MINUTES,
+                location=self.location,
+                block_seconds=LIVE_CAMERA_DUPLICATE_CASE_BLOCK_SECONDS,
             )
             cooldown_ready = (
                 time.time() - self.last_alert_at
                 >= LIVE_CAMERA_ALERT_COOLDOWN_SECONDS
             )
             if existing_case:
+                (
+                    duplicate_key_frame_path,
+                    duplicate_key_frame_url,
+                    duplicate_annotated_path,
+                    duplicate_annotated_url,
+                ) = save_detection_snapshot()
+                refreshed_case = replace_case_evidence(
+                    existing_case["caseId"],
+                    key_frame_path=duplicate_key_frame_path or duplicate_annotated_path,
+                    thumbnail_path=duplicate_key_frame_path or duplicate_annotated_path,
+                    annotated_path=duplicate_annotated_path,
+                    boxes=response_boxes,
+                    detected_at=checked_at,
+                )
+                existing_case = refreshed_case or existing_case
                 blocked_reason = (
-                    f"Alert blocked because active case already exists: {existing_case['caseId']}"
+                    f"Alert blocked because an active case already exists for this same recent incident: {existing_case['caseId']}"
                 )
                 result_payload.update(
                     {
@@ -1742,22 +1833,19 @@ class LiveCameraMonitor:
                         "activeBlockingCaseId": existing_case["caseId"],
                         "activeBlockingStatus": existing_case["status"],
                         "alertBlockedReason": blocked_reason,
+                        "keyFramePath": existing_case.get("keyFramePath"),
+                        "annotatedPath": existing_case.get("annotatedPath"),
+                        "annotated_media_url": duplicate_annotated_url or duplicate_key_frame_url,
+                        "annotated_media_available": bool(duplicate_annotated_url or duplicate_key_frame_url),
+                        "annotated_media_previewable": bool(duplicate_annotated_url or duplicate_key_frame_url),
+                        "annotated_media_download_url": duplicate_annotated_url or duplicate_key_frame_url,
+                        "annotated_key_frame_url": duplicate_key_frame_url or duplicate_annotated_url,
                     }
                 )
                 status = "possible-crash-detected"
                 message = blocked_reason
             elif cooldown_ready:
-                output_name = f"live_camera_{uuid.uuid4().hex[:8]}.jpg"
-                output_path = OUTPUTS / output_name
-                annotated_frame = draw_detection_boxes_overlay(frame, response_boxes)
-                write_succeeded = bool(cv2.imwrite(str(output_path), annotated_frame))
-                annotated_url = (
-                    build_output_url_from_base(self.output_base, output_name)
-                    if write_succeeded
-                    else None
-                )
-                if not write_succeeded:
-                    log_stream(f"Failed to save live camera evidence frame: {output_path.name}")
+                key_frame_path, key_frame_url, annotated_path, annotated_url = save_detection_snapshot()
                 sqlite_case = persist_sqlite_crash_case(
                     media_type="image",
                     source_file=self.label,
@@ -1767,7 +1855,7 @@ class LiveCameraMonitor:
                     original_path=None,
                     annotated_url=annotated_url,
                     annotated_download_url=annotated_url,
-                    key_frame_url=annotated_url,
+                    key_frame_url=key_frame_url or annotated_url,
                     trigger_status="camera_detection",
                     source_camera=self.label,
                     area_id=self.area_id or "demo",
@@ -1846,7 +1934,7 @@ class LiveCameraMonitor:
                         "annotated_media_available": bool(annotated_url),
                         "annotated_media_previewable": bool(annotated_url),
                         "annotated_media_download_url": annotated_url,
-                        "annotated_key_frame_url": annotated_url,
+                        "annotated_key_frame_url": key_frame_url or annotated_url,
                         "createdAt": checked_at,
                     }
                 )
@@ -1860,7 +1948,7 @@ class LiveCameraMonitor:
         elif accident_detected and not threshold_hit:
             result_payload["persistenceStatus"] = "skipped"
             result_payload["persistenceSkippedReason"] = (
-                "Detection did not create alert because confidence is below threshold."
+                "Detection did not create alert because confidence is below the required 20% threshold."
             )
         else:
             result_payload["persistenceStatus"] = "skipped"
@@ -2111,11 +2199,10 @@ def image_detection_response_from_bgr(
 
     timestamp = datetime.now().isoformat()
     is_camera_detection = (trigger_status or incident_media_type == "cctv") == "camera_detection"
-    required_threshold = LIVE_CAMERA_CONFIDENCE_THRESHOLD if is_camera_detection else None
-    passed_threshold = (
-        bool(accident_detected and best_confidence >= required_threshold)
-        if required_threshold is not None
-        else bool(accident_detected)
+    required_threshold = CRASH_ALERT_CONFIDENCE_THRESHOLD
+    passed_threshold = passes_crash_alert_threshold(
+        best_confidence,
+        accident_detected=accident_detected,
     )
     persistence_status = "not_attempted"
     persistence_skipped_reason = None
@@ -2130,13 +2217,15 @@ def image_detection_response_from_bgr(
     )
 
     sqlite_case = None
-    if is_camera_detection and not accident_detected:
+    if not accident_detected:
         persistence_status = "skipped"
         persistence_skipped_reason = "Detection did not create alert because no crash was detected."
-    elif is_camera_detection and not passed_threshold:
+    elif not passed_threshold:
         persistence_status = "skipped"
-        persistence_skipped_reason = "Detection did not create alert because confidence is below threshold."
-    elif accident_detected:
+        persistence_skipped_reason = (
+            "Detection did not create alert because confidence is below the required 20% threshold."
+        )
+    else:
         case_area_id = area_id or ("demo" if is_camera_detection else None)
         sqlite_case = persist_sqlite_crash_case(
             media_type=api_media_type,
@@ -2198,6 +2287,7 @@ def image_detection_response_from_bgr(
         "status": sqlite_case.get("status") if sqlite_case else None,
         "confidence": best_confidence,
         "lastConfidence": best_confidence,
+        "rawCrashConfidence": best_confidence,
         "requiredThreshold": required_threshold,
         "threshold": required_threshold,
         "passedThreshold": passed_threshold,
@@ -3531,8 +3621,23 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
         else:
             log_video("annotated_media_url returned: no")
 
+        required_threshold = CRASH_ALERT_CONFIDENCE_THRESHOLD
+        passed_threshold = passes_crash_alert_threshold(
+            best_confidence,
+            accident_detected=accident_detected,
+        )
+        persistence_status = "not_attempted"
+        persistence_skipped_reason = None
         sqlite_case = None
-        if accident_detected:
+        if not accident_detected:
+            persistence_status = "skipped"
+            persistence_skipped_reason = "Detection did not create alert because no crash was detected."
+        elif not passed_threshold:
+            persistence_status = "skipped"
+            persistence_skipped_reason = (
+                "Detection did not create alert because confidence is below the required 20% threshold."
+            )
+        else:
             sqlite_case = persist_sqlite_crash_case(
                 media_type="video",
                 source_file=file.filename or "uploaded_video",
@@ -3547,12 +3652,43 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
                 source_camera=file.filename or "uploaded_video",
                 boxes=detection_box_samples,
             )
+            persistence_status = (
+                sqlite_case.get("casePersistenceStatus")
+                if sqlite_case
+                else "failed"
+            )
+            if sqlite_case is None:
+                persistence_skipped_reason = "Crash was detected, but the backend could not save a review case."
+            elif sqlite_case.get("casePersistenceStatus") != "created":
+                persistence_skipped_reason = sqlite_case.get("alertBlockedReason")
+            elif not sqlite_case.get("createdNotificationId"):
+                persistence_status = "failed_missing_notification"
+                persistence_skipped_reason = "Crash case was saved, but no notification id was returned."
+
+        created_notification_id = (
+            sqlite_case.get("createdNotificationId")
+            if sqlite_case and persistence_status == "created"
+            else None
+        )
 
         return {
             "success": True,
             "accident_detected": accident_detected,
             "caseId": sqlite_case["caseId"] if sqlite_case else None,
+            "notificationId": created_notification_id,
             "confidence": best_confidence,
+            "lastConfidence": best_confidence,
+            "rawCrashConfidence": best_confidence,
+            "requiredThreshold": required_threshold,
+            "threshold": required_threshold,
+            "passedThreshold": passed_threshold,
+            "persistenceStatus": persistence_status,
+            "persistenceSkippedReason": persistence_skipped_reason,
+            "casePersistenceStatus": sqlite_case.get("casePersistenceStatus") if sqlite_case else persistence_status,
+            "alertBlockedReason": sqlite_case.get("alertBlockedReason") if sqlite_case else None,
+            "activeBlockingCaseId": sqlite_case.get("activeBlockingCaseId") if sqlite_case else None,
+            "activeBlockingStatus": sqlite_case.get("activeBlockingStatus") if sqlite_case else None,
+            "triggerStatus": "upload_detection",
             "media_type": "video",
             "timestamp": timestamp,
             "location": "Uploaded Video",

@@ -555,10 +555,10 @@ export default function SettingsPage() {
                     type="range"
                     min="0"
                     max="100"
-                    defaultValue="60"
+                    defaultValue="20"
                     className="flex-1"
                   />
-                  <span className="text-sm font-semibold w-12 text-right">60%</span>
+                  <span className="text-sm font-semibold w-12 text-right">20%</span>
                 </div>
                 <p className="text-xs text-muted-foreground mt-2">
                   Minimum confidence level to create a possible crash review case.

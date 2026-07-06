@@ -60,6 +60,7 @@ type AddCameraFormState = {
 
 const CAMERA_CACHE_KEY = 'mycrushguard.savedCctvCamera'
 const RESPONDER_CAMERA_IDS_KEY = 'mycrushguard.responderCameraIds'
+const HIDDEN_CAMERA_IDS_KEY = 'mycrushguard.hiddenCameraFeedIds'
 const RESPONDER_CAMERA_TYPE = 'Responder RTSP Stream'
 
 function isDemoCamera(camera: CctvCamera) {
@@ -196,6 +197,22 @@ function writeResponderCameraIds(ids: Set<string>) {
   window.localStorage.setItem(RESPONDER_CAMERA_IDS_KEY, JSON.stringify([...ids]))
 }
 
+function readHiddenCameraIds() {
+  if (typeof window === 'undefined') return new Set<string>()
+
+  try {
+    const raw = window.localStorage.getItem(HIDDEN_CAMERA_IDS_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return new Set(Array.isArray(parsed) ? parsed.filter((value) => typeof value === 'string') : [])
+  } catch {
+    return new Set<string>()
+  }
+}
+
+function writeHiddenCameraIds(ids: Set<string>) {
+  window.localStorage.setItem(HIDDEN_CAMERA_IDS_KEY, JSON.stringify([...ids]))
+}
+
 function cameraStatusFrameUrl(status?: CameraMonitoringStatus) {
   return status?.latestFrameUrl ?? status?.frameUrl ?? status?.previewUrl ?? status?.imageUrl ?? null
 }
@@ -262,6 +279,7 @@ export default function IpCameraPage() {
   const [savingCamera, setSavingCamera] = useState(false)
   const [removingCameraId, setRemovingCameraId] = useState<string | null>(null)
   const [responderCameraIds, setResponderCameraIds] = useState<Set<string>>(() => new Set())
+  const [hiddenCameraIds, setHiddenCameraIds] = useState<Set<string>>(() => readHiddenCameraIds())
   const [cameraError, setCameraError] = useState('')
   const [cameraStatuses, setCameraStatuses] = useState<Record<string, CameraMonitoringStatus>>({})
   const [cameraPreviewUrls, setCameraPreviewUrls] = useState<Record<string, string>>({})
@@ -294,20 +312,21 @@ export default function IpCameraPage() {
     : null
 
   const savedCameraCount = useMemo(
-    () => cameras.filter((camera) => !isDemoCamera(camera)).length,
-    [cameras]
+    () => cameras.filter((camera) => !isDemoCamera(camera) && !hiddenCameraIds.has(camera.cameraId)).length,
+    [cameras, hiddenCameraIds]
   )
   const savedCameras = useMemo(() => {
     const unique = new Map<string, CctvCamera>()
     for (const camera of cameras) {
       if (isDemoCamera(camera)) continue
+      if (hiddenCameraIds.has(camera.cameraId)) continue
       const uniqueKey = camera.cameraIp?.trim() || camera.streamUrl?.trim() || camera.cameraId
       if (!unique.has(uniqueKey)) {
         unique.set(uniqueKey, camera)
       }
     }
     return [...unique.values()]
-  }, [cameras])
+  }, [cameras, hiddenCameraIds])
   const cameraSlots = useMemo(() => buildCameraSlots(savedCameras), [savedCameras])
   const activeStatusBadges = useMemo(
     () => cameraStatusBadges(activeCameraStatus, activeCamera),
@@ -317,8 +336,8 @@ export default function IpCameraPage() {
     (camera: CctvCamera) =>
       isResponder &&
       !isDemoCamera(camera) &&
-      (responderCameraIds.has(camera.cameraId) || isResponderCreatedCamera(camera)),
-    [isResponder, responderCameraIds]
+      !hiddenCameraIds.has(camera.cameraId),
+    [hiddenCameraIds, isResponder]
   )
 
   const applyCamera = useCallback((camera: CctvCamera | null) => {
@@ -333,7 +352,8 @@ export default function IpCameraPage() {
     try {
       const items = await getCctvCameras()
       setCameras(items)
-      const defaultCamera = pickDefaultCamera(items, areaId)
+      const visibleItems = items.filter((camera) => !hiddenCameraIds.has(camera.cameraId))
+      const defaultCamera = pickDefaultCamera(visibleItems, areaId)
 
       if (defaultCamera) {
         applyCamera(defaultCamera)
@@ -346,7 +366,12 @@ export default function IpCameraPage() {
       if (cached) {
         try {
           const cachedCamera = JSON.parse(cached) as CctvCamera
-          applyCamera(cachedCamera)
+          if (cachedCamera.cameraId && !hiddenCameraIds.has(cachedCamera.cameraId)) {
+            applyCamera(cachedCamera)
+          } else {
+            window.localStorage.removeItem(CAMERA_CACHE_KEY)
+            applyCamera(null)
+          }
         } catch {
         }
       }
@@ -354,7 +379,7 @@ export default function IpCameraPage() {
     } finally {
       setLoadingCameras(false)
     }
-  }, [applyCamera, areaId])
+  }, [applyCamera, areaId, hiddenCameraIds])
 
   useEffect(() => {
     setForm((current) => ({
@@ -369,6 +394,7 @@ export default function IpCameraPage() {
 
   useEffect(() => {
     setResponderCameraIds(readResponderCameraIds())
+    setHiddenCameraIds(readHiddenCameraIds())
   }, [])
 
   const setPreviewUrl = useCallback((cameraId: string, objectUrl: string) => {
@@ -587,7 +613,7 @@ export default function IpCameraPage() {
 
   const removeResponderCamera = async (camera: CctvCamera) => {
     if (!canRemoveCamera(camera)) {
-      setCameraError('Only cameras added by this responder can be removed.')
+      setCameraError('This camera cannot be removed from your feed list.')
       return
     }
 
@@ -595,25 +621,34 @@ export default function IpCameraPage() {
     setCameraError('')
 
     try {
-      await saveCctvCamera({
-        cameraId: camera.cameraId,
-        label: camera.label,
-        cameraIp: camera.cameraIp ?? undefined,
-        streamUrl: camera.streamUrl ?? undefined,
-        areaId: camera.areaId ?? areaId,
-        barangay: camera.barangay ?? camera.areaId ?? areaId,
-        roadName: camera.roadName ?? undefined,
-        location: camera.location ?? camera.locationDescription ?? undefined,
-        locationDescription: camera.locationDescription ?? camera.location ?? undefined,
-        latitude: camera.latitude ?? undefined,
-        longitude: camera.longitude ?? undefined,
-        cameraType: camera.cameraType ?? RESPONDER_CAMERA_TYPE,
-        status: 'inactive',
-        isActive: false,
-        detectionEnabled: false,
-      })
+      const shouldDeactivateCamera =
+        responderCameraIds.has(camera.cameraId) || isResponderCreatedCamera(camera)
+
+      if (shouldDeactivateCamera) {
+        await saveCctvCamera({
+          cameraId: camera.cameraId,
+          label: camera.label,
+          cameraIp: camera.cameraIp ?? undefined,
+          streamUrl: camera.streamUrl ?? undefined,
+          areaId: camera.areaId ?? areaId,
+          barangay: camera.barangay ?? camera.areaId ?? areaId,
+          roadName: camera.roadName ?? undefined,
+          location: camera.location ?? camera.locationDescription ?? undefined,
+          locationDescription: camera.locationDescription ?? camera.location ?? undefined,
+          latitude: camera.latitude ?? undefined,
+          longitude: camera.longitude ?? undefined,
+          cameraType: camera.cameraType ?? RESPONDER_CAMERA_TYPE,
+          status: 'inactive',
+          isActive: false,
+          detectionEnabled: false,
+        })
+      }
 
       const nextCameras = cameras.filter((item) => item.cameraId !== camera.cameraId)
+      const nextHiddenCameraIds = new Set(hiddenCameraIds)
+      nextHiddenCameraIds.add(camera.cameraId)
+      writeHiddenCameraIds(nextHiddenCameraIds)
+      setHiddenCameraIds(nextHiddenCameraIds)
       setCameras(nextCameras)
       setResponderCameraIds((current) => {
         const next = new Set(current)
@@ -624,7 +659,10 @@ export default function IpCameraPage() {
       clearPreviewUrl(camera.cameraId)
 
       if (activeCamera?.cameraId === camera.cameraId) {
-        const replacement = pickDefaultCamera(nextCameras, areaId)
+        const replacement = pickDefaultCamera(
+          nextCameras.filter((item) => !nextHiddenCameraIds.has(item.cameraId)),
+          areaId
+        )
         applyCamera(replacement)
         if (replacement) {
           window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(replacement))
@@ -839,7 +877,7 @@ export default function IpCameraPage() {
                                 <AlertDialogHeader>
                                   <AlertDialogTitle>Remove camera?</AlertDialogTitle>
                                   <AlertDialogDescription>
-                                    Are you sure you want to remove this camera?
+                                    Are you sure you want to remove this camera from your camera feeds?
                                   </AlertDialogDescription>
                                 </AlertDialogHeader>
                                 <AlertDialogFooter>
