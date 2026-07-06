@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { useTheme } from 'next-themes'
 
 import { Sidebar, DashboardHeader } from '@/components/dashboard-sidebar'
@@ -10,6 +11,17 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 import {
   Select,
   SelectContent,
@@ -21,6 +33,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Loader2,
+  LogOut,
   RotateCcw,
   Save,
   Settings2,
@@ -38,9 +51,13 @@ import { useAuth } from '@/components/auth-provider'
 import { useDisplayMode } from '@/lib/display-mode'
 
 export default function SettingsPage() {
-  const { profile } = useAuth()
+  const router = useRouter()
+  const { profile, signOutUser } = useAuth()
   const { canUseAdvanced, isAdvancedMode, mode, setMode } = useDisplayMode(profile)
-  const { setTheme, theme } = useTheme()
+  const { setTheme, theme, resolvedTheme } = useTheme()
+  const normalizedRole = String(profile?.role ?? '').toLowerCase()
+  const activeTheme = theme === 'system' ? resolvedTheme : theme
+  const [isSigningOut, setIsSigningOut] = useState(false)
   const [backendStatus, setBackendStatus] = useState<
     'checking' | 'reachable' | 'unreachable'
   >('checking')
@@ -55,6 +72,10 @@ export default function SettingsPage() {
   const [cameraSettingsSaving, setCameraSettingsSaving] = useState(false)
 
   useEffect(() => {
+    if (normalizedRole !== 'admin') {
+      return
+    }
+
     let cancelled = false
 
     async function loadBackendHealth() {
@@ -94,7 +115,7 @@ export default function SettingsPage() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [normalizedRole])
 
   const updateCameraSetting = (key: keyof CameraSettings, value: string | number) => {
     setCameraSettings((current) => ({ ...current, [key]: value }))
@@ -121,6 +142,16 @@ export default function SettingsPage() {
     }
   }
 
+  const handleSignOut = async () => {
+    setIsSigningOut(true)
+    try {
+      await signOutUser()
+      router.replace('/login')
+    } finally {
+      setIsSigningOut(false)
+    }
+  }
+
   const backendStatusIndicatorClass =
     backendStatus === 'reachable'
       ? 'bg-[var(--status-online)]'
@@ -140,7 +171,94 @@ export default function SettingsPage() {
         ? 'Not reachable'
         : 'Checking'
 
-  if (String(profile?.role ?? '').toLowerCase() !== 'admin') {
+  if (normalizedRole === 'responder') {
+    return (
+      <div className="flex min-h-screen bg-background">
+        <Sidebar />
+        <div className="flex-1 md:ml-0">
+          <DashboardHeader />
+
+          <main className="space-y-6 p-6">
+            <div>
+              <h1 className="text-3xl font-bold">Settings</h1>
+              <p className="text-muted-foreground">
+                Manage your responder display and account options.
+              </p>
+            </div>
+
+            <div className="max-w-2xl space-y-6">
+              <Card className="border border-border bg-card/70 p-6">
+                <div className="border-b border-border pb-4">
+                  <h2 className="text-xl font-semibold">Appearance</h2>
+                </div>
+
+                <div className="mt-4 space-y-3">
+                  <Label className="text-sm font-semibold">Theme</Label>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Button
+                      type="button"
+                      variant={activeTheme === 'light' ? 'default' : 'outline'}
+                      className="justify-start"
+                      onClick={() => setTheme('light')}
+                    >
+                      Light Mode
+                    </Button>
+                    <Button
+                      type="button"
+                      variant={activeTheme === 'dark' ? 'default' : 'outline'}
+                      className="justify-start"
+                      onClick={() => setTheme('dark')}
+                    >
+                      Dark Mode
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Theme changes apply across responder dashboard pages.
+                  </p>
+                </div>
+              </Card>
+
+              <Card className="border border-border bg-card/70 p-6">
+                <div className="border-b border-border pb-4">
+                  <h2 className="text-xl font-semibold">Account</h2>
+                </div>
+
+                <div className="mt-4 space-y-3">
+                  <p className="text-sm text-muted-foreground">
+                    Sign out of this responder session.
+                  </p>
+                  <AlertDialog>
+                    <AlertDialogTrigger asChild>
+                      <Button type="button" variant="outline" className="gap-2" disabled={isSigningOut}>
+                        <LogOut className="h-4 w-4" />
+                        Sign Out
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent className="sm:max-w-md">
+                      <AlertDialogHeader className="items-center gap-3 text-center">
+                        <AlertDialogTitle>Are you sure you want to logout?</AlertDialogTitle>
+                        <AlertDialogDescription className="max-w-sm text-center">
+                          You will need to sign in again to access the dashboard.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter className="mt-2 gap-5 sm:justify-center">
+                        <AlertDialogCancel>No</AlertDialogCancel>
+                        <AlertDialogAction onClick={handleSignOut} disabled={isSigningOut}>
+                          Yes
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                </div>
+              </Card>
+            </div>
+          </main>
+        </div>
+      </div>
+    )
+  }
+
+  if (normalizedRole !== 'admin') {
     return <PermissionMessage />
   }
 

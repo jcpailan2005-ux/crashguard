@@ -61,6 +61,7 @@ interface LiveCameraProps {
   initialSourceTab?: 'device' | 'cctv'
   autoStartCctv?: boolean
   autoStartCctvKey?: string | null
+  controlRoomMode?: boolean
   managedCctvMode?: boolean
   onDetectionResult?: (result: DetectionResponse) => void
   onFrameResult?: (result: DetectionResponse | null, rawFrameDataUrl: string | null) => void
@@ -420,6 +421,7 @@ export function LiveCamera({
   initialSourceTab = 'device',
   autoStartCctv = false,
   autoStartCctvKey,
+  controlRoomMode = false,
   managedCctvMode = false,
   onDetectionResult,
   onFrameResult,
@@ -1449,7 +1451,7 @@ export function LiveCamera({
           onValueChange={handleSourceTabChange}
           className="gap-0 rounded-none border-0 bg-transparent shadow-none"
         >
-          {(!managedCctvMode || isAdvancedMode) ? (
+          {(!controlRoomMode && (!managedCctvMode || isAdvancedMode)) ? (
           <div className="border-b border-border px-4 pt-4">
             <TabsList className="h-auto w-full flex-wrap justify-start gap-1 sm:w-auto">
               <TabsTrigger value="device" className="gap-1.5">
@@ -1702,6 +1704,7 @@ export function LiveCamera({
             )}
           </CctvVideoOverlay>
 
+          {!controlRoomMode ? (
           <div className="space-y-4 p-4">
             {error && (
               <Alert variant="destructive">
@@ -1898,6 +1901,7 @@ export function LiveCamera({
               </Button>
             ) : null}
           </div>
+          ) : null}
         </Tabs>
 
         <canvas ref={canvasRef} className="hidden" />

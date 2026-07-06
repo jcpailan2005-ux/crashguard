@@ -1,9 +1,9 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, CheckCircle2, MapPin, RefreshCw, Save, Video } from 'lucide-react'
+import { AlertTriangle, MapPin, RefreshCw, Save, Video } from 'lucide-react'
 
-import { DashboardHeader, Sidebar } from '@/components/dashboard-sidebar'
+import { Sidebar } from '@/components/dashboard-sidebar'
 import { LiveCamera } from '@/components/live-camera'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -142,15 +142,6 @@ function cameraStatusFrameUrl(status?: CameraMonitoringStatus) {
   return status?.latestFrameUrl ?? status?.frameUrl ?? status?.previewUrl ?? status?.imageUrl ?? null
 }
 
-function primaryCameraStatusLabel(status: CameraMonitoringStatus | undefined, camera: CctvCamera | null) {
-  if (!camera || !camera.isActive || !camera.detectionEnabled) return 'OFFLINE'
-  if (status?.reconnecting || status?.status === 'reconnecting') return 'RECONNECTING'
-  if (status?.lastError || status?.status === 'connection-lost') return 'OFFLINE'
-  if (status?.detectionRunning) return 'SCANNING'
-  if (status?.monitoringLive || status?.cameraConnected || status?.latestFrameAvailable) return 'LIVE'
-  return 'OFFLINE'
-}
-
 function cameraStatusBadges(status: CameraMonitoringStatus | undefined, camera: CctvCamera | null) {
   if (!camera || !camera.isActive || !camera.detectionEnabled) return ['OFFLINE']
   if (status?.reconnecting || status?.status === 'reconnecting') return ['RECONNECTING']
@@ -189,7 +180,7 @@ function latestAlertId(status?: CameraMonitoringStatus) {
 
 function buildCameraSlots(cameras: CctvCamera[]): CameraSlot[] {
   const slots: CameraSlot[] = cameras.map((camera, index) => ({ camera, slotNumber: index + 1 }))
-  while (slots.length < 3) {
+  if (slots.length < 3) {
     slots.push({ camera: null, slotNumber: slots.length + 1 })
   }
   return slots
@@ -207,7 +198,6 @@ export default function IpCameraPage() {
   const [form, setForm] = useState<CameraFormState>(() => emptyCameraForm(areaId))
   const [loadingCameras, setLoadingCameras] = useState(true)
   const [savingCamera, setSavingCamera] = useState(false)
-  const [cameraMessage, setCameraMessage] = useState('')
   const [cameraError, setCameraError] = useState('')
   const [cameraStatuses, setCameraStatuses] = useState<Record<string, CameraMonitoringStatus>>({})
   const [cameraPreviewUrls, setCameraPreviewUrls] = useState<Record<string, string>>({})
@@ -222,11 +212,6 @@ export default function IpCameraPage() {
         ? safeCameraName(activeCamera)
         : 'Manual CCTV Camera'
   const activeCameraSource = activeCameraName
-  const activeStatusLabel = cameraError
-    ? 'Needs Attention'
-    : activeCamera
-      ? primaryCameraStatusLabel(activeCameraStatus, activeCamera)
-      : 'Offline'
   const shouldAutoStartCctv = Boolean(
     activeCamera?.isActive &&
       activeCamera.detectionEnabled &&
@@ -245,10 +230,17 @@ export default function IpCameraPage() {
     () => cameras.filter((camera) => !isDemoCamera(camera)).length,
     [cameras]
   )
-  const savedCameras = useMemo(
-    () => cameras.filter((camera) => !isDemoCamera(camera)),
-    [cameras]
-  )
+  const savedCameras = useMemo(() => {
+    const unique = new Map<string, CctvCamera>()
+    for (const camera of cameras) {
+      if (isDemoCamera(camera)) continue
+      const uniqueKey = camera.cameraIp?.trim() || camera.streamUrl?.trim() || camera.cameraId
+      if (!unique.has(uniqueKey)) {
+        unique.set(uniqueKey, camera)
+      }
+    }
+    return [...unique.values()]
+  }, [cameras])
   const cameraSlots = useMemo(() => buildCameraSlots(savedCameras), [savedCameras])
   const activeStatusBadges = useMemo(
     () => cameraStatusBadges(activeCameraStatus, activeCamera),
@@ -271,11 +263,9 @@ export default function IpCameraPage() {
 
       if (defaultCamera) {
         applyCamera(defaultCamera)
-        setCameraMessage(`Monitoring ${safeCameraName(defaultCamera)}`)
         window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(defaultCamera))
       } else {
         applyCamera(null)
-        setCameraMessage('No saved CCTV cameras yet. Ask admin to add cameras.')
       }
     } catch (error) {
       const cached = window.localStorage.getItem(CAMERA_CACHE_KEY)
@@ -283,9 +273,7 @@ export default function IpCameraPage() {
         try {
           const cachedCamera = JSON.parse(cached) as CctvCamera
           applyCamera(cachedCamera)
-          setCameraMessage('Using locally cached camera values until the backend is reachable.')
         } catch {
-          setCameraMessage('')
         }
       }
       setCameraError(error instanceof Error ? error.message : 'Could not load saved cameras.')
@@ -442,7 +430,6 @@ export default function IpCameraPage() {
         return [saved, ...withoutSaved]
       })
       window.localStorage.setItem(CAMERA_CACHE_KEY, JSON.stringify(saved))
-      setCameraMessage(`Saved camera: ${safeCameraName(saved)}`)
     } catch (error) {
       setCameraError(error instanceof Error ? error.message : 'Could not save camera.')
     } finally {
@@ -454,94 +441,25 @@ export default function IpCameraPage() {
     <div className="flex min-h-screen bg-background">
       <Sidebar />
       <div className="flex-1 md:ml-0">
-        <DashboardHeader />
+        <main className="space-y-4 p-4 pt-16 md:p-6 md:pt-6">
+          {cameraError ? (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertDescription>
+                {canEditCameraSettings
+                  ? cameraError
+                  : 'Unable to connect to this CCTV. Please ask the admin to check the camera settings.'}
+              </AlertDescription>
+            </Alert>
+          ) : null}
 
-        <main className="space-y-6 p-6">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-            <div className="min-w-0">
-              <h1 className="mb-2 text-3xl font-bold">CCTV Monitoring</h1>
-              <p className="text-muted-foreground">
-                Monitor assigned traffic cameras from a control-room view.
-              </p>
-            </div>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => void loadSavedCameras()}
-              disabled={loadingCameras}
-            >
-              <RefreshCw className={`mr-2 h-4 w-4 ${loadingCameras ? 'animate-spin' : ''}`} />
-              Refresh
-            </Button>
-          </div>
-
-          <div className="space-y-4 rounded-lg border border-border bg-card p-4">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                    Control room status
-                  </span>
-                  {activeCamera ? (
-                    activeStatusBadges.map((badge) => (
-                      <Badge key={badge} variant={statusBadgeVariant(badge)}>
-                        {badge}
-                      </Badge>
-                    ))
-                  ) : (
-                    <Badge variant="outline">OFFLINE</Badge>
-                  )}
-                  {latestAlertId(activeCameraStatus) ? (
-                    <Badge variant="destructive">ALERT</Badge>
-                  ) : null}
-                </div>
-                <p className="mt-2 break-words text-lg font-semibold [overflow-wrap:anywhere]">
-                  {activeCamera ? safeCameraName(activeCamera) : 'No CCTV available'}
-                </p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {activeCamera
-                    ? `Area/location: ${cameraLocationLabel(activeCamera, activeAreaId)}`
-                    : 'Please connect or assign a CCTV camera.'}
-                </p>
-              </div>
-              <div className="flex flex-wrap gap-2 text-sm">
-                <div className="rounded-md border border-border px-3 py-2">
-                  <p className="text-muted-foreground">Active camera</p>
-                  <p className="font-medium">{activeCamera ? activeCameraName : 'None'}</p>
-                </div>
-                <div className="rounded-md border border-border px-3 py-2">
-                  <p className="text-muted-foreground">Status</p>
-                  <p className="font-medium">{activeStatusLabel}</p>
-                </div>
-              </div>
-            </div>
-
-            {cameraError ? (
-              <Alert variant="destructive">
-                <AlertTriangle className="h-4 w-4" />
-                <AlertDescription>
-                  {canEditCameraSettings
-                    ? cameraError
-                    : 'Unable to connect to this CCTV. Please ask the admin to check the camera settings.'}
-                </AlertDescription>
-              </Alert>
-            ) : null}
-
-            {cameraMessage && (showAdvancedCameraControls || !activeCamera) ? (
-              <Alert>
-                <CheckCircle2 className="h-4 w-4" />
-                <AlertDescription>{cameraMessage}</AlertDescription>
-              </Alert>
-            ) : null}
-          </div>
-
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_22rem]">
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_21rem]">
             <section className="min-w-0 space-y-3">
-              <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2 font-medium">
+                  <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
                     <Video className="h-4 w-4 shrink-0" />
-                    <span className="break-words [overflow-wrap:anywhere]">
+                    <span className="break-words text-foreground [overflow-wrap:anywhere]">
                       {activeCamera ? safeCameraName(activeCamera) : 'No CCTV available'}
                     </span>
                   </div>
@@ -577,6 +495,7 @@ export default function IpCameraPage() {
                   initialSourceTab="cctv"
                   autoStartCctv={shouldAutoStartCctv}
                   autoStartCctvKey={autoStartCctvKey}
+                  controlRoomMode
                   detectionIntervalMs={1000}
                   managedCctvMode
                 />
@@ -591,26 +510,45 @@ export default function IpCameraPage() {
             </section>
 
             <aside className="min-w-0 rounded-lg border border-border bg-card">
-              <div className="border-b border-border p-4">
-                <h2 className="font-semibold">Camera feeds</h2>
-                <p className="text-sm text-muted-foreground">
-                  Select a thumbnail to open it in the main preview.
-                </p>
+              <div className="flex items-start justify-between gap-3 border-b border-border p-3">
+                <div className="min-w-0">
+                  <h2 className="font-semibold">Camera feeds</h2>
+                  <p className="text-sm text-muted-foreground">
+                    Select a feed to open it.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="outline"
+                  onClick={() => void loadSavedCameras()}
+                  disabled={loadingCameras}
+                  aria-label="Refresh camera feeds"
+                >
+                  <RefreshCw className={`h-4 w-4 ${loadingCameras ? 'animate-spin' : ''}`} />
+                </Button>
               </div>
               <div className="grid gap-3 p-3 sm:grid-cols-2 xl:max-h-[calc(100vh-220px)] xl:grid-cols-1 xl:overflow-y-auto">
                 {cameraSlots.map(({ camera, slotNumber }) => {
                   if (!camera) {
+                    const emptyTitle = savedCameras.length === 0
+                      ? 'Waiting for assigned camera'
+                      : 'No other CCTV available'
                     return (
                       <div
                         key={`empty-thumbnail-${slotNumber}`}
                         className="overflow-hidden rounded-lg border border-dashed border-border bg-background"
                       >
                         <div className="flex aspect-video items-center justify-center bg-zinc-950 text-xs font-medium uppercase tracking-wide text-zinc-500">
-                          Empty slot
+                          {savedCameras.length === 0 ? 'No feed' : 'Standby'}
                         </div>
                         <div className="p-3">
-                          <p className="font-medium">Camera Slot {slotNumber}</p>
-                          <p className="text-sm text-muted-foreground">No CCTV assigned</p>
+                          <p className="font-medium">{emptyTitle}</p>
+                          <p className="text-sm text-muted-foreground">
+                            {savedCameras.length === 0
+                              ? 'Please connect or assign a CCTV camera.'
+                              : 'Waiting for assigned camera'}
+                          </p>
                         </div>
                       </div>
                     )

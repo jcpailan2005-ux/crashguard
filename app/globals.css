@@ -11,7 +11,10 @@
   --popover: #ffffff;
   --popover-foreground: #111827;
   --primary: #0f766e;
+  --primary-hover: #115e59;
   --primary-foreground: #ffffff;
+  --button-outline-hover: #f1f5f9;
+  --button-outline-hover-border: #99c9c3;
   --secondary: #e5e7eb;
   --secondary-foreground: #111827;
   --muted: #eef2f7;
@@ -71,7 +74,10 @@
   --popover: #111111;
   --popover-foreground: #f5f5f5;
   --primary: #ff6a00;
+  --primary-hover: #ff7a1a;
   --primary-foreground: #090909;
+  --button-outline-hover: #1d1d1d;
+  --button-outline-hover-border: #3a3a3a;
   --secondary: #1d1d1d;
   --secondary-foreground: #f5f5f5;
   --muted: #1d1d1d;

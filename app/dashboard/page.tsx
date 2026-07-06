@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
-  BarChart3,
+  Camera,
   ClipboardCheck,
   Clock,
   ListChecks,
@@ -155,13 +155,13 @@ export default function DashboardPage() {
             </Card>
 
             <Card className="border border-border bg-card p-5">
-              <BarChart3 className="mb-3 h-8 w-8 text-muted-foreground" />
-              <h2 className="font-semibold">Analytics</h2>
+              <Camera className="mb-3 h-8 w-8 text-muted-foreground" />
+              <h2 className="font-semibold">Live Camera</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                View local detection trends, false alarms, and response-time metrics.
+                View live camera feed and run crash detection monitoring.
               </p>
               <Button asChild variant="outline" className="mt-4 w-full">
-                <Link href="/dashboard/analytics">View Analytics</Link>
+                <Link href="/dashboard/ip-camera">Open Live Camera</Link>
               </Button>
             </Card>
           </div>

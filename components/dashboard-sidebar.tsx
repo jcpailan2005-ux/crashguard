@@ -78,6 +78,7 @@ export function Sidebar() {
   const normalizedRole = String(profile?.role ?? '').toLowerCase()
   const isAdmin = normalizedRole === 'admin'
   const isNormalUser = normalizedRole === 'user'
+  const isResponder = normalizedRole === 'responder'
   const responderArea = normalizedRole === 'responder' ? profile?.areaId ?? null : null
   const roleLabel =
     isAdmin
@@ -87,9 +88,9 @@ export function Sidebar() {
         : 'User'
   const effectiveNavItems = isNormalUser
     ? navItems.filter((item) => item.href === '/samples')
-    : responderArea
+    : isResponder
       ? navItems.filter((item) =>
-          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/samples'].includes(
+          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/samples', '/dashboard/settings'].includes(
             item.href
           )
         )
@@ -236,27 +237,29 @@ export function Sidebar() {
 
         {/* Footer status */}
         <div className="flex-shrink-0 space-y-2 border-t border-sidebar-border bg-sidebar p-4">
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button type="button" variant="outline" className="w-full" disabled={isSigningOut}>
-                Sign Out
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent className="sm:max-w-md">
-              <AlertDialogHeader className="items-center gap-3 text-center">
-                <AlertDialogTitle>Are you sure you want to logout?</AlertDialogTitle>
-                <AlertDialogDescription className="max-w-sm text-center">
-                  You will need to sign in again to access the dashboard.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter className="mt-2 gap-5 sm:justify-center">
-                <AlertDialogCancel>No</AlertDialogCancel>
-                <AlertDialogAction onClick={handleSignOut} disabled={isSigningOut}>
-                  Yes
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+          {!isResponder ? (
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button type="button" variant="outline" className="w-full" disabled={isSigningOut}>
+                  Sign Out
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent className="sm:max-w-md">
+                <AlertDialogHeader className="items-center gap-3 text-center">
+                  <AlertDialogTitle>Are you sure you want to logout?</AlertDialogTitle>
+                  <AlertDialogDescription className="max-w-sm text-center">
+                    You will need to sign in again to access the dashboard.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter className="mt-2 gap-5 sm:justify-center">
+                  <AlertDialogCancel>No</AlertDialogCancel>
+                  <AlertDialogAction onClick={handleSignOut} disabled={isSigningOut}>
+                    Yes
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          ) : null}
           <div className="bg-card/50 rounded-lg p-3 border border-border">
             <div className="space-y-2 text-xs">
               <div className="flex items-center justify-between gap-2">
