@@ -1,0 +1,71 @@
+{
+  "dataset": "C:\\Users\\Lenovo\\Desktop\\MyCrushguard\\backend\\datasets\\crash_classification",
+  "base_model": "yolov8n-cls.pt",
+  "run_dir": "C:\\Users\\Lenovo\\Desktop\\MyCrushguard\\backend\\runs\\crash_classifier\\train2",
+  "best_model": "C:\\Users\\Lenovo\\Desktop\\MyCrushguard\\backend\\runs\\crash_classifier\\train2\\weights\\best.pt",
+  "final_model": "C:\\Users\\Lenovo\\Desktop\\MyCrushguard\\backend\\models\\crash_classifier.pt",
+  "epochs": 5,
+  "imgsz": 224,
+  "batch": 32,
+  "device": "cpu",
+  "evaluation": {
+    "val": {
+      "split": "val",
+      "total": 1941,
+      "accuracy": 0.9649665121071612,
+      "macro_precision": 0.9651409782022252,
+      "macro_recall": 0.9649928227429863,
+      "per_class": {
+        "accident": {
+          "precision": 0.974816369359916,
+          "recall": 0.9547790339157246,
+          "support": 973
+        },
+        "non_accident": {
+          "precision": 0.9554655870445344,
+          "recall": 0.9752066115702479,
+          "support": 968
+        }
+      },
+      "confusion_matrix": {
+        "accident": {
+          "accident": 929,
+          "non_accident": 44
+        },
+        "non_accident": {
+          "accident": 24,
+          "non_accident": 944
+        }
+      }
+    },
+    "test": {
+      "split": "test",
+      "total": 1941,
+      "accuracy": 0.9613601236476044,
+      "macro_precision": 0.9616608412039054,
+      "macro_recall": 0.9613667491267373,
+      "per_class": {
+        "accident": {
+          "precision": 0.9735729386892178,
+          "recall": 0.9485066941297632,
+          "support": 971
+        },
+        "non_accident": {
+          "precision": 0.949748743718593,
+          "recall": 0.9742268041237113,
+          "support": 970
+        }
+      },
+      "confusion_matrix": {
+        "accident": {
+          "accident": 921,
+          "non_accident": 50
+        },
+        "non_accident": {
+          "accident": 25,
+          "non_accident": 945
+        }
+      }
+    }
+  }
+}

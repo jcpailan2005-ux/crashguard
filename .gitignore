@@ -106,3 +106,9 @@ backend/datasets/crash_classification/test/
 backend/datasets/crash_classification/train/
 backend/datasets/crash_classification/val/
 backend/datasets/crash_classification/test/
+
+backend/runs/
+backend/datasets/crash_classification/**/*.cache
+backend/datasets/crash_classification/train/
+backend/datasets/crash_classification/val/
+backend/datasets/crash_classification/test/
