@@ -10,7 +10,6 @@ import {
   Eye,
   FileText,
   MapPin,
-  Phone,
   Send,
   ShieldQuestion,
   Truck,
@@ -45,6 +44,7 @@ import {
   CaseStatus,
   getCaseStatusLabel,
 } from '@/lib/incident-status'
+import { getAreaLabel } from '@/lib/locations'
 import { getCaseStatusClass } from '@/lib/theme-status'
 import { CrashCase, DetectionBox } from '@/lib/types'
 
@@ -92,13 +92,11 @@ function getReviewActions(status: CaseStatus): DisplayAction[] {
     case 'confirmed_crash':
       return [
         { kind: 'state', action: 'dispatch_help', icon: <Truck className="h-4 w-4" />, className: 'bg-destructive text-destructive-foreground hover:bg-destructive/90' },
-        { kind: 'state', action: 'contact_user', icon: <Phone className="h-4 w-4" /> },
         { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
       ]
     case 'dispatched':
       return [
         { kind: 'state', action: 'resolve_case', icon: <ClipboardList className="h-4 w-4" /> },
-        { kind: 'state', action: 'contact_user', icon: <Phone className="h-4 w-4" /> },
         { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
       ]
     case 'false_alarm':
@@ -128,6 +126,62 @@ function formatDetectedTime(value: string) {
     hour: 'numeric',
     minute: '2-digit',
   })
+}
+
+function normalizeDisplayText(value?: string | null) {
+  return value?.trim().replace(/\s+/g, ' ') ?? ''
+}
+
+function formatAreaLabel(areaId?: string | null) {
+  const normalized = normalizeDisplayText(areaId)
+  if (!normalized) return 'Unassigned'
+
+  const knownAreaLabel = getAreaLabel(normalized)
+  if (knownAreaLabel !== 'Fallback Demo Location') return knownAreaLabel
+
+  return normalized
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function isSensitiveLocationText(value: string) {
+  const normalized = value.toLowerCase()
+
+  return (
+    /(?:https?|rtsp):\/\//i.test(value) ||
+    /\b(?:\d{1,3}\.){3}\d{1,3}\b/.test(value) ||
+    /\/\/[^/\s]*@/.test(value) ||
+    /(?:username|password|credential|token|streamurl|cameraip|rtsp)/i.test(value) ||
+    normalized.includes('://') ||
+    normalized.includes('@')
+  )
+}
+
+function getIncidentLocationLabel(caseItem: CrashCase) {
+  const locationLabel = normalizeDisplayText(caseItem.location.label)
+  const fallbackArea = formatAreaLabel(caseItem.location.areaId)
+  const cameraValues = [
+    caseItem.cameraName,
+    caseItem.sourceCamera,
+    caseItem.media.sourceFile,
+    caseItem.cameraId,
+    caseItem.cameraIp,
+  ]
+    .map(normalizeDisplayText)
+    .filter(Boolean)
+    .map((value) => value.toLowerCase())
+
+  if (
+    locationLabel &&
+    !isSensitiveLocationText(locationLabel) &&
+    !cameraValues.includes(locationLabel.toLowerCase())
+  ) {
+    return locationLabel
+  }
+
+  return fallbackArea
 }
 
 function EvidenceImageWithBoxes({
@@ -229,9 +283,6 @@ export function IncidentReviewDialog({
     setSubmittingAction(action)
     try {
       if (caseItem.caseId.startsWith('CASE-')) {
-        if (action === 'contact_user') {
-          throw new Error('Contact logging is only available for Firestore cases.')
-        }
         const updatedCase = await applyLocalCrashCaseAction(caseItem.caseId, {
           action,
           actorId,
@@ -346,7 +397,7 @@ export function IncidentReviewDialog({
                       Location
                     </p>
                     <p className="whitespace-normal break-words text-left text-sm font-semibold leading-snug text-foreground [overflow-wrap:anywhere] sm:text-right">
-                      {caseItem.location.label}
+                      {getIncidentLocationLabel(caseItem)}
                     </p>
                   </div>
                   <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
@@ -572,35 +623,6 @@ export function IncidentReviewDialog({
               </AccordionContent>
             </AccordionItem>
             ) : null}
-
-            <AccordionItem value="people">
-              <AccordionTrigger>
-                <span className="inline-flex items-center gap-2">
-                  <Phone className="h-4 w-4" />
-                  User and Vehicle Info
-                </span>
-              </AccordionTrigger>
-              <AccordionContent>
-                <div className="grid gap-4 pb-3 text-sm sm:grid-cols-2">
-                  <div>
-                    <p className="font-medium">User</p>
-                    <p className="text-muted-foreground">{caseItem.user?.name ?? 'Not provided'}</p>
-                    <p className="text-muted-foreground">
-                      {caseItem.user?.phone ?? caseItem.user?.email ?? 'No contact information'}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="font-medium">Vehicle</p>
-                    <p className="text-muted-foreground">{caseItem.vehicle?.plateNumber ?? 'Not provided'}</p>
-                    <p className="text-muted-foreground">
-                      {[caseItem.vehicle?.color, caseItem.vehicle?.type]
-                        .filter(Boolean)
-                        .join(' ') || 'No vehicle description'}
-                    </p>
-                  </div>
-                </div>
-              </AccordionContent>
-            </AccordionItem>
 
             <AccordionItem value="history">
               <AccordionTrigger>
