@@ -212,6 +212,9 @@ function formatConfidencePercent(value: number, digits = 1): string {
 
 function getCrashConfidence(result: DetectionResponse): number | null {
   return (
+    normalizeConfidenceFraction(result.accidentProbability) ??
+    normalizeConfidenceFraction(result.crashScore) ??
+    normalizeConfidenceFraction(result.crashConfidence) ??
     normalizeConfidenceFraction(result.rawCrashConfidence) ??
     normalizeConfidenceFraction(result.lastConfidence) ??
     normalizeConfidenceFraction(result.confidence)
@@ -219,8 +222,12 @@ function getCrashConfidence(result: DetectionResponse): number | null {
 }
 
 function getRequiredCrashThreshold(result: DetectionResponse): number | null {
-  void result
-  return CRASH_ALERT_REQUIRED_THRESHOLD
+  return (
+    normalizeConfidenceFraction(result.requiredThreshold) ??
+    normalizeConfidenceFraction(result.decisionThreshold) ??
+    normalizeConfidenceFraction(result.caseThreshold) ??
+    CRASH_ALERT_REQUIRED_THRESHOLD
+  )
 }
 
 function hasPassedCrashAlertThreshold(result: DetectionResponse): boolean {

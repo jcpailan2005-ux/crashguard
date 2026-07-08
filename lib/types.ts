@@ -34,8 +34,49 @@ export interface DetectionResponse {
   requiredThreshold?: number | null
   threshold?: number | null
   passedThreshold?: boolean
+  crashClass?: 'accident' | 'non_accident' | string | null
+  crashConfidence?: number | null
+  /** Accident-class probability as a 0-1 fraction. This drives crash decisions. */
+  accidentProbability?: number | null
+  /** Non-accident class probability as a 0-1 fraction, exposed for debugging/calibration. */
+  nonAccidentProbability?: number | null
+  /** Class with the highest classifier probability, separate from accidentProbability. */
+  predictedClass?: 'accident' | 'non_accident' | string | null
+  /** Confidence of predictedClass, separate from accidentProbability. */
+  predictedClassConfidence?: number | null
+  /** Crash classifier score as a 0-1 fraction. Prefer this over crashConfidence. */
+  crashScore?: number | null
+  /** Same value as crashScore, pre-formatted as a 0-100 percent number. */
+  crashScorePercent?: number | null
+  uiThreshold?: number | null
+  caseThreshold?: number | null
+  decisionThreshold?: number | null
+  crashSuspected?: boolean | null
+  crashClassifierAvailable?: boolean | null
+  crashClassifierError?: string | null
   persistenceStatus?: string | null
+  persistenceReason?: string | null
   persistenceSkippedReason?: string | null
+  rejectionReason?: string | null
+  finalDecision?: string | null
+  /** True only when a case was actually persisted (finalDecision === "confirmed_crash" or "high_confidence_review"). */
+  caseCreated?: boolean | null
+  /** True only when a notification was actually persisted alongside the case. */
+  notificationCreated?: boolean | null
+  /** The object detector's own label for the highest-confidence box ("car", "bus", "truck", ...), or "none".
+   * Kept separate from crash-decision fields on purpose — never overwritten by crashScore/finalDecision. */
+  detectedObjectLabel?: string | null
+  vehicleCount?: number | null
+  personCount?: number | null
+  sceneValid?: boolean | null
+  motionValid?: boolean | null
+  consecutiveCrashHits?: number | null
+  requiredConsecutiveCrashHits?: number | null
+  blurScore?: number | null
+  brightnessScore?: number | null
+  contrastScore?: number | null
+  frameQualityStatus?: 'good' | 'bad' | string | null
+  qualityRejectionReason?: string | null
   triggerStatus?: string | null
   cameraId?: string | null
   cameraName?: string | null
