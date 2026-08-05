@@ -37,7 +37,7 @@ import {
   type CameraMonitoringStatus,
 } from '@/lib/api-client'
 import { useDisplayMode } from '@/lib/display-mode'
-import { CctvCamera } from '@/lib/types'
+import { CctvCamera, DetectionResponse } from '@/lib/types'
 
 type CameraFormState = {
   cameraId: string
@@ -229,10 +229,14 @@ function cameraStatusBadges(status: CameraMonitoringStatus | undefined, camera: 
   if (status?.detectionRunning) {
     badges.push('SCANNING')
   }
+  if (isLowQualityFrame(status?.latestResult)) {
+    badges.push('LOW QUALITY')
+  }
   return badges.length > 0 ? badges : ['OFFLINE']
 }
 
 function statusBadgeVariant(label: string): 'default' | 'secondary' | 'outline' {
+  if (label === 'LOW QUALITY') return 'secondary'
   if (label === 'LIVE' || label === 'SCANNING') return 'default'
   if (label === 'RECONNECTING') return 'secondary'
   return 'outline'
@@ -243,14 +247,100 @@ function formatConfidence(value?: number | null) {
   return `${Math.round(value * 100)}%`
 }
 
-function latestAlertId(status?: CameraMonitoringStatus) {
+function normalizeConfidenceFraction(value: number | null | undefined): number | null {
+  if (value == null) return null
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return numeric > 1 ? numeric / 100 : numeric
+}
+
+function detectionReviewCaseId(result?: DetectionResponse | null): string | null {
+  if (!result) return null
   return (
-    status?.lastCreatedCaseId ??
-    status?.activeBlockingCaseId ??
-    status?.activeCaseId ??
-    status?.latestResult?.caseId ??
+    result.caseId ??
+    (result as DetectionResponse & { reviewCaseId?: string | null }).reviewCaseId ??
+    (result as DetectionResponse & { case_id?: string | null }).case_id ??
     null
   )
+}
+
+function isLowQualityFrame(result?: DetectionResponse | null): boolean {
+  return result?.frameQualityStatus === 'bad'
+}
+
+function getFrameQualityMessage(result?: DetectionResponse | null): string {
+  switch (result?.qualityRejectionReason) {
+    case 'low_quality_blurry_frame':
+      return 'Camera quality too low: unclear frame (too blurry).'
+    case 'low_quality_dark_frame':
+      return 'Camera quality too low: frame is too dark.'
+    case 'low_quality_overexposed_frame':
+      return 'Camera quality too low: frame is overexposed.'
+    case 'low_quality_low_contrast_frame':
+      return 'Camera quality too low: unclear frame (low contrast).'
+    default:
+      return 'Camera quality too low. Unclear frame.'
+  }
+}
+
+function isSavedCrashCase(result?: DetectionResponse | null): boolean {
+  if (!result) return false
+  if (isLowQualityFrame(result)) return false
+
+  const status = String(result.persistenceStatus ?? result.casePersistenceStatus ?? '').toLowerCase()
+  const reason = String(result.persistenceReason ?? '').toLowerCase()
+  const blockedStatuses = new Set([
+    'below_threshold',
+    'below_case_threshold',
+    'non_accident',
+    'vehicle_only',
+    'no_case_created',
+    'no_review_case',
+    'waiting_for_consecutive_frames',
+    'temporal_not_confirmed',
+    'duplicate_cooldown',
+    'cooldown_active',
+    'blocked_existing_case',
+    'no_vehicle_detected',
+    'person_only_not_crash',
+    'vehicle_outside_roi',
+    'motion_not_crash_like',
+    'active_case_exists',
+    'low_quality_blurry_frame',
+    'low_quality_dark_frame',
+    'low_quality_overexposed_frame',
+    'low_quality_low_contrast_frame',
+  ])
+  const crashClass = String(result.crashClass ?? '').toLowerCase()
+  const confidence =
+    normalizeConfidenceFraction(result.crashConfidence) ??
+    normalizeConfidenceFraction(result.rawCrashConfidence) ??
+    normalizeConfidenceFraction(result.lastConfidence) ??
+    normalizeConfidenceFraction(result.confidence)
+  const threshold = Math.max(normalizeConfidenceFraction(result.requiredThreshold) ?? 0.8, 0.8)
+  const savedStatus =
+    status === 'case_created' ||
+    status === 'created' ||
+    status === 'notification_created' ||
+    reason === 'case_created'
+
+  if (blockedStatuses.has(status) || blockedStatuses.has(reason)) {
+    return false
+  }
+
+  return Boolean(
+    detectionReviewCaseId(result) &&
+      crashClass === 'accident' &&
+      confidence != null &&
+      confidence >= threshold &&
+      savedStatus
+  )
+}
+
+function latestAlertId(status?: CameraMonitoringStatus) {
+  return isSavedCrashCase(status?.latestResult)
+    ? detectionReviewCaseId(status?.latestResult)
+    : null
 }
 
 function buildCameraSlots(cameras: CctvCamera[]): CameraSlot[] {
@@ -300,7 +390,7 @@ export default function IpCameraPage() {
   const shouldAutoStartCctv = Boolean(
     activeCamera?.isActive &&
       activeCamera.detectionEnabled &&
-      (form.cameraIp.trim() || form.streamUrl.trim())
+      (activeCamera.cameraId || form.cameraIp.trim() || form.streamUrl.trim())
   )
   const autoStartCctvKey = activeCamera
     ? [
@@ -833,7 +923,8 @@ export default function IpCameraPage() {
                         {previewUrl ? (
                           <img
                             src={previewUrl}
-                            alt={`${safeCameraName(camera)} preview`}
+                            alt={`${safeCameraName(camera)} snapshot preview`}
+                            title="Snapshot preview from latest-frame.jpg. The main panel uses the MJPEG stream."
                             className="h-full w-full object-cover"
                           />
                         ) : (

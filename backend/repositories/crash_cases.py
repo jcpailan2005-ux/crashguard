@@ -1,9 +1,124 @@
 from datetime import datetime, timedelta
 from pathlib import Path
+import os
 import uuid
 
 from backend.db import get_connection
 from backend.media_store import copy_media_file, media_dir, relative_media_path
+
+
+class CrashCaseRejected(Exception):
+    """Raised by create_crash_case when it refuses to persist a payload.
+
+    This is the final repository-level safety gate. It is intentionally
+    independent of backend.main's own gating (evaluate_crash_case_decision):
+    it re-reads its thresholds fresh from the environment and only trusts
+    proof carried in the payload itself. If any route ever calls
+    create_crash_case without going through the strict decision pipeline —
+    by bug, by a new code path, or because a stale process is still running
+    old code — no row is written and no notification is sent.
+    """
+
+    def __init__(self, reason: str, details: str = ""):
+        self.reason = reason
+        self.details = details
+        super().__init__(f"{reason}: {details}" if details else reason)
+
+
+def _gate_env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # Accept both "90" and "0.90" style config, matching backend.main's parsing.
+    return value / 100.0 if value > 1.0 else value
+
+
+def _gate_env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def crash_case_creation_enabled() -> bool:
+    """Master safety switch. Defaults to enabled; set false during an incident
+    to stop all crash case / notification creation without stopping detection."""
+    return os.getenv("ENABLE_CRASH_CASE_CREATION", "true").strip().lower() != "false"
+
+
+def _require_confirmed_crash_payload(data: dict) -> None:
+    if not crash_case_creation_enabled():
+        print(
+            "[crash-gate] REJECTED create_crash_case: "
+            "reason=crash_case_creation_disabled "
+            "ENABLE_CRASH_CASE_CREATION=false"
+        )
+        raise CrashCaseRejected(
+            "crash_case_creation_disabled",
+            "ENABLE_CRASH_CASE_CREATION=false; no case or notification may be created.",
+        )
+
+    threshold = _gate_env_float("CRASH_CASE_THRESHOLD", 0.90)
+    required_hits = max(1, _gate_env_int("CRASH_REQUIRED_CONSECUTIVE_FRAMES", 3))
+
+    final_decision = data.get("finalDecision")
+    vehicle_count = data.get("vehicleCount")
+    scene_valid = data.get("sceneValid")
+    motion_valid = data.get("motionValid")
+    crash_score = data.get("crashScore")
+    consecutive_hits = data.get("consecutiveCrashHits")
+
+    # Two valid outcome tiers, both requiring crashScore >= threshold and a
+    # real vehicle in an in-ROI scene:
+    #   - confirmed_crash: additionally requires motion corroboration AND
+    #     the 3-frame temporal streak (strongest evidence).
+    #   - high_confidence_review: a single very-high-confidence frame is
+    #     enough on its own to raise a Needs Review case — motion/temporal
+    #     corroboration is NOT required because a human responder verifies
+    #     it manually before any dispatch action is taken.
+    valid_decisions = {"confirmed_crash", "high_confidence_review"}
+
+    failures: list[str] = []
+    if final_decision not in valid_decisions:
+        failures.append(
+            f"finalDecision={final_decision!r} (must be 'confirmed_crash' or 'high_confidence_review')"
+        )
+    if not isinstance(vehicle_count, (int, float)) or isinstance(vehicle_count, bool) or vehicle_count < 1:
+        failures.append(f"vehicleCount={vehicle_count!r} (must be >= 1)")
+    if scene_valid is not True:
+        failures.append(f"sceneValid={scene_valid!r} (must be true)")
+    if not isinstance(crash_score, (int, float)) or isinstance(crash_score, bool) or crash_score < threshold:
+        failures.append(f"crashScore={crash_score!r} (must be >= {threshold})")
+    if final_decision == "confirmed_crash":
+        if motion_valid is not True:
+            failures.append(f"motionValid={motion_valid!r} (must be true for confirmed_crash)")
+        if (
+            not isinstance(consecutive_hits, (int, float))
+            or isinstance(consecutive_hits, bool)
+            or consecutive_hits < required_hits
+        ):
+            failures.append(
+                f"consecutiveCrashHits={consecutive_hits!r} (must be >= {required_hits} for confirmed_crash)"
+            )
+
+    if failures:
+        detail = "; ".join(failures)
+        print(
+            "[crash-gate] REJECTED create_crash_case: "
+            "reason=missing_confirmed_crash_decision "
+            f"cameraId={data.get('cameraId')!r} "
+            f"sourceCamera={data.get('sourceCamera')!r} "
+            f"triggerStatus={data.get('triggerStatus')!r} "
+            f"failures=[{detail}]"
+        )
+        raise CrashCaseRejected("missing_confirmed_crash_decision", detail)
 
 
 CASE_STATUSES = {
@@ -168,6 +283,17 @@ def create_crash_case(
     boxes: list[dict] | None = None,
     frame_path: str | None = None,
 ) -> dict:
+    """Persist a crash case + its notification.
+
+    Raises CrashCaseRejected and persists nothing unless `data` proves a
+    confirmed_crash OR high_confidence_review decision (see
+    _require_confirmed_crash_payload). This is the last line of defense
+    against false-positive cases — every caller, including future ones, is
+    subject to it. Every case created here starts at status pending_review
+    regardless of tier; neither tier is an automatic confirmed dispatch.
+    """
+    _require_confirmed_crash_payload(data)
+
     case_id = data.get("caseId") or f"CASE-{uuid.uuid4().hex[:10].upper()}"
     detected_at = data.get("detectedAt") or now_iso()
     updated_at = data.get("updatedAt") or detected_at
@@ -234,13 +360,27 @@ def create_crash_case(
                 "pending_review",
             ),
         )
+        # This function only ever runs for a payload that already proved a
+        # confirmed_crash or high_confidence_review decision (see
+        # _require_confirmed_crash_payload), so crashScore is guaranteed
+        # present and >= CRASH_CASE_THRESHOLD here. Both tiers create a
+        # pending_review "Needs Review" case — neither is an automatic
+        # confirmed emergency dispatch — so the notification wording is the
+        # same for both.
+        score_percent = round(float(data.get("crashScore") or data.get("confidence") or 0) * 100)
+        notification_title = "Car Crash Detected"
         if data.get("triggerStatus") == "camera_detection":
             camera_label = data.get("cameraName") or data.get("sourceCamera") or "Live Camera"
-            area_label = area_id or data.get("barangay")
-            area_suffix = f" in {area_label}" if area_label else ""
-            camera_message = f"A pending review case was created from {camera_label}{area_suffix}."
+            notification_message = (
+                f"A car crash was detected with {score_percent}% confidence "
+                f"at {camera_label}. Please review the case."
+            )
         else:
-            camera_message = "Crash alert needs responder review."
+            source_label = data.get("sourceCamera") or "the uploaded media"
+            notification_message = (
+                f"A car crash was detected with {score_percent}% confidence "
+                f"in {source_label}. Please review the case."
+            )
         conn.execute(
             """
             INSERT INTO notifications (
@@ -252,8 +392,8 @@ def create_crash_case(
             (
                 notification_id,
                 case_id,
-                "Possible Crash Detected",
-                camera_message,
+                notification_title,
+                notification_message,
                 "review",
                 0,
                 data.get("responderId"),

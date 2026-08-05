@@ -70,24 +70,25 @@ function normalizeDetectionResponse(result: DetectionResponse): DetectionRespons
     })
     .filter((d): d is NonNullable<typeof d> => Boolean(d))
 
-  const derivedAccidentDetected =
-    result.accident_detected ||
-    projectDetections.some((d) => d.label.toLowerCase() === 'accident')
-
   const backendConfidence = Number.isFinite(Number(result.confidence))
     ? Number(result.confidence)
     : 0
+  const crashConfidence =
+    result.crashConfidence != null && Number.isFinite(Number(result.crashConfidence))
+      ? Number(result.crashConfidence)
+      : null
   const rawCrashConfidence =
     result.rawCrashConfidence != null && Number.isFinite(Number(result.rawCrashConfidence))
       ? Number(result.rawCrashConfidence)
       : result.accident_detected
-        ? backendConfidence
+        ? crashConfidence ?? backendConfidence
         : result.rawCrashConfidence
 
   return {
     ...result,
-    accident_detected: derivedAccidentDetected,
+    accident_detected: Boolean(result.accident_detected),
     confidence: backendConfidence,
+    crashConfidence,
     rawCrashConfidence,
     annotated_media_url: result.annotated_media_url ?? frameUrl,
     latestFrameUrl: result.latestFrameUrl ?? frameUrl,
@@ -494,21 +495,23 @@ export async function getCurrentSQLiteUser(): Promise<AuthUser> {
 }
 
 export async function testCameraConnection(
-  cameraIp: string,
+  cameraIpOrUrl: string,
   metadata: {
     cameraId?: string
     label?: string
     areaId?: string
     location?: string
   } = {}
-): Promise<{ connected: boolean; message: string; cameraId?: string; cameraIp: string; label: string; status?: string }> {
+): Promise<{ connected: boolean; message: string; cameraId?: string; cameraIp?: string; label: string; status?: string }> {
   let response: Response
+  const source = cameraIpOrUrl.trim()
+  const isStreamUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(source)
 
   try {
     response = await fetch(`${NORMALIZED_BACKEND_URL}/api/cameras/test-connection`, {
       method: 'POST',
       headers: await authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ cameraIp: cameraIp.trim(), ...metadata }),
+      body: JSON.stringify({ [isStreamUrl ? 'url' : 'cameraIp']: source, ...metadata }),
     })
   } catch (error) {
     if (error instanceof TypeError) {
@@ -529,7 +532,7 @@ export async function testCameraConnection(
     connected: boolean
     message: string
     cameraId?: string
-    cameraIp: string
+    cameraIp?: string
     label: string
     status?: string
   }
@@ -572,6 +575,7 @@ export interface CameraMonitoringStatus {
   annotatedImageUrl?: string | null
   frameWidth?: number | null
   frameHeight?: number | null
+  frameAgeMs?: number | null
   detectionWorkerRunning?: boolean
   detectionRunning?: boolean
   activePendingCase?: boolean
@@ -586,6 +590,14 @@ export interface CameraMonitoringStatus {
   previewAvailable?: boolean
   existingCaseMessage?: string | null
   reconnecting?: boolean
+}
+
+export interface CameraStreamAccess {
+  token: string
+  expiresInSeconds: number
+  streamUrl?: string
+  previewUrl: string
+  eventsUrl: string
 }
 
 export async function getCameraMonitoringStatus(
@@ -604,6 +616,13 @@ export function getCameraPreviewFrameUrl(cameraIp: string): string {
 
 export function getCameraMjpegPreviewUrl(cameraIdOrIp: string): string {
   return `${NORMALIZED_BACKEND_URL}/api/cameras/${encodeURIComponent(cameraIdOrIp.trim())}/preview.mjpeg`
+}
+
+export async function createCameraStreamAccess(cameraId: string): Promise<CameraStreamAccess> {
+  return apiCall<CameraStreamAccess>(
+    `/api/cameras/${encodeURIComponent(cameraId.trim())}/stream-token`,
+    { method: 'POST' }
+  )
 }
 
 export async function fetchCameraPreviewFrameObjectUrl(

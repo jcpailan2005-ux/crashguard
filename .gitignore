@@ -112,3 +112,19 @@ backend/datasets/crash_classification/**/*.cache
 backend/datasets/crash_classification/train/
 backend/datasets/crash_classification/val/
 backend/datasets/crash_classification/test/
+
+# =========================
+# Evaluation dataset (frames stay local; structure + README are tracked)
+# =========================
+dataset/**/*.jpg
+dataset/**/*.jpeg
+dataset/**/*.png
+dataset/**/*.bmp
+dataset/**/*.webp
+dataset/**/*.mp4
+dataset/**/*.avi
+dataset/**/*.mov
+dataset/**/*.mkv
+crash_decision_report.csv
+baseline_report.csv
+retrained_report.csv

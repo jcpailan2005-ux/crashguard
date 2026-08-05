@@ -10,6 +10,7 @@ interface CctvVideoOverlayProps {
   boxes?: DetectionBox[]
   boxFit?: 'contain' | 'cover'
   children: ReactNode
+  emptyDetectionLabel?: string
   isDetecting: boolean
   isLive: boolean
   labels: string[]
@@ -38,6 +39,7 @@ export function CctvVideoOverlay({
   boxes = [],
   boxFit = 'contain',
   children,
+  emptyDetectionLabel = 'No detection in current frame',
   isDetecting,
   isLive,
   labels,
@@ -230,7 +232,7 @@ export function CctvVideoOverlay({
             variant="outline"
             className="border-[var(--media-border)] bg-[color:var(--media-overlay)] text-[var(--media-foreground)]"
           >
-            No detection in current frame
+            {emptyDetectionLabel}
           </Badge>
         </div>
       )}
