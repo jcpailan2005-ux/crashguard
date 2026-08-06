@@ -127,6 +127,8 @@ CASE_STATUSES = {
     "confirmed_crash",
     "false_alarm",
     "dispatched",
+    "responding",
+    "arrived",
     "resolved",
 }
 
@@ -135,17 +137,21 @@ ACTION_NEXT_STATUS = {
     "confirm_crash": "confirmed_crash",
     "mark_false_alarm": "false_alarm",
     "dispatch_help": "dispatched",
+    "accept_dispatch": "responding",
+    "arrive_scene": "arrived",
     "add_notes": None,
     "resolve_case": "resolved",
 }
 
 ALLOWED_ACTIONS = {
     "review_alert": {"pending_review"},
-    "confirm_crash": {"under_review"},
-    "mark_false_alarm": {"under_review"},
-    "dispatch_help": {"confirmed_crash"},
-    "add_notes": {"pending_review", "under_review", "confirmed_crash", "false_alarm", "dispatched"},
-    "resolve_case": {"dispatched", "false_alarm"},
+    "confirm_crash": {"pending_review", "under_review"},
+    "mark_false_alarm": {"pending_review", "under_review", "confirmed_crash"},
+    "dispatch_help": {"pending_review", "under_review", "confirmed_crash"},
+    "accept_dispatch": {"dispatched"},
+    "arrive_scene": {"responding"},
+    "add_notes": {"pending_review", "under_review", "confirmed_crash", "false_alarm", "dispatched", "responding", "arrived"},
+    "resolve_case": {"dispatched", "responding", "arrived", "false_alarm"},
 }
 
 
@@ -360,47 +366,9 @@ def create_crash_case(
                 "pending_review",
             ),
         )
-        # This function only ever runs for a payload that already proved a
-        # confirmed_crash or high_confidence_review decision (see
-        # _require_confirmed_crash_payload), so crashScore is guaranteed
-        # present and >= CRASH_CASE_THRESHOLD here. Both tiers create a
-        # pending_review "Needs Review" case — neither is an automatic
-        # confirmed emergency dispatch — so the notification wording is the
-        # same for both.
-        score_percent = round(float(data.get("crashScore") or data.get("confidence") or 0) * 100)
-        notification_title = "Car Crash Detected"
-        if data.get("triggerStatus") == "camera_detection":
-            camera_label = data.get("cameraName") or data.get("sourceCamera") or "Live Camera"
-            notification_message = (
-                f"A car crash was detected with {score_percent}% confidence "
-                f"at {camera_label}. Please review the case."
-            )
-        else:
-            source_label = data.get("sourceCamera") or "the uploaded media"
-            notification_message = (
-                f"A car crash was detected with {score_percent}% confidence "
-                f"in {source_label}. Please review the case."
-            )
-        conn.execute(
-            """
-            INSERT INTO notifications (
-              notificationId, caseId, title, message, alertLevel, read,
-              responderId, areaId, createdAt
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                notification_id,
-                case_id,
-                notification_title,
-                notification_message,
-                "review",
-                0,
-                data.get("responderId"),
-                area_id,
-                detected_at,
-            ),
-        )
+        # AI detection creates a pending_review case ONLY.
+        # No notifications are created automatically for responders at AI detection time.
+        # Responder notifications are created ONLY when an Admin approves & dispatches the case.
         if data.get("cameraId"):
             conn.execute(
                 "UPDATE cameras SET lastEventAt = ?, updatedAt = ? WHERE cameraId = ?",
@@ -415,7 +383,7 @@ def create_crash_case(
         )
     case_item = get_crash_case(case_id)
     if case_item is not None:
-        case_item["createdNotificationId"] = notification_id
+        case_item["createdNotificationId"] = None
     return case_item
 
 
@@ -494,12 +462,27 @@ def list_crash_cases(
     sort: str = "newest",
     limit: int = 100,
     offset: int = 0,
+    role: str | None = None,
+    responder_id: str | None = None,
 ) -> list[dict]:
     clauses = []
     params: list[object] = []
-    if status and status != "all":
-        clauses.append("status = ?")
-        params.append(status)
+    if role == "responder":
+        # Responders must ONLY see cases that were verified & dispatched by Admin!
+        dispatched_statuses = ("dispatched", "responding", "arrived", "resolved")
+        if status and status != "all":
+            if status in dispatched_statuses:
+                clauses.append("status = ?")
+                params.append(status)
+            else:
+                clauses.append("1 = 0")  # Block unvetted status requests from responders
+        else:
+            clauses.append("status IN ('dispatched', 'responding', 'arrived', 'resolved')")
+    else:
+        if status and status != "all":
+            clauses.append("status = ?")
+            params.append(status)
+
     if area_id and area_id != "all":
         clauses.append("areaId = ?")
         params.append(area_id)
@@ -691,7 +674,10 @@ def apply_action(case_id: str, action: str, actor_id: str | None, notes: str | N
         conn.execute(
             f"""
             UPDATE crash_cases
-            SET status = ?, responderId = ?, {field_update_sql} updatedAt = ?,
+            SET status = ?, responderId = COALESCE(?, responderId), {field_update_sql}
+                reviewedAt = COALESCE(reviewedAt, CASE WHEN ? IN ('dispatch_help', 'confirm_crash', 'mark_false_alarm') THEN ? ELSE NULL END),
+                confirmedAt = COALESCE(confirmedAt, CASE WHEN ? IN ('dispatch_help', 'confirm_crash') THEN ? ELSE NULL END),
+                updatedAt = ?,
                 notes = CASE WHEN ? != '' THEN trim(coalesce(notes, '') || char(10) || ?) ELSE notes END
             WHERE caseId = ?
             """,
@@ -699,6 +685,10 @@ def apply_action(case_id: str, action: str, actor_id: str | None, notes: str | N
                 next_status,
                 actor_id,
                 *field_update_params,
+                action,
+                timestamp,
+                action,
+                timestamp,
                 timestamp,
                 (notes or "").strip(),
                 (notes or "").strip(),
@@ -724,10 +714,46 @@ def apply_action(case_id: str, action: str, actor_id: str | None, notes: str | N
                 next_status,
             ),
         )
-        conn.execute(
-            "UPDATE notifications SET read = 1 WHERE caseId = ?",
-            (case_id,),
-        )
+        # Create Responder Notification ONLY when Admin dispatches help
+        if action == "dispatch_help":
+            score_percent = round(float(case_item.get("confidence") or 0) * 100)
+            location_label = (
+                case_item.get("cameraName")
+                or case_item.get("sourceCamera")
+                or case_item.get("location")
+                or "CCTV Incident"
+            )
+            notification_id = f"NOT-{uuid.uuid4().hex}"
+            notification_title = "EMERGENCY DISPATCH: Car Crash"
+            notification_message = (
+                f"Admin verified and dispatched emergency incident at {location_label} "
+                f"({score_percent}% confidence). Immediate response required."
+            )
+            conn.execute(
+                """
+                INSERT INTO notifications (
+                  notificationId, caseId, title, message, alertLevel, read,
+                  responderId, areaId, createdAt
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    notification_id,
+                    case_id,
+                    notification_title,
+                    notification_message,
+                    "warning",
+                    0,
+                    actor_id if actor_id and actor_id != "unknown" else None,
+                    case_item.get("areaId"),
+                    timestamp,
+                ),
+            )
+        elif action == "mark_false_alarm":
+            conn.execute(
+                "UPDATE notifications SET read = 1 WHERE caseId = ?",
+                (case_id,),
+            )
     return get_crash_case(case_id)
 
 
@@ -748,6 +774,7 @@ def list_notifications(
             responder_clauses.append("COALESCE(n.areaId, c.areaId) = ?")
             params.append(area_id)
         clauses.append(f"({' OR '.join(responder_clauses)})")
+        clauses.append("c.status IN ('dispatched', 'responding', 'arrived', 'resolved')")
 
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_connection() as conn:

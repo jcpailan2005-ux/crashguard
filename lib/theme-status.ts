@@ -11,6 +11,10 @@ export const CASE_STATUS_CLASSES: Record<CaseStatus, string> = {
     'border-[var(--status-false-alarm)] bg-[color:var(--status-false-alarm-bg)] text-[var(--status-false-alarm)]',
   dispatched:
     'border-[var(--status-dispatched)] bg-[color:var(--status-dispatched-bg)] text-[var(--status-dispatched)]',
+  responding:
+    'border-[var(--status-dispatched)] bg-[color:var(--status-dispatched-bg)] text-[var(--status-dispatched)]',
+  arrived:
+    'border-[var(--status-confirmed)] bg-[color:var(--status-confirmed-bg)] text-[var(--status-confirmed)]',
   resolved:
     'border-[var(--status-resolved)] bg-[color:var(--status-resolved-bg)] text-[var(--status-resolved)]',
 }

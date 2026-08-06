@@ -152,9 +152,10 @@ export default function NotificationsPage() {
           profile?.role === 'responder'
             ? items.filter(
                 (item) =>
-                  !item.responderId ||
-                  item.responderId === firebaseUser?.uid ||
-                  Boolean(profile.areaId && item.areaId === profile.areaId)
+                  item.alertLevel !== 'review' &&
+                  (!item.responderId ||
+                    item.responderId === firebaseUser?.uid ||
+                    Boolean(profile.areaId && item.areaId === profile.areaId))
               )
             : items
         const sortedItems = [...visibleItems].sort(

@@ -77,32 +77,35 @@ const STATE_ACTION_CLASSES: Partial<Record<CaseActionType, string>> = {
 function getReviewActions(status: CaseStatus): DisplayAction[] {
   switch (status) {
     case 'pending_review':
-      return [
-        { kind: 'state', action: 'review_alert', icon: <ShieldQuestion className="h-4 w-4" />, label: 'Start Review' },
-        { kind: 'media', icon: <ExternalLink className="h-4 w-4" /> },
-        { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
-      ]
     case 'under_review':
-      return [
-        { kind: 'state', action: 'confirm_crash', icon: <CheckCircle2 className="h-4 w-4" /> },
-        { kind: 'state', action: 'mark_false_alarm', icon: <AlertTriangle className="h-4 w-4" /> },
-        { kind: 'media', icon: <ExternalLink className="h-4 w-4" /> },
-        { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
-      ]
     case 'confirmed_crash':
       return [
-        { kind: 'state', action: 'dispatch_help', icon: <Truck className="h-4 w-4" />, className: 'bg-destructive text-destructive-foreground hover:bg-destructive/90' },
+        { kind: 'state', action: 'dispatch_help', icon: <Truck className="h-4 w-4" />, label: 'Approve & Dispatch', className: 'bg-destructive text-destructive-foreground hover:bg-destructive/90' },
+        { kind: 'state', action: 'mark_false_alarm', icon: <AlertTriangle className="h-4 w-4" />, label: 'False Alarm' },
+        { kind: 'media', icon: <ExternalLink className="h-4 w-4" /> },
         { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
       ]
     case 'dispatched':
+      return [
+        { kind: 'state', action: 'accept_dispatch', icon: <CheckCircle2 className="h-4 w-4" />, label: 'Accept Dispatch' },
+        { kind: 'state', action: 'resolve_case', icon: <ClipboardList className="h-4 w-4" /> },
+        { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
+      ]
+    case 'responding':
+      return [
+        { kind: 'state', action: 'arrive_scene', icon: <MapPin className="h-4 w-4" />, label: 'Mark Arrived' },
+        { kind: 'state', action: 'resolve_case', icon: <ClipboardList className="h-4 w-4" /> },
+        { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
+      ]
+    case 'arrived':
       return [
         { kind: 'state', action: 'resolve_case', icon: <ClipboardList className="h-4 w-4" /> },
         { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
       ]
     case 'false_alarm':
       return [
-        { kind: 'state', action: 'resolve_case', icon: <ClipboardList className="h-4 w-4" /> },
         { kind: 'history', icon: <ClipboardList className="h-4 w-4" /> },
+        { kind: 'map', icon: <MapPin className="h-4 w-4" /> },
       ]
     case 'resolved':
       return [
@@ -254,6 +257,7 @@ export function IncidentReviewDialog({
   const [submittingAction, setSubmittingAction] = useState<CaseActionType | null>(null)
   const [openSections, setOpenSections] = useState<string[]>([])
   const [imageLoadError, setImageLoadError] = useState(false)
+  const [showConfirmDispatchModal, setShowConfirmDispatchModal] = useState(false)
   const { toast } = useToast()
   const { profile } = useAuth()
   const { isAdvancedMode } = useDisplayMode(profile)
@@ -603,30 +607,29 @@ export function IncidentReviewDialog({
             ) : null}
 
             {isAdvancedMode ? (
-            <AccordionItem value="media-debug">
-              <AccordionTrigger>
-                <span className="inline-flex items-center gap-2">
-                  <Eye className="h-4 w-4" />
-                  Media Debug
-                </span>
-              </AccordionTrigger>
-              <AccordionContent>
-                <div className="grid gap-2 pb-3 text-xs sm:grid-cols-2">
-                  <p className="break-all"><span className="text-muted-foreground">caseId:</span> {caseItem.caseId}</p>
-                  <p className="break-all"><span className="text-muted-foreground">annotatedPath:</span> {caseItem.annotatedPath ?? 'null'}</p>
-                  <p className="break-all"><span className="text-muted-foreground">keyFramePath:</span> {caseItem.keyFramePath ?? 'null'}</p>
-                  <p className="break-all"><span className="text-muted-foreground">thumbnailPath:</span> {caseItem.thumbnailPath ?? 'null'}</p>
-                  <p className="break-all"><span className="text-muted-foreground">videoPath:</span> {caseItem.videoPath ?? 'null'}</p>
-                  <p className="break-all"><span className="text-muted-foreground">resolvedPreviewUrl:</span> {media.previewUrl ?? 'null'}</p>
-                  <p className="break-all"><span className="text-muted-foreground">imageLoadError:</span> {String(imageLoadError)}</p>
-                </div>
-              </AccordionContent>
-            </AccordionItem>
+              <AccordionItem value="media-debug">
+                <AccordionTrigger>
+                  <span className="inline-flex items-center gap-2">
+                    <Eye className="h-4 w-4" />
+                    Media Debug
+                  </span>
+                </AccordionTrigger>
+                <AccordionContent>
+                  <div className="grid gap-2 pb-3 text-xs sm:grid-cols-2">
+                    <p className="break-all"><span className="text-muted-foreground">caseId:</span> {caseItem.caseId}</p>
+                    <p className="break-all"><span className="text-muted-foreground">annotatedPath:</span> {caseItem.annotatedPath ?? 'null'}</p>
+                    <p className="break-all"><span className="text-muted-foreground">keyFramePath:</span> {caseItem.keyFramePath ?? 'null'}</p>
+                    <p className="break-all"><span className="text-muted-foreground">thumbnailPath:</span> {caseItem.thumbnailPath ?? 'null'}</p>
+                    <p className="break-all"><span className="text-muted-foreground">videoPath:</span> {caseItem.videoPath ?? 'null'}</p>
+                    <p className="break-all"><span className="text-muted-foreground">resolvedPreviewUrl:</span> {media.previewUrl ?? 'null'}</p>
+                  </div>
+                </AccordionContent>
+              </AccordionItem>
             ) : null}
 
-            <AccordionItem value="history">
-              <AccordionTrigger>
-                <span className="inline-flex items-center gap-2">
+            <AccordionItem value="history" className="border-border">
+              <AccordionTrigger className="hover:no-underline">
+                <span className="flex items-center gap-2 font-semibold">
                   <ChevronDown className="h-4 w-4" />
                   Action History
                 </span>
@@ -664,6 +667,40 @@ export function IncidentReviewDialog({
           </Accordion>
         </div>
       </DialogContent>
+
+      <Dialog open={showConfirmDispatchModal} onOpenChange={setShowConfirmDispatchModal}>
+        <DialogContent className="max-w-md border border-border bg-card p-6">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertTriangle className="h-5 w-5" />
+              Confirm Emergency Dispatch
+            </DialogTitle>
+            <DialogDescription className="mt-2 text-sm text-muted-foreground">
+              Dispatch incident to responders? This will verify the accident and create an emergency alert in the Responder Queue.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="mt-6 flex justify-end gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowConfirmDispatchModal(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={submittingAction != null}
+              onClick={async () => {
+                setShowConfirmDispatchModal(false)
+                await handleAction('dispatch_help')
+              }}
+            >
+              {submittingAction === 'dispatch_help' ? 'Dispatching...' : 'YES, Confirm & Dispatch'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Dialog>
   )
 }

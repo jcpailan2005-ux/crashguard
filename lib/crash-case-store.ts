@@ -220,17 +220,8 @@ export async function createCrashCaseFromDetection(
   })
 
   await setDoc(caseRef, { caseId: caseRef.id }, { merge: true })
-  await addDoc(collection(db, 'notifications'), {
-    areaId: params.areaId ?? null,
-    incident_id: caseRef.id,
-    message: `Possible crash detected at ${locationPayload.label}. Responder review required.`,
-    read: false,
-    responderUid: params.actorId,
-    alertLevel: 'review',
-    timestamp: serverTimestamp(),
-    title: 'Possible Crash Pending Review',
-  })
-
+  // AI detection creates a pending_review case ONLY.
+  // Responder notifications are created ONLY when an Admin dispatches the incident.
   return caseRef.id
 }
 
@@ -253,12 +244,14 @@ export async function applyCrashCaseAction(
 
   const allowedByAction: Record<CaseActionType, CaseStatus[]> = {
     review_alert: ['pending_review'],
-    confirm_crash: ['under_review'],
-    mark_false_alarm: ['under_review'],
-    dispatch_help: ['confirmed_crash'],
-    contact_user: ['pending_review', 'under_review', 'confirmed_crash', 'dispatched'],
-    add_notes: ['pending_review', 'under_review', 'confirmed_crash', 'dispatched', 'false_alarm'],
-    resolve_case: ['dispatched', 'false_alarm'],
+    confirm_crash: ['pending_review', 'under_review'],
+    mark_false_alarm: ['pending_review', 'under_review', 'confirmed_crash'],
+    dispatch_help: ['pending_review', 'under_review', 'confirmed_crash'],
+    accept_dispatch: ['dispatched'],
+    arrive_scene: ['responding'],
+    contact_user: ['pending_review', 'under_review', 'confirmed_crash', 'dispatched', 'responding', 'arrived'],
+    add_notes: ['pending_review', 'under_review', 'confirmed_crash', 'dispatched', 'responding', 'arrived', 'false_alarm'],
+    resolve_case: ['dispatched', 'responding', 'arrived', 'false_alarm'],
   }
 
   if (!allowedByAction[params.action].includes(params.caseItem.status)) {
@@ -305,6 +298,19 @@ export async function applyCrashCaseAction(
     ...timestampUpdate,
     updatedAt: serverTimestamp(),
   })
+
+  if (params.action === 'dispatch_help') {
+    await addDoc(collection(db, 'notifications'), {
+      areaId: params.caseItem.location.areaId ?? null,
+      incident_id: params.caseItem.caseId,
+      message: `Emergency crash dispatched at ${params.caseItem.location.label}. Immediate response required.`,
+      read: false,
+      responderUid: params.actorId,
+      alertLevel: 'warning',
+      timestamp: serverTimestamp(),
+      title: 'EMERGENCY DISPATCH: Car Crash',
+    })
+  }
 }
 
 export async function applyMapReviewDecision(

@@ -117,12 +117,10 @@ export default function ResponderQueuePage() {
               <Select value={status} onValueChange={(value) => { setStatus(value); setLimit(PAGE_SIZE) }}>
                 <SelectTrigger><SelectValue placeholder="Status" /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">All Statuses</SelectItem>
-                  <SelectItem value="pending_review">Pending Review</SelectItem>
-                  <SelectItem value="under_review">Under Review</SelectItem>
-                  <SelectItem value="confirmed_crash">Confirmed Crash</SelectItem>
-                  <SelectItem value="false_alarm">False Alarm</SelectItem>
+                  <SelectItem value="all">All Dispatched Cases</SelectItem>
                   <SelectItem value="dispatched">Dispatched</SelectItem>
+                  <SelectItem value="responding">Responding</SelectItem>
+                  <SelectItem value="arrived">Arrived at Scene</SelectItem>
                   <SelectItem value="resolved">Resolved</SelectItem>
                 </SelectContent>
               </Select>

@@ -1,3 +1,7 @@
+# WARNING: Legacy/alternate entrypoint.
+# The primary authoritative FastAPI application for CrashGuard is backend/main.py.
+# Run with: uvicorn backend.main:app --reload --port 8000
+
 from datetime import datetime
 from pathlib import Path
 import os

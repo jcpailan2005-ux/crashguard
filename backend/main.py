@@ -81,9 +81,14 @@ CRASH_MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 init_db()
 seed_demo_camera_data()
 
+DEFAULT_FRONTEND_ORIGINS = (
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:3001,http://127.0.0.1:3001,"
+    "http://localhost:3002,http://127.0.0.1:3002"
+)
 frontend_origins = [
     origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+    for origin in os.getenv("FRONTEND_ORIGINS", DEFAULT_FRONTEND_ORIGINS).split(",")
     if origin.strip()
 ]
 
@@ -3666,10 +3671,10 @@ def api_crash_cases(
     limit: int = 100,
     offset: int = 0,
 ):
-    require_dashboard_access(request)
+    user = require_dashboard_access(request)
     return list_crash_cases(
         status=status,
-        area_id=areaId,
+        area_id=areaId or (user.get("areaId") if user.get("role") == "responder" else None),
         search=search,
         date=date,
         from_date=fromDate,
@@ -3677,6 +3682,8 @@ def api_crash_cases(
         sort=sort,
         limit=max(1, min(limit, 200)),
         offset=max(0, offset),
+        role=user.get("role"),
+        responder_id=user.get("uid"),
     )
 
 
@@ -3858,6 +3865,28 @@ def api_camera_by_id(camera_id: str, request: Request):
 
 @app.get("/api/incidents")
 def get_incidents():
+    try:
+        db_cases = list_crash_cases(limit=100)
+        if db_cases:
+            return [
+                {
+                    "id": case.get("caseId"),
+                    "timestamp": case.get("detectedAt") or case.get("createdAt"),
+                    "detectedAt": case.get("detectedAt") or case.get("createdAt"),
+                    "location": case.get("location") or "Detected Location",
+                    "confidence": case.get("confidence") or 0.0,
+                    "media_type": case.get("mediaType") or "image",
+                    "status": case.get("status") or "pending_review",
+                    "triggerStatus": case.get("triggerStatus") or "upload_detection",
+                    "accident_detected": bool(case.get("accidentDetected", True)),
+                    "source_file": case.get("sourceCamera") or case.get("caseId"),
+                    "latitude": case.get("latitude") or DEMO_FALLBACK_LATITUDE,
+                    "longitude": case.get("longitude") or DEMO_FALLBACK_LONGITUDE,
+                }
+                for case in db_cases
+            ]
+    except Exception as error:
+        print(f"[incidents] Failed to query SQLite crash cases: {error}")
     return incidents[::-1]
 
 

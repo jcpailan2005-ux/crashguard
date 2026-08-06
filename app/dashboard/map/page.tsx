@@ -256,9 +256,12 @@ export default function LiveMapPage() {
     return [...localCases, ...cases].filter((caseItem) => {
       if (seen.has(caseItem.caseId)) return false
       seen.add(caseItem.caseId)
+      if (profile?.role === 'responder') {
+        return ['dispatched', 'responding', 'arrived', 'resolved'].includes(caseItem.status)
+      }
       return true
     })
-  }, [cases, localCases])
+  }, [cases, localCases, profile?.role])
 
   const openReviewCase = (caseItem: CrashCase) => {
     setSelectedCase(caseItem)

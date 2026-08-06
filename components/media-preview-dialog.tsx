@@ -99,13 +99,13 @@ export function MediaPreviewDialog({
             ) : null}
           </div>
         ) : mediaType === 'video' ? (
-          <div className="space-y-4 rounded-lg border border-dashed border-border/60 bg-muted/20 p-6 text-sm text-muted-foreground">
+          <div className="space-y-4 rounded-lg border border-dashed border-border/60 bg-muted/20 p-6 text-center text-sm text-muted-foreground">
             <p>
               Inline video playback was not available for this file in the current browser.
             </p>
-            {fallbackUrl ? (
+            {fallbackUrl || mediaUrl ? (
               <Button asChild variant="outline">
-                <a href={fallbackUrl} target="_blank" rel="noreferrer">
+                <a href={fallbackUrl || mediaUrl!} target="_blank" rel="noreferrer">
                   Open Output File
                 </a>
               </Button>
