@@ -81,14 +81,10 @@ function SamplesPageContent() {
 
   useEffect(() => {
     if (isResponder) {
-      router.replace(
-        responderArea
-          ? `/dashboard/ip-camera?area=${responderArea}`
-          : '/dashboard/ip-camera'
-      )
+      router.replace('/dashboard')
       return
     }
-  }, [isResponder, responderArea, router])
+  }, [isResponder, router])
 
   const visibleLocationTabs = useMemo(() => {
     if (!responderArea) return LOCATION_TABS

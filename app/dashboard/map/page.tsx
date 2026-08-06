@@ -32,7 +32,7 @@ import {
   subscribeCrashCases,
 } from '@/lib/crash-case-store'
 import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
-import { ACTIVE_CASE_STATUSES, getCaseStatusLabel } from '@/lib/incident-status'
+import { ACTIVE_CASE_STATUSES, getCaseStatusLabel, getIncidentTitle } from '@/lib/incident-status'
 import { getCaseStatusClass } from '@/lib/theme-status'
 import { CrashCase, DetectionBox, LocalCrashCase } from '@/lib/types'
 
@@ -446,7 +446,7 @@ export default function LiveMapPage() {
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="text-sm text-muted-foreground">
-                        Case {shortCaseId(selectedCase.caseId)}
+                        {getIncidentTitle(selectedCase.status)} · Case {shortCaseId(selectedCase.caseId)}
                       </p>
                       <h2 className="break-words text-lg font-semibold [overflow-wrap:anywhere]">
                         {selectedCase.location.label}

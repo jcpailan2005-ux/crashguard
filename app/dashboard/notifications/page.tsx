@@ -467,7 +467,7 @@ export default function NotificationsPage() {
 
                         <div className="min-w-0 flex-1">
                           <h3 className="truncate font-semibold">
-                            {notification.title || 'Possible Crash Detected'}
+                            {notification.title || (notification.alertLevel === 'warning' ? 'Crash Incident' : 'Possible Crash Review')}
                           </h3>
                           {isAdvancedMode ? (
                             <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">

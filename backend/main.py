@@ -383,15 +383,7 @@ def get_user_area_scope(user: dict) -> str | None:
 def can_access_camera(user: dict, camera: dict | None) -> bool:
     if camera is None:
         return False
-    if user.get("role") == "admin":
-        return True
-    if user.get("role") != "responder":
-        return False
-    area_scope = get_user_area_scope(user)
-    if area_scope and camera.get("areaId") == area_scope:
-        return True
-    assigned = list_cameras(role="responder", user_id=user.get("uid"), area_id=area_scope)
-    return any(item["cameraId"] == camera.get("cameraId") for item in assigned)
+    return user.get("role") == "admin"
 
 
 def require_camera_access(request: Request, camera_id: str) -> tuple[dict, dict]:
@@ -3752,12 +3744,9 @@ def require_camera_record_editor(request: Request, area_id: str) -> dict:
     user = require_dashboard_access(request)
     if user["role"] == "admin":
         return user
-    area_scope = get_user_area_scope(user)
-    if area_scope and area_id == area_scope:
-        return user
     raise HTTPException(
         status_code=403,
-        detail="Responders can only save cameras for their assigned area.",
+        detail="Camera management is restricted to Administrators only.",
     )
 
 
@@ -3784,11 +3773,13 @@ def camera_record_payload(body: CameraRecordIn, camera_ip: str | None) -> dict:
 @app.get("/api/cameras")
 def api_cameras(request: Request):
     user = verify_firebase_user(request)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Camera access is restricted to Administrators only.")
     return list_cameras(
         role=user["role"],
         user_id=user["uid"],
         area_id=user.get("areaId"),
-        include_inactive=user["role"] == "admin",
+        include_inactive=True,
     )
 
 

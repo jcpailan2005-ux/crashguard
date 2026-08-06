@@ -444,7 +444,7 @@ export default function AllNotificationsPage() {
                           </div>
                           <div className="min-w-0">
                             <h3 className="truncate font-semibold">
-                              {notification.title || 'Possible Crash Detected'}
+                              {notification.title || (notification.alertLevel === 'warning' ? 'Crash Incident' : 'Possible Crash Review')}
                             </h3>
                             <p className="text-sm text-muted-foreground">
                               {new Date(notification.createdAt ?? notification.timestamp).toLocaleString()}

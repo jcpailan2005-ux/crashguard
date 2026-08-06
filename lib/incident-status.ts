@@ -74,3 +74,20 @@ export function isCaseStatus(value: unknown): value is CaseStatus {
 export function getCaseStatusLabel(status: CaseStatus) {
   return CASE_STATUS_LABELS[status]
 }
+
+export function getIncidentTitle(status: CaseStatus): string {
+  switch (status) {
+    case 'pending_review':
+    case 'under_review':
+      return 'Possible Crash Review'
+    case 'dispatched':
+    case 'responding':
+    case 'arrived':
+    case 'resolved':
+      return 'Crash Incident'
+    case 'false_alarm':
+      return 'False Alarm'
+    default:
+      return 'Crash Incident'
+  }
+}

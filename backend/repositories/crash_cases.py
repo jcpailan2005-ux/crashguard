@@ -929,6 +929,8 @@ def list_cameras(
     area_id: str | None = None,
     include_inactive: bool = False,
 ) -> list[dict]:
+    if role == "responder":
+        return []
     clauses = []
     params: list[object] = []
     if not include_inactive:

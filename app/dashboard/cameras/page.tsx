@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import { Loader, Plus, Save, Search } from 'lucide-react'
 
 import { useAuth } from '@/components/auth-provider'
@@ -45,7 +46,7 @@ const EMPTY_FORM = {
 }
 
 export default function CameraManagementPage() {
-  const { profile } = useAuth()
+  const { profile, loading: authLoading } = useAuth()
   const { toast } = useToast()
   const [cameras, setCameras] = useState<CctvCamera[]>([])
   const [form, setForm] = useState(EMPTY_FORM)
@@ -188,7 +189,16 @@ export default function CameraManagementPage() {
     }
   }
 
-  if (profile?.role !== 'admin') {
+  const router = useRouter()
+
+  useEffect(() => {
+    if (authLoading) return
+    if (!profile || profile.role !== 'admin') {
+      router.replace('/dashboard')
+    }
+  }, [authLoading, profile, router])
+
+  if (authLoading || !profile || profile.role !== 'admin') {
     return <PermissionMessage />
   }
 

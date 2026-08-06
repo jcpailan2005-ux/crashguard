@@ -43,6 +43,7 @@ import {
   CaseActionType,
   CaseStatus,
   getCaseStatusLabel,
+  getIncidentTitle,
 } from '@/lib/incident-status'
 import { getAreaLabel } from '@/lib/locations'
 import { getCaseStatusClass } from '@/lib/theme-status'
@@ -335,7 +336,7 @@ export function IncidentReviewDialog({
           <DialogHeader className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
-                <DialogTitle className="text-xl">Possible Crash Review</DialogTitle>
+                <DialogTitle className="text-xl">{getIncidentTitle(caseItem.status)}</DialogTitle>
                 <DialogDescription className="mt-1">
                   Case {shortCaseId(caseItem.caseId)}
                 </DialogDescription>

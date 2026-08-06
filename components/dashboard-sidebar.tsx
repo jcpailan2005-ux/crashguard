@@ -86,17 +86,13 @@ export function Sidebar() {
       : normalizedRole === 'responder'
         ? 'Responder'
         : 'User'
-  const effectiveNavItems = isNormalUser
-    ? navItems.filter((item) => item.href === '/samples')
-    : isResponder
-      ? navItems.filter((item) =>
-          ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/ip-camera', '/dashboard/settings'].includes(
-            item.href
-          )
+  const effectiveNavItems = isAdmin
+    ? navItems
+    : navItems.filter((item) =>
+        ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/settings'].includes(
+          item.href
         )
-      : isAdmin
-        ? navItems
-        : navItems.filter((item) => item.href !== '/dashboard/settings')
+      )
 
   const getItemHref = (href: string) => {
     if (!responderArea) return href

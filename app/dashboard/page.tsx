@@ -131,7 +131,7 @@ export default function DashboardPage() {
             ))}
           </div>
 
-          <div className="grid gap-4 md:grid-cols-3">
+          <div className={`grid gap-4 ${profile?.role === 'admin' ? 'md:grid-cols-3' : 'md:grid-cols-2'}`}>
             <Card className="border border-border bg-card p-5">
               <ListChecks className="mb-3 h-8 w-8 text-muted-foreground" />
               <h2 className="font-semibold">Responder Queue</h2>
@@ -154,16 +154,18 @@ export default function DashboardPage() {
               </Button>
             </Card>
 
-            <Card className="border border-border bg-card p-5">
-              <Camera className="mb-3 h-8 w-8 text-muted-foreground" />
-              <h2 className="font-semibold">Live Camera</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                View live camera feed and run crash detection monitoring.
-              </p>
-              <Button asChild variant="outline" className="mt-4 w-full">
-                <Link href="/dashboard/ip-camera">Open Live Camera</Link>
-              </Button>
-            </Card>
+            {profile?.role === 'admin' ? (
+              <Card className="border border-border bg-card p-5">
+                <Camera className="mb-3 h-8 w-8 text-muted-foreground" />
+                <h2 className="font-semibold">Live Camera</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  View live camera feed and run crash detection monitoring.
+                </p>
+                <Button asChild variant="outline" className="mt-4 w-full">
+                  <Link href="/dashboard/ip-camera">Open Live Camera</Link>
+                </Button>
+              </Card>
+            ) : null}
           </div>
         </main>
       </div>

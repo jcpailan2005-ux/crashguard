@@ -18,7 +18,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { getLocalCrashCases } from '@/lib/api-client'
-import { getCaseStatusLabel } from '@/lib/incident-status'
+import { getCaseStatusLabel, getIncidentTitle } from '@/lib/incident-status'
 import { getCaseStatusClass } from '@/lib/theme-status'
 import { LocalCrashCase } from '@/lib/types'
 
@@ -216,7 +216,7 @@ export default function ResponderQueuePage() {
                   <div className="grid gap-4 lg:grid-cols-[1fr_auto]">
                     <div className="min-w-0 space-y-2">
                       <div className="flex flex-wrap items-center gap-2">
-                        <p className="font-semibold">{caseItem.caseId}</p>
+                        <p className="font-semibold">{getIncidentTitle(caseItem.status)} · {caseItem.caseId}</p>
                         <Badge className={getCaseStatusClass(caseItem.status)} variant="outline">
                           {getCaseStatusLabel(caseItem.status)}
                         </Badge>
