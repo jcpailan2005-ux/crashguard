@@ -9,11 +9,13 @@ import {
   Bell,
   ImageIcon,
   ListChecks,
+  History as HistoryIcon,
   BarChart3,
   ChevronRight,
   ChevronDown,
   Menu,
   Settings,
+  Video,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useAuth } from '@/components/auth-provider'
@@ -40,22 +42,28 @@ interface NavItem {
   }>
 }
 
-const navItems: NavItem[] = [
+const responderNavItems: NavItem[] = [
   { name: 'Dashboard', href: '/dashboard', icon: <LayoutDashboard className="w-5 h-5" /> },
   { name: 'Responder Queue', href: '/dashboard/responder-queue', icon: <ListChecks className="w-5 h-5" /> },
+  { name: 'History', href: '/dashboard/history', icon: <HistoryIcon className="w-5 h-5" /> },
+  { name: 'Notifications', href: '/dashboard/notifications', icon: <Bell className="w-5 h-5" /> },
+  { name: 'Settings', href: '/dashboard/settings', icon: <Settings className="w-5 h-5" /> },
+]
+
+const adminNavItems: NavItem[] = [
+  { name: 'Dashboard', href: '/dashboard', icon: <LayoutDashboard className="w-5 h-5" /> },
+  { name: 'Live Camera', href: '/dashboard/ip-camera', icon: <Camera className="w-5 h-5" /> },
   { name: 'Map Review', href: '/dashboard/map', icon: <MapPin className="w-5 h-5" /> },
   { name: 'Notifications', href: '/dashboard/notifications', icon: <Bell className="w-5 h-5" /> },
-  { name: 'Live Camera', href: '/dashboard/ip-camera', icon: <Camera className="w-5 h-5" /> },
   { name: 'Analytics', href: '/dashboard/analytics', icon: <BarChart3 className="w-5 h-5" /> },
   { name: 'Settings', href: '/dashboard/settings', icon: <Settings className="w-5 h-5" /> },
-  {
-    name: 'CCTV',
-    href: '/samples',
-    icon: <ImageIcon className="w-5 h-5" />,
-    children: [
-      { name: 'Talomo CCTV', href: '/samples?area=talomo' },
-    ],
-  },
+  { name: 'CCTV', href: '/samples', icon: <Video className="w-5 h-5" /> },
+]
+
+const defaultNavItems: NavItem[] = [
+  { name: 'Dashboard', href: '/dashboard', icon: <LayoutDashboard className="w-5 h-5" /> },
+  { name: 'Notifications', href: '/dashboard/notifications', icon: <Bell className="w-5 h-5" /> },
+  { name: 'Settings', href: '/dashboard/settings', icon: <Settings className="w-5 h-5" /> },
 ]
 
 export function Sidebar() {
@@ -86,13 +94,12 @@ export function Sidebar() {
       : normalizedRole === 'responder'
         ? 'Responder'
         : 'User'
-  const effectiveNavItems = isAdmin
-    ? navItems
-    : navItems.filter((item) =>
-        ['/dashboard', '/dashboard/responder-queue', '/dashboard/map', '/dashboard/notifications', '/dashboard/settings'].includes(
-          item.href
-        )
-      )
+
+  const effectiveNavItems = isResponder
+    ? responderNavItems
+    : isAdmin
+      ? adminNavItems
+      : defaultNavItems
 
   const getItemHref = (href: string) => {
     if (!responderArea) return href

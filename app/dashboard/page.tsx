@@ -7,6 +7,7 @@ import {
   Camera,
   ClipboardCheck,
   Clock,
+  History as HistoryIcon,
   ListChecks,
   MapPin,
   ShieldQuestion,
@@ -143,16 +144,29 @@ export default function DashboardPage() {
               </Button>
             </Card>
 
-            <Card className="border border-border bg-card p-5">
-              <MapPin className="mb-3 h-8 w-8 text-muted-foreground" />
-              <h2 className="font-semibold">Map Review</h2>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Review location, media evidence, and source context on the map.
-              </p>
-              <Button asChild variant="outline" className="mt-4 w-full">
-                <Link href="/dashboard/map">Open Map Review</Link>
-              </Button>
-            </Card>
+            {profile?.role === 'responder' ? (
+              <Card className="border border-border bg-card p-5">
+                <HistoryIcon className="mb-3 h-8 w-8 text-muted-foreground" />
+                <h2 className="font-semibold">History</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  View completed and past incident response history records.
+                </p>
+                <Button asChild variant="outline" className="mt-4 w-full">
+                  <Link href="/dashboard/history">Open History</Link>
+                </Button>
+              </Card>
+            ) : (
+              <Card className="border border-border bg-card p-5">
+                <MapPin className="mb-3 h-8 w-8 text-muted-foreground" />
+                <h2 className="font-semibold">Map Review</h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Review location, media evidence, and source context on the map.
+                </p>
+                <Button asChild variant="outline" className="mt-4 w-full">
+                  <Link href="/dashboard/map">Open Map Review</Link>
+                </Button>
+              </Card>
+            )}
 
             {profile?.role === 'admin' ? (
               <Card className="border border-border bg-card p-5">

@@ -259,6 +259,7 @@ export function IncidentReviewDialog({
   const [openSections, setOpenSections] = useState<string[]>([])
   const [imageLoadError, setImageLoadError] = useState(false)
   const [showConfirmDispatchModal, setShowConfirmDispatchModal] = useState(false)
+  const [showAcceptDispatchModal, setShowAcceptDispatchModal] = useState(false)
   const { toast } = useToast()
   const { profile } = useAuth()
   const { isAdvancedMode } = useDisplayMode(profile)
@@ -461,6 +462,7 @@ export function IncidentReviewDialog({
                 <div className="mt-3 grid gap-2">
                   {actions.map((item) => {
                     if (item.kind === 'map') {
+                      if (profile?.role === 'responder') return null
                       return (
                         <Button key="map" asChild variant="outline" className="justify-start">
                           <a href={mapUrl} target="_blank" rel="noreferrer">
@@ -527,7 +529,13 @@ export function IncidentReviewDialog({
                         key={item.action}
                         type="button"
                         variant="outline"
-                        onClick={() => handleAction(item.action)}
+                        onClick={() => {
+                          if (item.action === 'accept_dispatch') {
+                            setShowAcceptDispatchModal(true)
+                          } else {
+                            handleAction(item.action)
+                          }
+                        }}
                         disabled={submittingAction != null}
                         className={`justify-start ${STATE_ACTION_CLASSES[item.action] ?? item.className ?? ''}`}
                       >
@@ -698,6 +706,38 @@ export function IncidentReviewDialog({
               }}
             >
               {submittingAction === 'dispatch_help' ? 'Dispatching...' : 'YES, Confirm & Dispatch'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showAcceptDispatchModal} onOpenChange={setShowAcceptDispatchModal}>
+        <DialogContent className="max-w-md border border-border bg-card p-6">
+          <DialogHeader>
+            <DialogTitle>Confirm Dispatch</DialogTitle>
+            <DialogDescription className="mt-2 text-sm text-muted-foreground">
+              Are you sure you want to accept this dispatch?
+              <br />
+              Once accepted, this incident will become your active assignment.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="mt-6 flex justify-end gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowAcceptDispatchModal(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={submittingAction != null}
+              onClick={async () => {
+                setShowAcceptDispatchModal(false)
+                await handleAction('accept_dispatch')
+              }}
+            >
+              {submittingAction === 'accept_dispatch' ? 'Accepting...' : 'Confirm Dispatch'}
             </Button>
           </div>
         </DialogContent>

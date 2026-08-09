@@ -261,7 +261,8 @@ async function apiCall<T>(
     })
 
     if (!response.ok) {
-      throw new Error(`API Error: ${response.status} ${response.statusText}`)
+      const message = await readErrorMessage(response, `API Error: ${response.status} ${response.statusText}`)
+      throw new Error(message)
     }
 
     return (await response.json()) as T

@@ -2,7 +2,7 @@
 
 This checklist is for local school-demo validation of the CCTV monitoring phase.
 
-- Admin can open `/dashboard/cameras` and see all camera records.
+- Admin can open `/dashboard/ip-camera` and see live camera feeds.
 - Responder can open `/dashboard/ip-camera` and see only assigned area/camera records.
 - Normal user cannot access dashboard camera pages.
 - Missing or invalid Firebase token returns `401` from protected camera APIs.

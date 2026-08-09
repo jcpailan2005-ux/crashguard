@@ -162,11 +162,13 @@ def verify_password(password: str, password_hash: str | None, password_salt: str
 
 
 def safe_user(profile: dict) -> dict:
+    raw_role = str(profile.get("role") or "user").strip().lower()
+    role = raw_role if raw_role in {"user", "responder", "admin"} else "user"
     return {
         "uid": profile.get("uid"),
         "email": profile.get("email"),
         "displayName": profile.get("displayName") or "",
-        "role": profile.get("role") if profile.get("role") in {"user", "responder", "admin"} else "user",
+        "role": role,
         "areaId": profile.get("areaId"),
         "active": bool(profile.get("isActive", profile.get("active", 1))),
         "createdAt": profile.get("createdAt") or "",
@@ -3785,21 +3787,19 @@ def api_cameras(request: Request):
 
 @app.post("/api/cameras")
 def api_create_camera(request: Request, body: CameraRecordIn):
+    require_admin(request)
     validate_camera_record_payload(body)
-    require_camera_record_editor(request, body.areaId)
     camera_ip = validate_camera_ip(body.cameraIp) if body.cameraIp else None
     return upsert_camera(camera_record_payload(body, camera_ip))
 
 
 @app.put("/api/cameras/{camera_id}")
 def api_update_camera(camera_id: str, request: Request, body: CameraRecordIn):
+    require_admin(request)
     existing_camera = get_camera(camera_id)
     if existing_camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
     validate_camera_record_payload(body)
-    user = require_camera_record_editor(request, body.areaId)
-    if user["role"] != "admin" and not can_access_camera(user, existing_camera):
-        raise HTTPException(status_code=403, detail="You are not authorized to update this camera.")
     body.cameraId = camera_id
     camera_ip = validate_camera_ip(body.cameraIp) if body.cameraIp else None
     return upsert_camera(camera_record_payload(body, camera_ip))

@@ -235,14 +235,6 @@ export default function ResponderQueuePage() {
                         <span>{caseItem.cameraId || caseItem.sourceCamera || 'No camera label'}</span>
                       </div>
                     </div>
-                    <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-                      <Button asChild>
-                        <Link href={`/dashboard/map?caseId=${caseItem.caseId}`}>
-                          <MapPin className="h-4 w-4" />
-                          Review on Map
-                        </Link>
-                      </Button>
-                    </div>
                   </div>
                 </Card>
               ))
