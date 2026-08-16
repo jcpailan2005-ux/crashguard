@@ -972,7 +972,7 @@ export async function applyLocalCrashCaseAction(
   caseId: string,
   params: { action: string; actorId?: string; notes?: string }
 ): Promise<LocalCrashCase> {
-  return apiCall<LocalCrashCase>(`/api/crash-cases/${caseId}/actions`, {
+  return apiCall<LocalCrashCase>(`/api/crash-cases/${encodeURIComponent(caseId)}/actions`, {
     method: 'POST',
     body: JSON.stringify(params),
   })

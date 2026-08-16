@@ -29,9 +29,11 @@ import { useAuth } from '@/components/auth-provider'
 import { playAccidentAlert } from '@/lib/accident-alert'
 import { APP_CONFIG } from '@/lib/app-config'
 import {
+  createCameraStreamAccess,
   detectFromFile,
   detectFromStreamUrl,
   fetchCameraPreviewFrameObjectUrl,
+  getCameraMjpegPreviewUrl,
   getCameraMonitoringStatus,
   resolveBackendMediaUrl,
   startCctvMonitoring,
@@ -549,6 +551,7 @@ export function LiveCamera({
   const [cctvConnectionStatus, setCctvConnectionStatus] = useState('')
   const [cctvFrameError, setCctvFrameError] = useState('')
   const [cctvPreviewUrl, setCctvPreviewUrl] = useState<string | null>(null)
+  const [cctvMjpegUrl, setCctvMjpegUrl] = useState<string | null>(null)
   const [isCctvLive, setIsCctvLive] = useState(false)
   const [overlaySourceSize, setOverlaySourceSize] = useState<{
     width: number
@@ -988,6 +991,7 @@ export function LiveCamera({
       cctvPreviewUrlRef.current = null
     }
     setCctvPreviewUrl(null)
+    setCctvMjpegUrl(null)
     cctvStartedAtRef.current = null
     cctvLastFrameAtRef.current = null
     cctvMonitorIdRef.current = ''
@@ -1339,15 +1343,24 @@ export function LiveCamera({
     setCctvFrameError('')
     setCctvConnectionStatus(connection.status || connection.message || 'Monitoring live')
 
+    let streamAccessUrl = getCameraMjpegPreviewUrl(monitorId)
+    if (savedCameraId) {
+      try {
+        const streamAccess = await createCameraStreamAccess(savedCameraId)
+        if (streamAccess?.streamUrl) {
+          streamAccessUrl = streamAccess.streamUrl
+        }
+      } catch {
+        // Fallback to standard mjpeg URL
+      }
+    }
+    setCctvMjpegUrl(streamAccessUrl)
+
     await pollCctvMonitor(monitorId)
-    await pollCctvPreview(monitorId)
 
     cctvStatusIntervalRef.current = setInterval(() => {
       void pollCctvMonitor(monitorId)
     }, getEffectiveDetectionIntervalMs())
-    cctvFrameIntervalRef.current = setInterval(() => {
-      void pollCctvPreview(monitorId)
-    }, 1200)
     return true
   }
 
@@ -1570,7 +1583,25 @@ export function LiveCamera({
               />
             ) : isCctvLive ? (
               <div className="flex h-full w-full items-center justify-center bg-[var(--media-background)]">
-                {cctvPreviewUrl ? (
+                {cctvMjpegUrl ? (
+                  <img
+                    key={cctvMjpegUrl}
+                    src={cctvMjpegUrl}
+                    alt="Live CCTV stream"
+                    className="h-full w-full object-contain"
+                    onLoad={(event) => {
+                      updateOverlaySourceSize(
+                        event.currentTarget.naturalWidth,
+                        event.currentTarget.naturalHeight
+                      )
+                    }}
+                    onError={() => {
+                      if (cctvMonitorIdRef.current) {
+                        void pollCctvPreview(cctvMonitorIdRef.current)
+                      }
+                    }}
+                  />
+                ) : cctvPreviewUrl ? (
                   <img
                     src={cctvPreviewUrl}
                     alt="Live CCTV preview"

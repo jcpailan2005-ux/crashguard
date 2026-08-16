@@ -255,24 +255,18 @@ export default function NotificationsPage() {
     setLoadingCaseId(caseId)
 
     try {
-      if (caseId.startsWith('CASE-')) {
-        const localCase = await getLocalCrashCase(caseId)
-        setSelectedCase(localCaseToCrashCase(localCase))
-        return
-      }
-
-      if (!APP_CONFIG.useMockData) {
-        throw new Error('Only SQLite crash cases can be opened from notifications.')
-      }
-
       const db = getFirestoreOrNull()
       const configError = getFirebaseConfigError()
-      if (!db || configError) {
-        throw new Error(configError ?? 'Firestore is not ready.')
+      if (db && !configError && !caseId.startsWith('CASE-')) {
+        const caseItem = await getCrashCase(db, caseId)
+        if (caseItem) {
+          setSelectedCase(caseItem)
+          return
+        }
       }
 
-      const caseItem = await getCrashCase(db, caseId)
-      setSelectedCase(caseItem)
+      const localCase = await getLocalCrashCase(caseId)
+      setSelectedCase(localCaseToCrashCase(localCase))
     } catch {
       setCaseLoadError('Could not load full crash case details.')
     } finally {

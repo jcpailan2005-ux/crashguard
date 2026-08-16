@@ -17,6 +17,7 @@ import shutil
 import socket
 import threading
 import time
+import sqlite3
 import uuid
 
 import cv2
@@ -159,6 +160,50 @@ def verify_password(password: str, password_hash: str | None, password_salt: str
         return False
     candidate_hash, _ = hash_password(password, password_salt)
     return hmac.compare_digest(candidate_hash, password_hash)
+
+
+def seed_default_users() -> None:
+    default_accounts = [
+        {
+            "uid": "USR-ADMIN-DEFAULT",
+            "email": "admin@crashguard.local",
+            "password": "admin123",
+            "displayName": "System Admin",
+            "role": "admin",
+            "areaId": None,
+        },
+        {
+            "uid": "USR-RESPONDER-DEFAULT",
+            "email": "responder@crashguard.local",
+            "password": "responder123",
+            "displayName": "Talomo Responder",
+            "role": "responder",
+            "areaId": "talomo",
+        },
+    ]
+
+    timestamp = datetime.now().isoformat()
+    for acc in default_accounts:
+        existing = get_user_profile_by_email(acc["email"])
+        if existing is None or not existing.get("passwordHash"):
+            p_hash, p_salt = hash_password(acc["password"])
+            upsert_user_profile(
+                {
+                    "uid": existing.get("uid") if existing else acc["uid"],
+                    "email": acc["email"],
+                    "displayName": acc["displayName"],
+                    "role": acc["role"],
+                    "areaId": acc["areaId"],
+                    "passwordHash": p_hash,
+                    "passwordSalt": p_salt,
+                    "isActive": True,
+                    "createdAt": existing.get("createdAt") if existing else timestamp,
+                    "updatedAt": timestamp,
+                }
+            )
+
+
+seed_default_users()
 
 
 def safe_user(profile: dict) -> dict:
@@ -2073,6 +2118,7 @@ class LiveCameraMonitor:
         self.status = "connecting"
         self.message = "Connecting"
         self.latest_frame: np.ndarray | None = None
+        self.latest_jpeg_bytes: bytes | None = None
         self.latest_result: dict | None = None
         self.last_checked_at: str | None = None
         self.last_frame_at: float | None = None
@@ -2137,6 +2183,7 @@ class LiveCameraMonitor:
                     time.sleep(0.08)
                 return
 
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000"
             while self.running:
                 self._set_status("reconnecting", "Reconnecting")
                 with self.lock:
@@ -2156,14 +2203,36 @@ class LiveCameraMonitor:
                     with self.lock:
                         self.reconnecting = False
                     while self.running:
-                        ok, frame = cap.read()
+                        # Low-latency priority: grab newest frame packet, discarding queued stale packets
+                        ok = cap.grab()
+                        if not ok:
+                            with self.lock:
+                                self.last_error = "Camera stream returned no frame."
+                            self._set_status("connection-lost", "Connection Lost")
+                            break
+
+                        # Flush queued stale frames (up to 5) to keep frame buffer fresh
+                        flushed = 0
+                        while flushed < 5 and cap.grab():
+                            flushed += 1
+
+                        ok, frame = cap.retrieve()
                         if not ok or frame is None:
                             with self.lock:
                                 self.last_error = "Camera stream returned no frame."
                             self._set_status("connection-lost", "Connection Lost")
                             break
+
+                        ok_enc, encoded = cv2.imencode(
+                            ".jpg",
+                            frame,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_CAMERA_JPEG_QUALITY],
+                        )
+                        jpeg_bytes = encoded.tobytes() if ok_enc else None
+
                         with self.lock:
                             self.latest_frame = frame
+                            self.latest_jpeg_bytes = jpeg_bytes
                             self.last_frame_at = time.time()
                             self.last_error = None
                 finally:
@@ -2175,8 +2244,15 @@ class LiveCameraMonitor:
                 self.reconnecting = False
 
     def seed_first_frame(self, frame: np.ndarray) -> None:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_CAMERA_JPEG_QUALITY],
+        )
+        jpeg_bytes = encoded.tobytes() if ok else None
         with self.lock:
             self.latest_frame = frame.copy()
+            self.latest_jpeg_bytes = jpeg_bytes
             self.last_frame_at = time.time()
             self.last_error = None
             self.reconnecting = False
@@ -2186,6 +2262,8 @@ class LiveCameraMonitor:
 
     def latest_jpeg(self) -> bytes | None:
         with self.lock:
+            if self.latest_jpeg_bytes is not None:
+                return self.latest_jpeg_bytes
             frame = None if self.latest_frame is None else self.latest_frame.copy()
         if frame is None:
             return None
@@ -2970,7 +3048,9 @@ def start_live_camera_monitor(
             for key in keys
             if key in LIVE_CAMERA_WORKERS
         }
-        for existing in existing_workers:
+        for existing in list(existing_workers):
+            if existing.running and existing.stream_url == stream_url:
+                return existing
             existing.stop()
         for key, worker in list(LIVE_CAMERA_WORKERS.items()):
             if worker in existing_workers:
@@ -3699,6 +3779,8 @@ def api_crash_case_action(case_id: str, request: Request, body: CrashCaseActionI
         raise HTTPException(status_code=404, detail="Crash case not found.") from error
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except sqlite3.Error as error:
+        raise HTTPException(status_code=400, detail=f"Database action failed: {error}") from error
 
 
 @app.get("/api/analytics/summary")

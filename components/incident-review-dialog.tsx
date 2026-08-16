@@ -288,31 +288,27 @@ export function IncidentReviewDialog({
   const handleAction = async (action: CaseActionType) => {
     setSubmittingAction(action)
     try {
-      if (caseItem.caseId.startsWith('CASE-')) {
-        const updatedCase = await applyLocalCrashCaseAction(caseItem.caseId, {
-          action,
-          actorId,
-          notes,
-        })
-        onCaseUpdated?.(localCaseToCrashCase(updatedCase))
-      } else {
-        const db = getFirestoreOrNull()
-        const configError = getFirebaseConfigError()
+      const db = getFirestoreOrNull()
+      const configError = getFirebaseConfigError()
 
-        if (!db || configError) {
-          throw new Error(configError ?? 'Firestore is not ready.')
-        }
-
+      if (db && !configError && !caseItem.caseId.startsWith('CASE-')) {
         await applyCrashCaseAction(db, {
           action,
           actorId,
           caseItem,
           notes,
         })
+      } else {
+        const updatedCase = await applyLocalCrashCaseAction(caseItem.caseId, {
+          action,
+          actorId,
+          notes,
+        })
+        onCaseUpdated?.(localCaseToCrashCase(updatedCase))
       }
       setNotes('')
       toast({
-        title: CASE_ACTION_LABELS[action],
+        title: action === 'accept_dispatch' ? 'Dispatch accepted' : CASE_ACTION_LABELS[action],
         description: `Case ${shortCaseId(caseItem.caseId)} updated.`,
       })
     } catch (error) {

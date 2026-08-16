@@ -520,14 +520,15 @@ def list_crash_cases(
 def get_crash_case(case_id: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM crash_cases WHERE caseId = ?",
-            (case_id,),
+            "SELECT * FROM crash_cases WHERE caseId = ? OR lower(caseId) = lower(?)",
+            (case_id, case_id),
         ).fetchone()
         if row is None:
             return None
+        actual_case_id = row["caseId"]
         actions = conn.execute(
             "SELECT * FROM crash_actions WHERE caseId = ? ORDER BY timestamp ASC",
-            (case_id,),
+            (actual_case_id,),
         ).fetchall()
         notification = conn.execute(
             """
@@ -537,7 +538,7 @@ def get_crash_case(case_id: str) -> dict | None:
             ORDER BY createdAt DESC
             LIMIT 1
             """,
-            (case_id,),
+            (actual_case_id,),
         ).fetchone()
     case_item = _row_to_case(row)
     case_item["notificationId"] = notification["notificationId"] if notification else None
