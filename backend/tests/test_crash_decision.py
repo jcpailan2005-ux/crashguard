@@ -1,6 +1,7 @@
 import gc
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -25,6 +26,7 @@ from backend.repositories.crash_cases import (
     list_notifications,
 )
 from backend.services.frame_quality import analyze_frame_quality
+from backend.services.crash_event_state import CrashEventManager
 from backend.tests.test_frame_quality import blurry_frame, clear_frame
 
 
@@ -48,6 +50,9 @@ def decide(**overrides):
 # requires as proof of a confirmed_crash decision (see _require_confirmed_crash_payload).
 CONFIRMED_CRASH_GATE_FIELDS = {
     "finalDecision": "confirmed_crash",
+    "detectionMode": "temporal_collision",
+    "temporalVerified": True,
+    "temporalCrashScore": 0.80,
     "vehicleCount": 2,
     "sceneValid": True,
     "motionValid": True,
@@ -98,24 +103,24 @@ class CrashDecisionTests(unittest.TestCase):
         self.assertEqual(reason, "person_only_not_crash")
         self.assertEqual(decision, "ignored")
 
-    def test_single_vehicle_without_motion_creates_review_case_not_confirmed(self):
+    def test_single_vehicle_without_interaction_stays_candidate(self):
         # A single still/parked vehicle has no second vehicle to corroborate
         # crash-like proximity, so this can never reach confirmed_crash
         # (which requires motion_valid) — but a genuinely high classifier
         # score is still enough on its own to raise a lower-confidence Needs
         # Review case for a human to check.
         should_create, reason, decision = decide(vehicle_count=1, motion_valid=False)
-        self.assertTrue(should_create)
-        self.assertIsNone(reason)
-        self.assertEqual(decision, "high_confidence_review")
+        self.assertFalse(should_create)
+        self.assertEqual(reason, "interaction_candidate_required")
+        self.assertEqual(decision, "candidate")
 
-    def test_normal_traffic_without_motion_creates_review_case_not_confirmed(self):
+    def test_normal_traffic_without_interaction_stays_candidate(self):
         # Multiple vehicles flowing without crash-like proximity/overlap
         # can't reach confirmed_crash either, for the same reason.
         should_create, reason, decision = decide(vehicle_count=4, motion_valid=False)
-        self.assertTrue(should_create)
-        self.assertIsNone(reason)
-        self.assertEqual(decision, "high_confidence_review")
+        self.assertFalse(should_create)
+        self.assertEqual(reason, "interaction_candidate_required")
+        self.assertEqual(decision, "candidate")
 
     def test_low_accident_probability_must_not_create_case(self):
         should_create, reason, decision = decide(
@@ -133,16 +138,16 @@ class CrashDecisionTests(unittest.TestCase):
         self.assertEqual(reason, "non_accident")
         self.assertEqual(decision, "ignored")
 
-    def test_one_frame_high_confidence_creates_review_case_not_confirmed(self):
+    def test_one_frame_high_confidence_requires_temporal_verification(self):
         # A single high-confidence frame can't reach confirmed_crash (which
         # requires the 3-frame temporal streak), but the
         # high_confidence_review tier exists precisely so it isn't ignored
         # either: it raises a Needs Review case immediately, and a human
         # responder verifies it manually.
         should_create, reason, decision = decide(consecutive_positive_frames=1)
-        self.assertTrue(should_create)
-        self.assertIsNone(reason)
-        self.assertEqual(decision, "high_confidence_review")
+        self.assertFalse(should_create)
+        self.assertEqual(reason, "temporal_not_confirmed")
+        self.assertEqual(decision, "verifying")
 
     def test_vehicle_outside_roi_must_not_create_case(self):
         should_create, reason, decision = decide(scene_valid=False)
@@ -238,7 +243,7 @@ class CameraDecisionTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.record_frame("cam", False, now=now + 2), 0)
         self.assertEqual(tracker.record_frame("cam", True, now=now + 3), 1)
 
-    def test_single_qualifying_frame_creates_exactly_one_review_case(self):
+    def test_temporal_streak_creates_only_after_required_hits(self):
         # Under the two-tier design, any frame that clears the shared
         # baseline (quality/score/vehicle/scene, plus motion_valid here)
         # immediately creates a case rather than waiting for a 3-frame
@@ -263,10 +268,10 @@ class CameraDecisionTrackerTests(unittest.TestCase):
 
         created = [entry for entry in decisions if entry[0]]
         self.assertEqual(len(created), 1)
-        self.assertEqual(decisions[0][2], "high_confidence_review")
-        self.assertEqual(decisions[1][1], "cooldown_active")
+        self.assertEqual(decisions[0][2], "verifying")
+        self.assertEqual(decisions[1][2], "verifying")
+        self.assertEqual(decisions[2][2], "confirmed_crash")
         self.assertFalse(decisions[1][0])
-        self.assertFalse(decisions[2][0])
         self.assertFalse(decisions[3][0])
 
     def test_three_consecutive_corroborated_hits_reach_confirmed_crash(self):
@@ -421,9 +426,9 @@ class RepositorySafetyGateTests(RepositorySafetyGateBase):
             create_crash_case(payload)
         self.assertEqual(ctx.exception.reason, "missing_confirmed_crash_decision")
 
-    def test_below_threshold_crash_score_is_refused(self):
+    def test_below_threshold_temporal_score_is_refused(self):
         payload = self._base_payload(
-            **{**CONFIRMED_CRASH_GATE_FIELDS, "crashScore": 0.1}
+            **{**CONFIRMED_CRASH_GATE_FIELDS, "temporalCrashScore": 0.1}
         )
         with self.assertRaises(CrashCaseRejected):
             create_crash_case(payload)
@@ -447,7 +452,7 @@ class RepositorySafetyGateTests(RepositorySafetyGateBase):
         case_item = create_crash_case(payload)
         self.assertIsNotNone(case_item)
         self.assertIsNotNone(case_item["caseId"])
-        self.assertIsNotNone(case_item.get("createdNotificationId"))
+        self.assertIsNone(case_item.get("createdNotificationId"))
 
         all_cases = list_crash_cases(area_id="demo")
         matching = [case for case in all_cases if case["cameraId"] == "CAM-TEST-GATE"]
@@ -524,11 +529,92 @@ class ActiveCaseBlockingTests(RepositorySafetyGateBase):
         self.assertIsNone(find_unresolved_camera_case(camera_id="CAM-TEST-1"))
 
 
+class DetectorEventPersistenceTests(RepositorySafetyGateBase):
+    def _event_payload(self, event_id: str) -> dict:
+        return self._base_payload(
+            cameraId="CAM-EVENT-PERSISTENCE",
+            detectorEventId=event_id,
+            **CONFIRMED_CRASH_GATE_FIELDS,
+        )
+
+    def test_pending_review_from_first_event_does_not_block_second_event(self):
+        first = create_crash_case(self._event_payload("EVENT-A"))
+        second = create_crash_case(self._event_payload("EVENT-B"))
+
+        self.assertEqual(first["status"], "pending_review")
+        self.assertEqual(second["status"], "pending_review")
+        self.assertNotEqual(first["caseId"], second["caseId"])
+        matching = [
+            case
+            for case in list_crash_cases(area_id="demo")
+            if case["cameraId"] == "CAM-EVENT-PERSISTENCE"
+        ]
+        self.assertEqual(len(matching), 2)
+
+    def test_same_detector_event_id_cannot_persist_twice(self):
+        create_crash_case(self._event_payload("EVENT-ONE-CASE"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            create_crash_case(self._event_payload("EVENT-ONE-CASE"))
+
+    def test_crash_clear_crash_creates_two_events_and_two_pending_cases(self):
+        manager = CrashEventManager(
+            required_positive_observations=3,
+            temporal_window_seconds=5.0,
+            clear_consecutive_negatives=2,
+            clear_seconds=1.0,
+            cooldown_seconds=1.0,
+        )
+
+        def positive(now: float):
+            return manager.observe(
+                "CAM-EVENT-PERSISTENCE",
+                positive=True,
+                interaction_candidate=True,
+                classifier_score=0.95,
+                now=now,
+            )
+
+        positive(0.0)
+        positive(0.2)
+        event_a = positive(0.4)
+        case_a = create_crash_case(self._event_payload(event_a.detector_event_id))
+        manager.mark_persisted(
+            "CAM-EVENT-PERSISTENCE", event_a.detector_event_id, case_a["caseId"], now=0.5
+        )
+
+        manager.observe(
+            "CAM-EVENT-PERSISTENCE",
+            positive=False,
+            interaction_candidate=False,
+            classifier_score=0.01,
+            now=1.0,
+        )
+        manager.observe(
+            "CAM-EVENT-PERSISTENCE",
+            positive=False,
+            interaction_candidate=False,
+            classifier_score=0.01,
+            now=2.1,
+        )
+
+        positive(3.2)
+        positive(3.4)
+        event_b = positive(3.6)
+        case_b = create_crash_case(self._event_payload(event_b.detector_event_id))
+        manager.mark_persisted(
+            "CAM-EVENT-PERSISTENCE", event_b.detector_event_id, case_b["caseId"], now=3.7
+        )
+
+        self.assertNotEqual(event_a.detector_event_id, event_b.detector_event_id)
+        self.assertNotEqual(case_a["caseId"], case_b["caseId"])
+        self.assertEqual(case_a["status"], "pending_review")
+        self.assertEqual(case_b["status"], "pending_review")
+
+
 class NotificationTriggerTests(RepositorySafetyGateBase):
     """A crash notification must only be created via create_crash_case, and
-    only when crashScore >= CRASH_CASE_THRESHOLD (0.90) AND every other
-    confirmed_crash gate has passed. 80% is a UI-only warning threshold and
-    must never create a notification by itself."""
+    only when explicit temporal or persistent-aftermath proof passes the final
+    repository gate. A classifier score by itself never creates a notification."""
 
     def _notifications_for_case(self, case_id: str) -> list[dict]:
         return [row for row in list_notifications() if row["caseId"] == case_id]
@@ -541,14 +627,54 @@ class NotificationTriggerTests(RepositorySafetyGateBase):
 
         payload = self._base_payload(
             cameraId="CAM-NOTIFY-089",
-            **{**CONFIRMED_CRASH_GATE_FIELDS, "crashScore": 0.89},
+            **{
+                **CONFIRMED_CRASH_GATE_FIELDS,
+                "crashScore": 0.89,
+                "temporalVerified": False,
+            },
         )
         with self.assertRaises(CrashCaseRejected) as ctx:
             create_crash_case(payload)
         self.assertEqual(ctx.exception.reason, "missing_confirmed_crash_decision")
         self.assertEqual(len(list_notifications()), 0)
 
-    def test_score_0_90_with_confirmed_crash_creates_notification(self):
+    def test_weak_classifier_with_real_temporal_proof_can_create_review_case(self):
+        payload = self._base_payload(
+            cameraId="CAM-NOTIFY-TEMPORAL",
+            **{**CONFIRMED_CRASH_GATE_FIELDS, "crashScore": 0.20},
+        )
+        case_item = create_crash_case(payload)
+        self.assertIsNotNone(case_item)
+        self.assertEqual(case_item["status"], "pending_review")
+        self.assertEqual(len(list_notifications()), 0)
+
+    def test_persistent_aftermath_proof_creates_distinct_review_case(self):
+        payload = self._base_payload(
+            cameraId="CAM-NOTIFY-AFTERMATH",
+            finalDecision="possible_crash_aftermath",
+            detectionMode="aftermath_review",
+            vehicleCount=1,
+            sceneValid=True,
+            motionValid=False,
+            interactionCandidate=False,
+            crashScore=0.88,
+            consecutiveCrashHits=3,
+            temporalVerified=False,
+            temporalCrashScore=0.0,
+            aftermathCandidate=True,
+            aftermathScore=0.88,
+            aftermathClassifierScore=0.90,
+            aftermathAbnormalityScore=0.90,
+            aftermathPositiveObservations=6,
+            aftermathPersistenceSeconds=2.5,
+        )
+        case_item = create_crash_case(payload)
+
+        self.assertEqual(case_item["status"], "pending_review")
+        self.assertEqual(case_item["detectionMode"], "aftermath_review")
+        self.assertIn("Impact was not observed", case_item["notes"])
+
+    def test_score_0_90_with_confirmed_crash_creates_case_without_notification(self):
         should_create, reason, decision = decide(crash_confidence=0.90)
         self.assertTrue(should_create)
         self.assertIsNone(reason)
@@ -561,13 +687,10 @@ class NotificationTriggerTests(RepositorySafetyGateBase):
         )
         case_item = create_crash_case(payload)
         self.assertIsNotNone(case_item)
-        self.assertIsNotNone(case_item.get("createdNotificationId"))
+        self.assertIsNone(case_item.get("createdNotificationId"))
 
         notifications = self._notifications_for_case(case_item["caseId"])
-        self.assertEqual(len(notifications), 1)
-        self.assertEqual(notifications[0]["title"], "Car Crash Detected")
-        self.assertIn("90%", notifications[0]["message"])
-        self.assertIn("Talomo Crossing CCTV", notifications[0]["message"])
+        self.assertEqual(len(notifications), 0)
 
     def test_score_0_95_person_only_creates_no_notification(self):
         should_create, reason, decision = decide(
@@ -611,7 +734,7 @@ class NotificationTriggerTests(RepositorySafetyGateBase):
             **{**CONFIRMED_CRASH_GATE_FIELDS, "crashScore": 0.95},
         )
         first_case = create_crash_case(payload)
-        self.assertEqual(len(self._notifications_for_case(first_case["caseId"])), 1)
+        self.assertEqual(len(self._notifications_for_case(first_case["caseId"])), 0)
 
         # A second high-scoring frame on the same camera, with the first case
         # still pending review, must be rejected before a case (and therefore
@@ -630,7 +753,7 @@ class NotificationTriggerTests(RepositorySafetyGateBase):
         camera_notifications = [
             row for row in list_notifications() if row.get("cameraId") == "CAM-NOTIFY-DUP"
         ]
-        self.assertEqual(len(camera_notifications), 1)
+        self.assertEqual(len(camera_notifications), 0)
 
 
 class DecisionLoggingTests(unittest.TestCase):
@@ -698,45 +821,34 @@ class HighConfidenceReviewCaseTests(RepositorySafetyGateBase):
             create_crash_case(payload)
         self.assertEqual(len(list_notifications()), 0)
 
-    def test_score_0_90_with_vehicle_creates_pending_review_case_and_notification(self):
+    def test_score_0_90_single_frame_creates_no_case_or_notification(self):
         should_create, reason, decision = decide_single_frame(crash_confidence=0.90)
-        self.assertTrue(should_create)
-        self.assertIsNone(reason)
-        self.assertEqual(decision, "high_confidence_review")
+        self.assertFalse(should_create)
+        self.assertEqual(reason, "interaction_candidate_required")
+        self.assertEqual(decision, "candidate")
 
         payload = self._base_payload(
             cameraId="CAM-REVIEW-090",
             cameraName="Matina Crossing CCTV",
             **{**HIGH_CONFIDENCE_REVIEW_GATE_FIELDS, "crashScore": 0.90},
         )
-        case_item = create_crash_case(payload)
-        self.assertIsNotNone(case_item)
-        self.assertEqual(case_item["status"], "pending_review")
-        self.assertIsNotNone(case_item.get("createdNotificationId"))
+        with self.assertRaises(CrashCaseRejected):
+            create_crash_case(payload)
+        self.assertEqual(len(list_notifications()), 0)
 
-        notifications = self._notifications_for_case(case_item["caseId"])
-        self.assertEqual(len(notifications), 1)
-        self.assertEqual(notifications[0]["title"], "Car Crash Detected")
-        self.assertIn("90%", notifications[0]["message"])
-        self.assertIn("Matina Crossing CCTV", notifications[0]["message"])
-        self.assertIn("review", notifications[0]["message"].lower())
-
-    def test_score_0_99_with_vehicle_creates_pending_review_case_and_notification(self):
+    def test_score_0_99_single_frame_creates_no_case_or_notification(self):
         should_create, reason, decision = decide_single_frame(crash_confidence=0.99)
-        self.assertTrue(should_create)
-        self.assertIsNone(reason)
-        self.assertEqual(decision, "high_confidence_review")
+        self.assertFalse(should_create)
+        self.assertEqual(reason, "interaction_candidate_required")
+        self.assertEqual(decision, "candidate")
 
         payload = self._base_payload(
             cameraId="CAM-REVIEW-099",
             **{**HIGH_CONFIDENCE_REVIEW_GATE_FIELDS, "crashScore": 0.99},
         )
-        case_item = create_crash_case(payload)
-        self.assertIsNotNone(case_item)
-        self.assertEqual(case_item["status"], "pending_review")
-        notifications = self._notifications_for_case(case_item["caseId"])
-        self.assertEqual(len(notifications), 1)
-        self.assertIn("99%", notifications[0]["message"])
+        with self.assertRaises(CrashCaseRejected):
+            create_crash_case(payload)
+        self.assertEqual(len(list_notifications()), 0)
 
     def test_score_0_99_no_vehicle_creates_no_case(self):
         should_create, reason, decision = decide_single_frame(
@@ -773,13 +885,13 @@ class HighConfidenceReviewCaseTests(RepositorySafetyGateBase):
     def test_active_pending_review_case_blocks_duplicate(self):
         payload = self._base_payload(
             cameraId="CAM-REVIEW-DUP",
-            **{**HIGH_CONFIDENCE_REVIEW_GATE_FIELDS, "crashScore": 0.95},
+            **{**CONFIRMED_CRASH_GATE_FIELDS, "crashScore": 0.95},
         )
         first_case = create_crash_case(payload)
         self.assertEqual(first_case["status"], "pending_review")
-        self.assertEqual(len(self._notifications_for_case(first_case["caseId"])), 1)
+        self.assertEqual(len(self._notifications_for_case(first_case["caseId"])), 0)
 
-        should_create_second, reason_second, decision_second = decide_single_frame(
+        should_create_second, reason_second, decision_second = decide(
             crash_confidence=0.99, active_case_exists=True
         )
         self.assertFalse(should_create_second)
@@ -792,17 +904,17 @@ class HighConfidenceReviewCaseTests(RepositorySafetyGateBase):
         camera_notifications = [
             row for row in list_notifications() if row.get("cameraId") == "CAM-REVIEW-DUP"
         ]
-        self.assertEqual(len(camera_notifications), 1)
+        self.assertEqual(len(camera_notifications), 0)
 
     def test_cooldown_blocks_duplicate(self):
         payload = self._base_payload(
             cameraId="CAM-REVIEW-COOLDOWN",
-            **{**HIGH_CONFIDENCE_REVIEW_GATE_FIELDS, "crashScore": 0.95},
+            **{**CONFIRMED_CRASH_GATE_FIELDS, "crashScore": 0.95},
         )
         first_case = create_crash_case(payload)
-        self.assertEqual(len(self._notifications_for_case(first_case["caseId"])), 1)
+        self.assertEqual(len(self._notifications_for_case(first_case["caseId"])), 0)
 
-        should_create_second, reason_second, decision_second = decide_single_frame(
+        should_create_second, reason_second, decision_second = decide(
             crash_confidence=0.99, cooldown_ready=False
         )
         self.assertFalse(should_create_second)

@@ -28,7 +28,6 @@ import {
 } from '@/lib/api-client'
 import { caseMedia as getCaseMedia, localCaseToCrashCase as mapLocalCaseToCrashCase } from '@/lib/crash-case-mapper'
 import {
-  applyMapReviewDecision,
   subscribeCrashCases,
 } from '@/lib/crash-case-store'
 import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
@@ -329,7 +328,7 @@ export default function LiveMapPage() {
     return [selectedCase, ...activeCases]
   }, [activeCases, selectedCase])
   const media = getCaseMedia(selectedCase)
-  const actorId = firebaseUser?.uid ?? 'map-responder'
+  const actorId = firebaseUser?.uid ?? ''
   const canDecide =
     selectedCase?.status === 'pending_review' || selectedCase?.status === 'under_review'
 
@@ -342,27 +341,16 @@ export default function LiveMapPage() {
 
     setDeciding(decision)
     try {
-      if (selectedCase.caseId.startsWith('CASE-')) {
-        if (selectedCase.status === 'pending_review') {
-          await applyLocalCrashCaseAction(selectedCase.caseId, {
-            action: 'review_alert',
-            actorId,
-          })
-        }
-        await applyLocalCrashCaseAction(selectedCase.caseId, {
-          action: decision === 'legit_crash' ? 'confirm_crash' : 'mark_false_alarm',
-          actorId,
-        })
-        refreshLocalCases()
-      } else {
-        const db = getFirestoreOrNull()
-        if (!db) return
-        await applyMapReviewDecision(db, {
-          actorId,
-          caseItem: selectedCase,
-          decision,
-        })
+      if (!selectedCase.caseId.startsWith('CASE-')) {
+        throw new Error('Legacy Firestore cases are read-only. Open the Dispatcher review queue for operational decisions.')
       }
+      if (selectedCase.status === 'pending_review') {
+        await applyLocalCrashCaseAction(selectedCase.caseId, { action: 'review_alert' })
+      }
+      await applyLocalCrashCaseAction(selectedCase.caseId, {
+        action: decision === 'legit_crash' ? 'confirm_crash' : 'mark_false_alarm',
+      })
+      refreshLocalCases()
       toast({
         title: decision === 'legit_crash' ? 'Crash confirmed' : 'Marked false alarm',
         description: `Case ${shortCaseId(selectedCase.caseId)} was updated from map review.`,

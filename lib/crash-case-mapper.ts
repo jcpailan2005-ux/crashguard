@@ -32,6 +32,7 @@ export function localCaseToCrashCase(caseItem: LocalCrashCase): CrashCase {
   return {
     caseId: caseItem.caseId,
     detectionId: caseItem.caseId,
+    detectionMode: caseItem.detectionMode ?? null,
     status: caseItem.status,
     reviewerId: caseItem.responderId ?? null,
     user: null,

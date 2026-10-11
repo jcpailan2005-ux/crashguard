@@ -91,6 +91,7 @@ export function crashCaseFromFirestore(id: string, data: any): CrashCase {
   return {
     caseId: String(data?.caseId ?? id),
     detectionId: String(data?.detectionId ?? id),
+    detectionMode: data?.detectionMode ?? null,
     status: data?.status ?? 'pending_review',
     reviewerId: data?.reviewerId ? String(data.reviewerId) : null,
     user: data?.user ?? null,

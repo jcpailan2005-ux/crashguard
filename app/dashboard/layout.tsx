@@ -1,14 +1,17 @@
 'use client'
 
 import { useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { usePathname, useRouter } from 'next/navigation'
 import { useAuth } from '@/components/auth-provider'
 import { isDashboardRole } from '@/lib/auth-profile'
 import { PermissionMessage } from '@/components/permission-message'
+import { legacyDashboardRedirect } from '@/lib/role-routing'
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { firebaseUser, loading, profile, signOutUser } = useAuth()
   const router = useRouter()
+  const pathname = usePathname()
+  const legacyRedirect = profile ? legacyDashboardRedirect(pathname, profile.role) : null
 
   useEffect(() => {
     if (loading) return
@@ -28,7 +31,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       return
     }
 
-  }, [firebaseUser, loading, profile, router, signOutUser])
+    const target = legacyDashboardRedirect(pathname, profile.role)
+    if (target) router.replace(target)
+
+  }, [firebaseUser, loading, pathname, profile, router, signOutUser])
 
   if (loading) {
     return (
@@ -45,6 +51,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   if (!isDashboardRole(profile.role)) {
     return <PermissionMessage onSignOut={() => void signOutUser().then(() => router.replace('/login'))} />
   }
+
+  if (legacyRedirect) return null
 
   return <>{children}</>
 }

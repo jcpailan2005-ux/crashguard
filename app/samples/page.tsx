@@ -30,8 +30,6 @@ import { useToast } from '@/hooks/use-toast'
 import { useAuth } from '@/components/auth-provider'
 import { detectFromFile } from '@/lib/api-client'
 import { APP_CONFIG } from '@/lib/app-config'
-import { isDashboardRole } from '@/lib/auth-profile'
-import { createCrashCaseFromDetection } from '@/lib/crash-case-store'
 import { db } from '@/lib/firebase'
 import { getFirebaseConfigError } from '@/lib/firebase-guards'
 import { AreaId, getAreaLabel } from '@/lib/locations'
@@ -64,24 +62,26 @@ function SamplesPageContent() {
   const [sampleError, setSampleError] = useState('')
   const [liveSession, setLiveSession] = useState<LiveCameraSession | null>(null)
   const [liveSessionSubscribeError, setLiveSessionSubscribeError] = useState<string | null>(null)
-  const lastResponderAlertAtRef = useRef(0)
   const lastLiveSessionPublishAtRef = useRef(0)
 
   const { toast } = useToast()
   const isResponder = profile?.role === 'responder'
   const responderArea = profile?.role === 'responder' ? profile.areaId : null
-  const canReviewIncidents = isDashboardRole(profile?.role)
   const canReadLiveSessions = profile?.role === 'admin' || Boolean(responderArea)
   const requestedArea = searchParams.get('area')
+  const legacyResponderArea: AreaId | null =
+    responderArea === 'talomo' || responderArea === 'bago' || responderArea === 'toril'
+      ? responderArea
+      : null
   const selectedLocation: AreaId =
-    responderArea ??
+    legacyResponderArea ??
     (requestedArea === 'talomo' || requestedArea === 'bago' || requestedArea === 'toril'
       ? requestedArea
       : 'talomo')
 
   useEffect(() => {
     if (isResponder) {
-      router.replace('/dashboard')
+      router.replace('/responder')
       return
     }
   }, [isResponder, router])
@@ -224,30 +224,6 @@ function SamplesPageContent() {
     void updateResponderLiveSession(payload)
   }
 
-  const pushResponderIncidentToFirestore = async (result: DetectionResponse) => {
-    if (!responderArea || !firebaseUser || !result.accident_detected) return
-    if (!db) return
-
-    try {
-      const now = Date.now()
-      if (now - lastResponderAlertAtRef.current < APP_CONFIG.detection.responderAlertDebounceMs) {
-        return
-      }
-      lastResponderAlertAtRef.current = now
-
-      await createCrashCaseFromDetection(db, {
-        actorId: firebaseUser.uid,
-        areaId: responderArea,
-        result,
-        source: 'live-camera',
-        sourceFile: `${responderArea}-live-camera`,
-        locationLabel: `${responderAreaLabel} CCTV`,
-      })
-    } catch (error) {
-      console.error('Failed to publish responder alert:', error)
-    }
-  }
-
   if (!mounted || loading) {
     return null
   }
@@ -295,16 +271,6 @@ function SamplesPageContent() {
       const result = await detectFromFile(file, sample.type)
 
       setSampleResult(result)
-      if (result.accident_detected && db && canReviewIncidents) {
-        await createCrashCaseFromDetection(db, {
-          actorId: firebaseUser?.uid ?? 'sample-user',
-          areaId: sample.location,
-          result,
-          source: 'sample',
-          sourceFile: sample.url,
-          locationLabel: `${getAreaLabel(sample.location)} sample`,
-        })
-      }
       toast({
         title: result.accident_detected ? 'Possible Crash Pending Review' : 'Detection Complete',
         description: `${sample.title} returned ${(result.confidence * 100).toFixed(
@@ -396,7 +362,7 @@ function SamplesPageContent() {
                     detections: result.detections.slice(0, 5),
                   } as DetectionResponse,
                 })
-                void pushResponderIncidentToFirestore(result)
+                // The backend transaction is the sole creator of operational incidents.
               }}
             />
           </main>

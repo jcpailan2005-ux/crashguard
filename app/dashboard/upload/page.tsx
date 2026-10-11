@@ -35,8 +35,7 @@ import { Card } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useToast } from '@/hooks/use-toast'
 import { playAccidentAlert } from '@/lib/accident-alert'
-import { createCrashCaseFromDetection } from '@/lib/crash-case-store'
-import { getFirestoreOrNull } from '@/lib/firebase-guards'
+import { shouldEmitOperationalAlarm } from '@/lib/incident-alarm-contract'
 import {
   detectFromFile,
   detectMediaTypeFromFile,
@@ -68,8 +67,10 @@ export default function UploadPage() {
   const uploadPreviewUrlRef = useRef<string | null>(null)
   const cameraPreviewUrlRef = useRef<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const lastAlarmedIncidentIdRef = useRef<string | null>(null)
   const { toast } = useToast()
-  const { firebaseUser, profile } = useAuth()
+  const { firebaseUser, personalPreferences, profile } = useAuth()
+  const alarmAudioEnabled = personalPreferences?.notificationPreferences.alarmAudio ?? true
   const router = useRouter()
 
   useEffect(() => {
@@ -261,24 +262,20 @@ export default function UploadPage() {
       })
 
       if (detectionResult.accident_detected) {
-        const db = getFirestoreOrNull()
-        if (db) {
-          const nextCaseId = await createCrashCaseFromDetection(db, {
-            actorId: firebaseUser?.uid ?? 'upload-user',
-            areaId: profile?.areaId ?? null,
-            result: detectionResult,
-            source: mode === 'upload' ? 'upload' : 'camera-capture',
-            sourceFile: activeMedia.file.name,
-            locationLabel: detectionResult.location,
-          })
-          setCreatedCaseId(nextCaseId)
-        }
+        setCreatedCaseId(detectionResult.incidentId ?? detectionResult.incident_id ?? null)
 
-        void playAccidentAlert(audioRef.current, 1, { beepRepeats: 3 }).catch(
-          (playbackError) => {
-            console.warn('Could not play alert sound:', playbackError)
-          }
-        )
+        const incidentId = detectionResult.incidentId ?? detectionResult.incident_id ?? null
+        if (
+          alarmAudioEnabled &&
+          shouldEmitOperationalAlarm(detectionResult, lastAlarmedIncidentIdRef.current)
+        ) {
+          lastAlarmedIncidentIdRef.current = incidentId
+          void playAccidentAlert(audioRef.current, 1, { beepRepeats: 3 }).catch(
+            (playbackError) => {
+              console.warn('Could not play alert sound:', playbackError)
+            }
+          )
+        }
 
         toast({
           title: 'Possible Crash Detected',
@@ -363,36 +360,9 @@ export default function UploadPage() {
       return createdCaseId
     }
 
-    const db = getFirestoreOrNull()
-    if (!db) {
-      toast({
-        title: 'Incident store unavailable',
-        description: 'Could not create a review case because Firestore is not ready.',
-        variant: 'destructive',
-      })
-      return null
-    }
-
-    if (!activeMedia) {
-      toast({
-        title: 'Media unavailable',
-        description: 'Could not create a review case because the uploaded media was cleared.',
-        variant: 'destructive',
-      })
-      return null
-    }
-
-    const nextCaseId = await createCrashCaseFromDetection(db, {
-      actorId: firebaseUser?.uid ?? 'upload-user',
-      areaId: profile?.areaId ?? null,
-      result,
-      source: mode === 'upload' ? 'upload' : 'camera-capture',
-      sourceFile: activeMedia.file.name,
-      locationLabel: result.location,
-    })
-
-    setCreatedCaseId(nextCaseId)
-    return nextCaseId
+    const incidentId = result.incidentId ?? result.incident_id ?? null
+    setCreatedCaseId(incidentId)
+    return incidentId
   }
 
   const reviewCase = async () => {

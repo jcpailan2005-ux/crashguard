@@ -65,47 +65,152 @@ def _require_confirmed_crash_payload(data: dict) -> None:
             "ENABLE_CRASH_CASE_CREATION=false; no case or notification may be created.",
         )
 
-    threshold = _gate_env_float("CRASH_CASE_THRESHOLD", 0.90)
     required_hits = max(1, _gate_env_int("CRASH_REQUIRED_CONSECUTIVE_FRAMES", 3))
+    temporal_threshold = _gate_env_float("TEMPORAL_CRASH_THRESHOLD", 0.62)
+    aftermath_min_classifier = _gate_env_float("AFTERMATH_MIN_CLASSIFIER_SCORE", 0.80)
+    aftermath_min_score = _gate_env_float(
+        "AFTERMATH_MIN_SCORE", _gate_env_float("AFTERMATH_REVIEW_THRESHOLD", 0.80)
+    )
+    aftermath_min_abnormality = _gate_env_float("AFTERMATH_MIN_ABNORMALITY_SCORE", 0.35)
+    aftermath_required_frames = max(
+        2,
+        _gate_env_int(
+            "AFTERMATH_REQUIRED_FRAMES",
+            _gate_env_int("AFTERMATH_REQUIRED_POSITIVE_FRAMES", 6),
+        ),
+    )
+    aftermath_min_seconds = max(
+        0.0, _gate_env_float("AFTERMATH_MIN_PERSISTENCE_SECONDS", 2.5)
+    )
 
     final_decision = data.get("finalDecision")
     vehicle_count = data.get("vehicleCount")
     scene_valid = data.get("sceneValid")
-    motion_valid = data.get("motionValid")
+    interaction_candidate = data.get("interactionCandidate", data.get("motionValid"))
     crash_score = data.get("crashScore")
     consecutive_hits = data.get("consecutiveCrashHits")
+    detection_mode = data.get("detectionMode")
 
-    # Two valid outcome tiers, both requiring crashScore >= threshold and a
+    # Only a temporally confirmed detector event may cross this final gate.
     # real vehicle in an in-ROI scene:
     #   - confirmed_crash: additionally requires motion corroboration AND
     #     the 3-frame temporal streak (strongest evidence).
-    #   - high_confidence_review: a single very-high-confidence frame is
+    # The former single-frame high-confidence review tier is intentionally rejected.
     #     enough on its own to raise a Needs Review case — motion/temporal
     #     corroboration is NOT required because a human responder verifies
     #     it manually before any dispatch action is taken.
-    valid_decisions = {"confirmed_crash", "high_confidence_review"}
+    valid_decisions = {"confirmed_crash", "possible_crash_aftermath", "possible_crash"}
+
+    is_static_image = bool(
+        final_decision == "possible_crash" or data.get("triggerStatus") == "upload_detection"
+    )
 
     failures: list[str] = []
     if final_decision not in valid_decisions:
         failures.append(
-            f"finalDecision={final_decision!r} (must be 'confirmed_crash' or 'high_confidence_review')"
+            "finalDecision="
+            f"{final_decision!r} (must be 'confirmed_crash', 'possible_crash_aftermath', or 'possible_crash')"
         )
     if not isinstance(vehicle_count, (int, float)) or isinstance(vehicle_count, bool) or vehicle_count < 1:
         failures.append(f"vehicleCount={vehicle_count!r} (must be >= 1)")
     if scene_valid is not True:
         failures.append(f"sceneValid={scene_valid!r} (must be true)")
-    if not isinstance(crash_score, (int, float)) or isinstance(crash_score, bool) or crash_score < threshold:
-        failures.append(f"crashScore={crash_score!r} (must be >= {threshold})")
+    if (
+        not isinstance(crash_score, (int, float))
+        or isinstance(crash_score, bool)
+        or not 0.0 <= crash_score <= 1.0
+    ):
+        failures.append(f"crashScore={crash_score!r} (must be a 0-1 supporting score)")
+    if not is_static_image and (
+        not isinstance(consecutive_hits, (int, float))
+        or isinstance(consecutive_hits, bool)
+        or consecutive_hits < required_hits
+    ):
+        failures.append(
+            f"consecutiveCrashHits={consecutive_hits!r} (must be >= {required_hits})"
+        )
     if final_decision == "confirmed_crash":
-        if motion_valid is not True:
-            failures.append(f"motionValid={motion_valid!r} (must be true for confirmed_crash)")
+        temporal_score = data.get("temporalCrashScore")
+        if detection_mode != "temporal_collision":
+            failures.append(
+                f"detectionMode={detection_mode!r} (must be 'temporal_collision')"
+            )
+        if data.get("temporalVerified") is not True:
+            failures.append("temporalVerified must be true for confirmed_crash")
         if (
-            not isinstance(consecutive_hits, (int, float))
-            or isinstance(consecutive_hits, bool)
-            or consecutive_hits < required_hits
+            not isinstance(temporal_score, (int, float))
+            or isinstance(temporal_score, bool)
+            or temporal_score < temporal_threshold
         ):
             failures.append(
-                f"consecutiveCrashHits={consecutive_hits!r} (must be >= {required_hits} for confirmed_crash)"
+                f"temporalCrashScore={temporal_score!r} (must be >= {temporal_threshold})"
+            )
+        if interaction_candidate is not True:
+            failures.append(
+                f"interactionCandidate={interaction_candidate!r} (must be true for confirmed_crash)"
+            )
+    elif final_decision == "possible_crash_aftermath":
+        aftermath_score = data.get("aftermathScore")
+        aftermath_classifier = data.get("aftermathClassifierScore")
+        aftermath_observations = data.get("aftermathPositiveObservations")
+        aftermath_seconds = data.get("aftermathPersistenceSeconds")
+        aftermath_abnormality = data.get("aftermathAbnormalityScore")
+        aftermath_high_classifier = _gate_env_float("AFTERMATH_HIGH_CLASSIFIER_THRESHOLD", 0.90)
+        is_high_confidence = bool(
+            isinstance(aftermath_classifier, (int, float))
+            and not isinstance(aftermath_classifier, bool)
+            and aftermath_classifier >= aftermath_high_classifier
+        )
+
+        if detection_mode != "aftermath_review":
+            failures.append(
+                f"detectionMode={detection_mode!r} (must be 'aftermath_review')"
+            )
+        if data.get("aftermathCandidate") is not True:
+            failures.append("aftermathCandidate must be true")
+        if (
+            not isinstance(aftermath_score, (int, float))
+            or isinstance(aftermath_score, bool)
+            or aftermath_score < aftermath_min_score
+        ):
+            failures.append(
+                f"aftermathScore={aftermath_score!r} (must be >= {aftermath_min_score})"
+            )
+        if (
+            not isinstance(aftermath_classifier, (int, float))
+            or isinstance(aftermath_classifier, bool)
+            or aftermath_classifier < aftermath_min_classifier
+        ):
+            failures.append(
+                "aftermathClassifierScore="
+                f"{aftermath_classifier!r} (must be >= {aftermath_min_classifier})"
+            )
+        if not is_high_confidence and (
+            not isinstance(aftermath_abnormality, (int, float))
+            or isinstance(aftermath_abnormality, bool)
+            or aftermath_abnormality < aftermath_min_abnormality
+        ):
+            failures.append(
+                "aftermathAbnormalityScore="
+                f"{aftermath_abnormality!r} (must be >= {aftermath_min_abnormality})"
+            )
+        if (
+            not isinstance(aftermath_observations, (int, float))
+            or isinstance(aftermath_observations, bool)
+            or aftermath_observations < aftermath_required_frames
+        ):
+            failures.append(
+                "aftermathPositiveObservations="
+                f"{aftermath_observations!r} (must be >= {aftermath_required_frames})"
+            )
+        if (
+            not isinstance(aftermath_seconds, (int, float))
+            or isinstance(aftermath_seconds, bool)
+            or aftermath_seconds < aftermath_min_seconds
+        ):
+            failures.append(
+                "aftermathPersistenceSeconds="
+                f"{aftermath_seconds!r} (must be >= {aftermath_min_seconds})"
             )
 
     if failures:
@@ -162,6 +267,7 @@ def now_iso() -> str:
 def _row_to_case(row) -> dict:
     return {
         "caseId": row["caseId"],
+        "detectionMode": row["detectionMode"],
         "status": row["status"],
         "confidence": row["confidence"],
         "createdAt": row["detectedAt"],
@@ -289,10 +395,10 @@ def create_crash_case(
     boxes: list[dict] | None = None,
     frame_path: str | None = None,
 ) -> dict:
-    """Persist a crash case + its notification.
+    """Persist one review case for a verified collision or persistent aftermath.
 
     Raises CrashCaseRejected and persists nothing unless `data` proves a
-    confirmed_crash OR high_confidence_review decision (see
+    accepted evidence decision (see
     _require_confirmed_crash_payload). This is the last line of defense
     against false-positive cases — every caller, including future ones, is
     subject to it. Every case created here starts at status pending_review
@@ -312,16 +418,18 @@ def create_crash_case(
         conn.execute(
             """
             INSERT INTO crash_cases (
-              caseId, status, confidence, detectedAt, updatedAt, location,
+              caseId, detectorEventId, detectionMode, status, confidence, detectedAt, updatedAt, location,
               latitude, longitude, areaId, videoPath, keyFramePath, thumbnailPath,
               annotatedPath, sourceCamera, cameraId, cameraName, cameraIp,
               barangay, roadName, assignedResponderId, triggerStatus, responderId,
               accidentDetected, notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 case_id,
+                data.get("detectorEventId"),
+                data.get("detectionMode"),
                 data.get("status", "pending_review"),
                 float(data.get("confidence") or 0),
                 detected_at,
@@ -344,7 +452,12 @@ def create_crash_case(
                 data.get("triggerStatus") or "unknown",
                 data.get("responderId"),
                 1 if data.get("accidentDetected") else 0,
-                data.get("notes") or "",
+                data.get("notes")
+                or (
+                    "Possible crash aftermath detected. Impact was not observed; review CCTV evidence."
+                    if data.get("detectionMode") == "aftermath_review"
+                    else ""
+                ),
             ),
         )
         conn.execute(
@@ -905,13 +1018,100 @@ def upsert_user_profile(data: dict) -> dict:
     return dict(row)
 
 
+def _sync_camera_to_postgres(camera_data: dict) -> None:
+    try:
+        from backend.phase3.database import connection
+        legacy_id = camera_data.get("cameraId")
+        if not legacy_id:
+            return
+        name = camera_data.get("label") or legacy_id
+        location = camera_data.get("location") or camera_data.get("locationDescription")
+        stream_ref = camera_data.get("streamUrl") or camera_data.get("cameraIp")
+        is_active = bool(camera_data.get("isActive", True))
+        detection_enabled = bool(camera_data.get("detectionEnabled", True))
+        status_val = "DISABLED" if not is_active else ("ONLINE" if str(camera_data.get("status", "")).lower() in {"online", "connected", "monitoring"} else "OFFLINE")
+        lat = camera_data.get("latitude")
+        lng = camera_data.get("longitude")
+        area_raw = camera_data.get("areaId") or camera_data.get("barangay")
+
+        with connection() as pg, pg.transaction():
+            area_uuid = None
+            if area_raw:
+                row = pg.execute("SELECT id FROM areas WHERE LOWER(name) = LOWER(%s) LIMIT 1", (str(area_raw).strip(),)).fetchone()
+                if row:
+                    area_uuid = row["id"]
+                else:
+                    new_area = pg.execute("INSERT INTO areas (name) VALUES (%s) RETURNING id", (str(area_raw).strip(),)).fetchone()
+                    if new_area:
+                        area_uuid = new_area["id"]
+
+            pg.execute(
+                """
+                INSERT INTO cameras (
+                    legacy_id, area_id, name, location, stream_reference,
+                    status, detection_enabled, latitude, longitude, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT(legacy_id) DO UPDATE SET
+                    area_id = COALESCE(excluded.area_id, cameras.area_id),
+                    name = excluded.name,
+                    location = excluded.location,
+                    stream_reference = COALESCE(excluded.stream_reference, cameras.stream_reference),
+                    status = excluded.status,
+                    detection_enabled = excluded.detection_enabled,
+                    latitude = COALESCE(excluded.latitude, cameras.latitude),
+                    longitude = COALESCE(excluded.longitude, cameras.longitude),
+                    updated_at = now()
+                """,
+                (legacy_id, area_uuid, name, location, stream_ref, status_val, detection_enabled, lat, lng),
+            )
+    except Exception:
+        pass
+
+
+def _sync_camera_active_to_postgres(camera_id: str, active: bool) -> None:
+    try:
+        from backend.phase3.database import connection
+        status_val = "OFFLINE" if active else "DISABLED"
+        with connection() as pg, pg.transaction():
+            pg.execute(
+                """
+                UPDATE cameras
+                SET status = %s, detection_enabled = %s, updated_at = now()
+                WHERE legacy_id = %s
+                """,
+                (status_val, active, camera_id),
+            )
+    except Exception:
+        pass
+
+
 def get_camera(camera_id: str) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM cameras WHERE cameraId = ?",
             (camera_id,),
         ).fetchone()
-    return _row_to_camera(row) if row else None
+    camera = _row_to_camera(row) if row else None
+    if camera and not camera.get("streamUrl"):
+        # Check if PostgreSQL has stream_reference
+        try:
+            from backend.phase3.database import connection
+            with connection() as pg:
+                pg_row = pg.execute(
+                    "SELECT stream_reference FROM cameras WHERE legacy_id = %s",
+                    (camera_id,),
+                ).fetchone()
+                if pg_row and pg_row.get("stream_reference"):
+                    camera["streamUrl"] = pg_row["stream_reference"]
+                    with get_connection() as conn:
+                        conn.execute(
+                            "UPDATE cameras SET streamUrl = ? WHERE cameraId = ?",
+                            (pg_row["stream_reference"], camera_id),
+                        )
+        except Exception:
+            pass
+    return camera
 
 
 def get_camera_by_ip(camera_ip: str) -> dict | None:
@@ -960,7 +1160,21 @@ def list_cameras(
             f"SELECT c.* FROM cameras c {where} ORDER BY c.areaId ASC, c.roadName ASC, c.label ASC",
             params,
         ).fetchall()
-    return [_row_to_camera(row) for row in rows]
+    cameras = [_row_to_camera(row) for row in rows]
+    # Reconcile any missing streamUrl from PostgreSQL
+    try:
+        from backend.phase3.database import connection
+        with connection() as pg:
+            pg_rows = pg.execute("SELECT legacy_id, stream_reference, status, detection_enabled FROM cameras WHERE stream_reference IS NOT NULL").fetchall()
+            pg_map = {r["legacy_id"]: r for r in pg_rows if r.get("legacy_id")}
+            for cam in cameras:
+                cid = cam.get("cameraId")
+                if cid in pg_map:
+                    if not cam.get("streamUrl") and pg_map[cid].get("stream_reference"):
+                        cam["streamUrl"] = pg_map[cid]["stream_reference"]
+    except Exception:
+        pass
+    return cameras
 
 
 def upsert_camera(data: dict) -> dict:
@@ -1021,7 +1235,9 @@ def upsert_camera(data: dict) -> dict:
             "SELECT * FROM cameras WHERE cameraId = ?",
             (camera_id,),
         ).fetchone()
-    return _row_to_camera(row)
+    camera = _row_to_camera(row)
+    _sync_camera_to_postgres(camera)
+    return camera
 
 
 def set_camera_active(camera_id: str, active: bool) -> dict | None:
@@ -1031,11 +1247,26 @@ def set_camera_active(camera_id: str, active: bool) -> dict | None:
             "UPDATE cameras SET isActive = ?, updatedAt = ? WHERE cameraId = ?",
             (1 if active else 0, timestamp, camera_id),
         )
+    _sync_camera_active_to_postgres(camera_id, active)
     return get_camera(camera_id)
 
 
 def delete_camera(camera_id: str) -> None:
     set_camera_active(camera_id, False)
+    with get_connection() as conn:
+        conn.execute("DELETE FROM cameras WHERE cameraId = ?", (camera_id,))
+    try:
+        from backend.phase3.database import connection
+        with connection() as pg, pg.transaction():
+            try:
+                pg.execute("DELETE FROM cameras WHERE legacy_id = %s", (camera_id,))
+            except Exception:
+                pg.execute(
+                    "UPDATE cameras SET status = 'DISABLED', detection_enabled = false, updated_at = now() WHERE legacy_id = %s",
+                    (camera_id,),
+                )
+    except Exception:
+        pass
 
 
 def assign_camera(data: dict) -> dict:

@@ -334,7 +334,7 @@ export default function SettingsPage() {
                 {IS_DEFAULT_BACKEND_URL ? (
                   <p className="mt-2 text-xs text-[var(--status-warning)]">
                     No `NEXT_PUBLIC_BACKEND_URL` is set right now, so the app is using the
-                    fallback `http://localhost:8000`. That only works if this browser can
+                    fallback `http://127.0.0.1:8010`. That only works if this browser can
                     reach the FastAPI server on the same machine.
                   </p>
                 ) : null}

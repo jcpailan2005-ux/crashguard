@@ -112,24 +112,26 @@ These items are present in the current codebase:
 - Live camera view includes timestamp overlay, alert debouncing, and meaningful-history filtering.
 - Detection preview dialog exists for annotated images and videos.
 - Backend video processing includes codec fallback and frame skipping.
+- Physical CCTV camera onboarding (RTSP/IP) is implemented with automated health checks, reconnect logic, and PostgreSQL synchronization.
+- Dual-Path Crash Detection is fully implemented and tested:
+  - Dynamic Temporal Path (Priority 1): detects live collisions in motion (`confirmed_crash` with siren alarm).
+  - High-Confidence Aftermath Path (Priority 2): detects stationary post-impact scenes without requiring rollover geometry (`possible_crash_aftermath` with visual review alert for Dispatcher).
+  - Static Image Endpoint Mode: decoupled one-shot photo detection without temporal motion dependencies (`possible_crash` review candidate).
+- Sample gallery media files exist under `public/samples/`.
+- Alert audio exists and is verified under `public/alert-sound.mp3` (148 KB).
+- Automated test suite includes 124 passing unit tests in `backend/tests/`.
 
 ## What Is Partial Or Unfinished
 These items are still incomplete, unverified, or mismatched with the intended product:
 
 - If no browser-preview-safe MP4 codec opens on a target machine, video detection still completes but `annotated_media_url` remains `null`, and the UI shows `No annotated footage preview available.` instead of a broken `View Footage` preview.
-- Sample gallery media files referenced under `/samples/...` are not present in `public/samples`, so those previews will currently fail unless the files are added.
-- The sample gallery "Analyze This Sample" action only redirects to the upload page; it does not send the sample file through the backend.
-- Notifications and incidents are in-memory only and reset when the backend restarts.
+- The sample gallery "Analyze This Sample" action redirects to the upload page; it does not yet pre-populate the sample into the file input.
 - Map coordinates are currently fixed placeholder coordinates in backend incident creation, not true source-based locations.
-- Live camera detection exists in the frontend, but final end-to-end validation against the real backend still needs confirmation.
 - Mobile browser camera behavior still needs real-device validation.
-- Production-grade persistent storage is not implemented.
-- Stronger retry logic, upload progress, and richer backend failure messaging are still limited.
 - There is a duplicate backend file `backend/carc.py`, which can cause confusion about which app is authoritative. Use `backend/main.py`.
 
 ## Known Mismatches To Be Honest About
-- Some repo documentation claims parts of video processing and live camera are fully verified or production-ready. The codebase still has unverified paths and browser/codec risk, so do not overstate readiness without testing.
-- The alert sound path exists, but `public/alert-sound.mp3` is currently a zero-byte file, so sound playback may fail silently or do nothing.
+- In-memory data structures in `backend/main.py` serve the fast live camera monitor cycles, while PostgreSQL `127.0.0.1:5433` serves the persistent authority for cameras, crash cases, reviews, and dispatch workflows.
 
 ## Practical Error And Failure Modes
 This section is not mathematically exhaustive, but it covers the current major errors and likely failure cases in this repo.
@@ -225,15 +227,13 @@ This section is not mathematically exhaustive, but it covers the current major e
 ## Run Commands
 ### Backend
 ```powershell
-cd C:\Users\wapak\Downloads\CARCRASH\backend
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
-uvicorn main:app --reload --port 8000
+cd C:\Users\Lenovo\Desktop\MyCrushguard
+.\backend\.venv\Scripts\uvicorn.exe backend.main:app --host 127.0.0.1 --port 8010
 ```
 
 ### Frontend
 ```powershell
-cd C:\Users\wapak\Downloads\CARCRASH
+cd C:\Users\Lenovo\Desktop\MyCrushguard
 npm run dev
 ```
 

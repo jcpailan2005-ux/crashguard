@@ -1,8 +1,11 @@
 // API client for car crash detection backend
-// Replace BACKEND_URL with your FastAPI server URL (e.g., http://localhost:8000)
+// The environment remains authoritative; the fallback matches the local development stack.
 
 import {
   DetectionResponse,
+  LiveFrameIdentity,
+  LiveBoxPacket,
+  LiveBoxView,
   Incident,
   Notification,
   HealthResponse,
@@ -15,7 +18,8 @@ import {
   MOCK_NOTIFICATIONS,
 } from './types'
 import { APP_CONFIG } from '@/lib/app-config'
-import { getStoredAuthToken } from '@/lib/session-auth'
+import { fetchWithBackendTimeout } from '@/lib/backend-fetch'
+import { acceptLiveBoxPacket, createLiveBoxCursor } from '@/lib/camera-analysis-view'
 
 export const BACKEND_URL = APP_CONFIG.backendUrl
 const USE_MOCK_DATA = APP_CONFIG.useMockData
@@ -27,6 +31,16 @@ export const BACKEND_URL_SOURCE = IS_DEFAULT_BACKEND_URL
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
 const VIDEO_EXTENSIONS = ['mp4', 'mov', 'webm', 'avi', 'm4v', 'mkv']
 export type DetectionMediaType = 'image' | 'video'
+
+export class CrashGuardApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string
+  ) {
+    super(message)
+    this.name = 'CrashGuardApiError'
+  }
+}
 
 type ProjectLabel = 'accident' | 'vehicle'
 
@@ -135,7 +149,7 @@ function buildBackendUnreachableMessage() {
     !['localhost', '127.0.0.1'].includes(pageUrl.hostname)
   ) {
     guidance.push(
-      'The app is using the fallback `http://localhost:8000`, which only works when this browser can reach the API on the same machine.'
+      'The app is using the local fallback `http://127.0.0.1:8010`. Set `NEXT_PUBLIC_BACKEND_URL` when the API runs elsewhere.'
     )
   }
 
@@ -249,25 +263,23 @@ async function apiCall<T>(
   if (!headers.has('Content-Type') && options.body && !(options.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json')
   }
-  const token = getStoredAuthToken()
-  if (token && !headers.has('Authorization')) {
-    headers.set('Authorization', `Bearer ${token}`)
-  }
-
   try {
     const response = await fetch(url, {
       ...options,
       headers,
+      credentials: options.credentials ?? 'include',
     })
 
     if (!response.ok) {
       const message = await readErrorMessage(response, `API Error: ${response.status} ${response.statusText}`)
-      throw new Error(message)
+      throw new CrashGuardApiError(response.status, message)
     }
 
     return (await response.json()) as T
   } catch (error) {
-    console.error(`API call failed to ${url}:`, error)
+    if (!(error instanceof CrashGuardApiError)) {
+      console.error(`API call failed to ${url}:`, error)
+    }
     throw error
   }
 }
@@ -277,12 +289,10 @@ async function readErrorMessage(
   fallbackMessage: string
 ): Promise<string> {
   try {
-    const data = (await response.json()) as {
-      detail?: string
-      error?: string
-      message?: string
+    const data = (await response.json()) as any
+    if (data && typeof data.detail === 'object' && data.detail !== null) {
+      return data.detail.message || JSON.stringify(data.detail)
     }
-
     return data.detail || data.error || data.message || fallbackMessage
   } catch {
     try {
@@ -438,61 +448,80 @@ function notificationTime(value: Notification): number {
 }
 
 async function authHeaders(extra?: HeadersInit): Promise<Headers> {
-  const headers = new Headers(extra)
-  const token = getStoredAuthToken()
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`)
-  }
-  return headers
+  return new Headers(extra)
 }
 
 export interface AuthUser {
   uid: string
   email: string
   displayName: string
-  role: 'user' | 'responder' | 'admin'
-  areaId: 'talomo' | 'bago' | 'toril' | string | null
+  role: 'admin' | 'dispatcher' | 'responder'
+  roles?: Array<'ADMIN' | 'DISPATCHER' | 'RESPONDER'>
+  permissions?: string[]
+  areaId: string | null
   active: boolean
+  status?: 'ACTIVE' | 'DISABLED' | 'LOCKED'
+  mustChangePassword: boolean
+  availabilityStatus?: string | null
   createdAt: string
   updatedAt: string
   lastLoginAt?: string | null
 }
 
 export interface AuthResponse {
-  token: string
   user: AuthUser
 }
 
-export async function loginWithSQLite(email: string, password: string): Promise<AuthResponse> {
-  const response = await fetch(`${NORMALIZED_BACKEND_URL}/api/auth/login`, {
+export async function loginWithPostgres(email: string, password: string): Promise<AuthResponse> {
+  const response = await fetchWithBackendTimeout(`${NORMALIZED_BACKEND_URL}/api/v3/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password }),
+    credentials: 'include',
   })
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response, 'Login failed.'))
+    throw new CrashGuardApiError(
+      response.status,
+      await readErrorMessage(response, 'Login failed.')
+    )
   }
   return (await response.json()) as AuthResponse
 }
 
-export async function registerWithSQLite(params: {
-  email: string
-  password: string
-  displayName?: string
-}): Promise<AuthResponse> {
-  const response = await fetch(`${NORMALIZED_BACKEND_URL}/api/auth/register`, {
+/** @deprecated Compatibility name for older components; uses PostgreSQL v3 auth. */
+export const loginWithSQLite = loginWithPostgres
+
+export async function logoutFromPostgres(): Promise<void> {
+  await apiCall<{ success: boolean }>('/api/v3/auth/logout', { method: 'POST' })
+}
+
+export async function getCurrentPostgresUser(): Promise<AuthUser> {
+  return apiCall<{ user: AuthUser }>('/api/v3/auth/me').then((result) => result.user)
+}
+
+/** @deprecated Compatibility name for older components; uses PostgreSQL v3 auth. */
+export const getCurrentSQLiteUser = getCurrentPostgresUser
+
+export async function changePostgresPassword(
+  currentPassword: string,
+  newPassword: string
+): Promise<AuthUser> {
+  return apiCall<{ user: AuthUser }>('/api/v3/auth/change-password', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  })
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response, 'Registration failed.'))
-  }
-  return (await response.json()) as AuthResponse
+    body: JSON.stringify({ currentPassword, newPassword }),
+  }).then((result) => result.user)
 }
 
-export async function getCurrentSQLiteUser(): Promise<AuthUser> {
-  return apiCall<{ user: AuthUser }>('/api/auth/me').then((result) => result.user)
+export interface CameraConnectionResult {
+  connected: boolean
+  status?: string
+  cameraHealth?: string
+  message: string
+  cameraId?: string
+  cameraIp?: string
+  label?: string
+  width?: number
+  height?: number
 }
 
 export async function testCameraConnection(
@@ -502,8 +531,12 @@ export async function testCameraConnection(
     label?: string
     areaId?: string
     location?: string
+    cameraUsername?: string
+    cameraPassword?: string
+    streamType?: string
+    rtspPort?: number
   } = {}
-): Promise<{ connected: boolean; message: string; cameraId?: string; cameraIp?: string; label: string; status?: string }> {
+): Promise<CameraConnectionResult> {
   let response: Response
   const source = cameraIpOrUrl.trim()
   const isStreamUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(source)
@@ -512,6 +545,7 @@ export async function testCameraConnection(
     response = await fetch(`${NORMALIZED_BACKEND_URL}/api/cameras/test-connection`, {
       method: 'POST',
       headers: await authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'include',
       body: JSON.stringify({ [isStreamUrl ? 'url' : 'cameraIp']: source, ...metadata }),
     })
   } catch (error) {
@@ -522,24 +556,48 @@ export async function testCameraConnection(
   }
 
   if (!response.ok) {
-    const message = await readErrorMessage(
-      response,
-      `Camera connection failed with status ${response.status}.`
-    )
-    throw new Error(message)
+    try {
+      const data = await response.json()
+      let detail = data?.detail || data
+      if (typeof detail === 'object' && detail !== null) {
+        return {
+          connected: false,
+          status: detail.status || 'OFFLINE',
+          cameraHealth: 'OFFLINE',
+          message: detail.message || 'Camera connection could not be verified directly.',
+        }
+      }
+      const rawMessage = String(detail || '')
+      const message = rawMessage.toLowerCase().includes('authentication')
+        ? 'RTSP stream link is ready to save.'
+        : rawMessage || `Camera connection failed with status ${response.status}.`
+
+      return {
+        connected: false,
+        status: 'OFFLINE',
+        cameraHealth: 'OFFLINE',
+        message,
+      }
+    } catch {
+      return {
+        connected: false,
+        status: 'OFFLINE',
+        cameraHealth: 'OFFLINE',
+        message: `Camera connection failed with status ${response.status}.`,
+      }
+    }
   }
 
-  return (await response.json()) as {
-    connected: boolean
-    message: string
-    cameraId?: string
-    cameraIp?: string
-    label: string
-    status?: string
-  }
+  return (await response.json()) as CameraConnectionResult
 }
 
 export interface CameraMonitoringStatus {
+  latestFrameIdentity?: LiveFrameIdentity | null
+  sourceReportedFps?: number | null
+  modelProcessingMs?: number | null
+  inferenceCompletionAgeMs?: number | null
+  frameCopyMs?: number | null
+  framesSkippedBeforeInference?: number
   cameraId?: string | null
   cameraIp?: string | null
   monitorKey?: string | null
@@ -577,6 +635,15 @@ export interface CameraMonitoringStatus {
   frameWidth?: number | null
   frameHeight?: number | null
   frameAgeMs?: number | null
+  lastConnectionAt?: string | null
+  connectionAttemptCount?: number
+  reconnectCount?: number
+  droppedFrames?: number
+  staleFrameEvents?: number
+  captureMs?: number | null
+  decodeMs?: number | null
+  processingLatencyMs?: number | null
+  cameraHealth?: 'ONLINE' | 'LIVE' | 'STALE' | 'RECONNECTING' | 'OFFLINE' | 'DISABLED' | string
   detectionWorkerRunning?: boolean
   detectionRunning?: boolean
   activePendingCase?: boolean
@@ -591,6 +658,15 @@ export interface CameraMonitoringStatus {
   previewAvailable?: boolean
   existingCaseMessage?: string | null
   reconnecting?: boolean
+  captureFps?: number | null
+  previewFps?: number | null
+  aiFps?: number | null
+  sourceWidth?: number | null
+  sourceHeight?: number | null
+  sourceResolution?: string | null
+  previewResolution?: string | null
+  aiResolution?: string | null
+  codec?: string | null
 }
 
 export interface CameraStreamAccess {
@@ -626,16 +702,89 @@ export async function createCameraStreamAccess(cameraId: string): Promise<Camera
   )
 }
 
+// This channel is visual only: it never normalizes or dispatches incident results.
+export function subscribeCameraBoxes(
+  cameraId: string,
+  eventsUrl: string | null,
+  receive: (view: LiveBoxView | null) => void
+): () => void {
+  let stopped = false
+  let inFlight = false
+  let pending = false
+  const cursor = createLiveBoxCursor()
+  let fallback = true
+  let controller: AbortController | null = null
+  const fetchLatest = async () => {
+    if (stopped) return
+    if (inFlight) { pending = true; return }
+    inFlight = true
+    controller = new AbortController()
+    const requestController = controller
+    const timeout = setTimeout(() => requestController.abort(), 2000)
+    const started = performance.now()
+    try {
+      const response = await fetch(`${NORMALIZED_BACKEND_URL}/api/cameras/${encodeURIComponent(cameraId)}/analysis-packet`, {
+        headers: await authHeaders(), credentials: 'include', cache: 'no-store', signal: requestController.signal,
+      })
+      if (!response.ok) throw new Error('Analysis preview unavailable')
+      const { packet } = await response.json() as { packet: LiveBoxPacket | null }
+      if (stopped) return
+      if (!packet) { receive(null); return }
+      const transportMs = performance.now() - started
+      const now = performance.now()
+      const view = acceptLiveBoxPacket(cameraId, packet, cursor, transportMs, now)
+      if (view) receive(view)
+    } catch {
+      if (!stopped) receive(null)
+    } finally {
+      clearTimeout(timeout)
+      inFlight = false
+      if (pending && !stopped) { pending = false; void fetchLatest() }
+    }
+  }
+  let events: EventSource | null = null
+  if (typeof EventSource !== 'undefined') {
+    const url = new URL(eventsUrl || `${NORMALIZED_BACKEND_URL}/api/cameras/${encodeURIComponent(cameraId)}/events`)
+    url.searchParams.set('boxes_only', 'true')
+    events = new EventSource(url.toString(), { withCredentials: true })
+    // An open SSE socket does not prove that a boxes event can reach this
+    // browser. Keep the bounded read-only fallback active until the first
+    // actual boxes notification arrives, then let SSE drive packet reads.
+    events.onopen = () => { void fetchLatest() }
+    events.onerror = () => { fallback = true }
+    events.addEventListener('boxes', () => { fallback = false; void fetchLatest() })
+  }
+  const timer = setInterval(() => { if (fallback) void fetchLatest() }, 250)
+  void fetchLatest()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+    events?.close()
+    controller?.abort()
+  }
+}
+
 export async function fetchCameraPreviewFrameObjectUrl(
   cameraId: string,
   frameUrl?: string | null
 ): Promise<string> {
-  const url = frameUrl?.trim()
-    ? `${frameUrl}${frameUrl.includes('?') ? '&' : '?'}t=${Date.now()}`
-    : `${NORMALIZED_BACKEND_URL}/api/cameras/${encodeURIComponent(cameraId.trim())}/latest-frame.jpg?t=${Date.now()}`
+  let targetPath = `/api/cameras/${encodeURIComponent(cameraId.trim())}/latest-frame.jpg`
+  if (frameUrl?.trim()) {
+    try {
+      const parsed = new URL(frameUrl)
+      targetPath = `${parsed.pathname}${parsed.search}`
+    } catch {
+      targetPath = frameUrl.startsWith('/') ? frameUrl : `/${frameUrl}`
+    }
+  }
+  const separator = targetPath.includes('?') ? '&' : '?'
+  const url = `${NORMALIZED_BACKEND_URL}${targetPath}${separator}t=${Date.now()}`
   const response = await fetch(
     url,
-    { headers: await authHeaders() }
+    {
+      headers: await authHeaders(),
+      credentials: 'include',
+    }
   )
   if (!response.ok) {
     const message = await readErrorMessage(response, 'Camera preview is not available.')
@@ -655,6 +804,10 @@ export async function testDetectionOnCurrentFrame(
 
 export async function getCctvCameras(): Promise<CctvCamera[]> {
   return apiCall<CctvCamera[]>('/api/cameras')
+}
+
+export async function getLocalWebcamSources(): Promise<Array<{ reference: string; name: string }>> {
+  return apiCall<Array<{ reference: string; name: string }>>('/api/cameras/local-webcam-sources')
 }
 
 export async function getCctvCamera(cameraId: string): Promise<CctvCamera> {
@@ -680,6 +833,12 @@ export async function disableCctvCamera(cameraId: string): Promise<CctvCamera> {
 export async function enableCctvCamera(cameraId: string): Promise<CctvCamera> {
   return apiCall<CctvCamera>(`/api/cameras/${encodeURIComponent(cameraId)}/enable`, {
     method: 'POST',
+  })
+}
+
+export async function deleteCctvCamera(cameraId: string): Promise<{ ok: boolean; cameraId: string; status: string }> {
+  return apiCall<{ ok: boolean; cameraId: string; status: string }>(`/api/cameras/${encodeURIComponent(cameraId)}`, {
+    method: 'DELETE',
   })
 }
 

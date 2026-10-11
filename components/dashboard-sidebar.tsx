@@ -91,6 +91,8 @@ export function Sidebar() {
   const roleLabel =
     isAdmin
       ? 'Admin'
+      : normalizedRole === 'dispatcher'
+        ? 'Dispatcher'
       : normalizedRole === 'responder'
         ? 'Responder'
         : 'User'

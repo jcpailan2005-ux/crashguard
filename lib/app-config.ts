@@ -3,7 +3,7 @@ import { APP_LOCATIONS } from '@/lib/locations'
 export const APP_CONFIG = {
   backendUrl:
     process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, '') ||
-    'http://localhost:8000',
+    'http://127.0.0.1:8010',
   useMockData: process.env.NEXT_PUBLIC_USE_MOCK_DATA === 'true',
   detection: {
     meaningfulConfidenceThreshold: Number(

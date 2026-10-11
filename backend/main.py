@@ -23,12 +23,19 @@ import uuid
 import cv2
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 from pydantic import BaseModel, Field
 from ultralytics import YOLO
 
+from backend.camera_privacy import public_camera_data, redact_camera_text
+from backend.services.camera_sources import is_webcam_reference, resolve_source, open_webcam, load_webcam_registry
+from backend.services.operational_detection import persist_operational_detection, find_pending_camera_incident
+from backend.phase3.database import DatabaseUnavailable
+from backend.services.inference_execution import bounded_inference, live_camera_inference_scheduler
+from backend.services import live_collision_diagnostics
 from backend.db import init_db
 from backend.media_store import CRASH_MEDIA_ROOT, public_media_path, store_case_media
 from backend.repositories.analytics import cases_by_area, monthly_trend, summary
@@ -41,7 +48,7 @@ from backend.repositories.crash_cases import (
     assign_camera,
     delete_camera,
     delete_notification,
-    find_unresolved_camera_case,
+    find_unresolved_camera_case as find_legacy_unresolved_camera_case,
     get_camera,
     get_camera_by_ip,
     get_user_profile,
@@ -68,6 +75,15 @@ from backend.services.frame_quality import (
 )
 
 app = FastAPI()
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request: Request, error: RequestValidationError):
+    # Validation details must not echo submitted URLs, passwords, or usernames.
+    return JSONResponse(status_code=422, content={"detail": [
+        {"loc": list(item["loc"]), "msg": redact_camera_text(item["msg"]), "type": item["type"]}
+        for item in error.errors()
+    ]})
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS = BASE_DIR / "uploads"
@@ -101,6 +117,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from backend.phase3.routes import router as phase3_router
+app.include_router(phase3_router)
+
 
 def _json_request(url: str, payload: dict, timeout: float = 8.0) -> dict:
     data = json.dumps(payload).encode("utf-8")
@@ -129,7 +148,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-SESSION_SECRET = os.getenv("CRASHGUARD_SESSION_SECRET", "crashguard-local-demo-session-secret")
+SESSION_SECRET = os.getenv("CRASHGUARD_SESSION_SECRET") or secrets.token_urlsafe(48)
 SESSION_TTL_SECONDS = _env_int("CRASHGUARD_SESSION_TTL_SECONDS", 60 * 60 * 24 * 7)
 PASSWORD_MIN_LENGTH = _env_int("CRASHGUARD_PASSWORD_MIN_LENGTH", 8)
 PASSWORD_HASH_ITERATIONS = _env_int("CRASHGUARD_PASSWORD_HASH_ITERATIONS", 210_000)
@@ -203,7 +222,6 @@ def seed_default_users() -> None:
             )
 
 
-seed_default_users()
 
 
 def safe_user(profile: dict) -> dict:
@@ -277,6 +295,7 @@ def create_camera_stream_token(user: dict, camera_id: str, ttl_seconds: int = 36
         "iat": now,
         "exp": now + max(300, min(ttl_seconds, 14_400)),
         "scope": "camera_stream",
+        "sessionId": user.get("sessionId"),
     }
     payload_part = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signature = hmac.new(
@@ -308,18 +327,16 @@ def verify_camera_stream_token(token: str, camera_id: str) -> dict:
     if str(payload.get("cameraId") or "") != camera_id:
         raise HTTPException(status_code=403, detail="Camera stream token does not match this camera.")
 
-    profile = get_user_profile(str(payload.get("uid") or ""))
-    if profile is None:
-        raise HTTPException(status_code=401, detail="Session user not found.")
-    if not bool(profile.get("isActive", 1)):
-        raise HTTPException(status_code=403, detail="This account is inactive.")
-    return {
-        "uid": profile["uid"],
-        "email": profile.get("email"),
-        "role": profile.get("role") or "user",
-        "areaId": profile.get("areaId"),
-        "profile": safe_user(profile),
-    }
+    from backend.phase3.service import authenticate_stream_session
+    from backend.phase3.database import DatabaseUnavailable
+    try:
+        principal = authenticate_stream_session(str(payload.get("sessionId") or ""), str(payload.get("uid") or ""))
+    except DatabaseUnavailable as error:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable.") from error
+    if not principal:
+        raise HTTPException(status_code=401, detail="Stream session is invalid, expired, or revoked.")
+    return {"uid": principal["id"], "role": principal["role"],
+            "permissions": principal["permissions"], "profile": principal}
 
 
 def user_from_sqlite_session(request: Request) -> dict | None:
@@ -333,73 +350,24 @@ def user_from_sqlite_session(request: Request) -> dict | None:
 
 
 def verify_firebase_user(request: Request) -> dict:
-    sqlite_user = user_from_sqlite_session(request)
-    if sqlite_user is not None:
-        return sqlite_user
-
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Firebase ID token.")
-    token = header.split(" ", 1)[1].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing Firebase ID token.")
-
-    api_key = (
-        os.getenv("FIREBASE_WEB_API_KEY")
-        or os.getenv("NEXT_PUBLIC_FIREBASE_API_KEY")
-        or os.getenv("FIREBASE_API_KEY")
-    )
-    emulator_host = os.getenv("FIREBASE_AUTH_EMULATOR_HOST")
-    decoded: dict
-    try:
-        if emulator_host:
-            host = emulator_host.replace("http://", "").replace("https://", "")
-            decoded = _json_request(
-                f"http://{host}/identitytoolkit.googleapis.com/v1/accounts:lookup?key=local",
-                {"idToken": token},
-            )
-            user = (decoded.get("users") or [{}])[0]
-            uid = user.get("localId")
-            email = user.get("email")
-        elif api_key:
-            decoded = _json_request(
-                f"https://identitytoolkit.googleapis.com/v1/accounts:lookup?key={api_key}",
-                {"idToken": token},
-            )
-            user = (decoded.get("users") or [{}])[0]
-            uid = user.get("localId")
-            email = user.get("email")
-        else:
-            # Local demo fallback: still require a bearer token, then map roles from SQLite.
-            # This is not a production verifier; configure FIREBASE_WEB_API_KEY for real verification.
-            user = _decode_jwt_payload_without_trust(token)
-            uid = user.get("user_id") or user.get("sub") or user.get("uid")
-            email = user.get("email")
-    except (urllib_error.HTTPError, urllib_error.URLError, ValueError, KeyError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=401, detail="Invalid Firebase ID token.") from error
-
-    if not uid:
-        raise HTTPException(status_code=401, detail="Invalid Firebase ID token.")
-
-    local_profile = get_user_profile(uid)
-    if local_profile is None:
-        role = user.get("role") if user.get("role") in {"user", "responder", "admin"} else "user"
-        local_profile = upsert_user_profile(
-            {
-                "uid": uid,
-                "email": email or f"{uid}@local.test",
-                "displayName": user.get("displayName") or user.get("name") or "",
-                "role": role,
-                "areaId": user.get("areaId"),
-            }
-        )
+    """Compatibility name; PostgreSQL sessions are the sole network identity."""
+    from backend.phase3.routes import current_user
+    principal = current_user(request)
+    if principal.get("mustChangePassword"):
+        raise HTTPException(status_code=403, detail="PASSWORD_CHANGE_REQUIRED")
     return {
-        "uid": uid,
-        "email": email or local_profile.get("email"),
-        "role": local_profile.get("role") or "user",
-        "areaId": local_profile.get("areaId"),
-        "profile": safe_user(local_profile),
+        "uid": principal["id"], "email": principal.get("email"),
+        "role": str(principal.get("role", "")).lower(),
+        "areaId": principal.get("areaId"), "permissions": principal.get("permissions", []),
+        "sessionId": principal.get("sessionId"), "profile": principal,
     }
+
+
+def require_legacy_permission(request: Request, *codes: str) -> dict:
+    user = verify_firebase_user(request)
+    if not set(codes).intersection(user.get("permissions", [])):
+        raise HTTPException(status_code=403, detail="Permission denied.")
+    return user
 
 
 def require_admin(request: Request) -> dict:
@@ -409,16 +377,30 @@ def require_admin(request: Request) -> dict:
     return user
 
 
+def require_camera_editor(request: Request, permission: str = "cameras.update") -> dict:
+    user = verify_firebase_user(request)
+    if user["role"] not in {"admin", "dispatcher"} or permission not in user.get("permissions", []):
+        raise HTTPException(status_code=403, detail=f"Permission required: {permission}")
+    return user
+
+
+def is_protected_camera(camera: dict) -> bool:
+    return (
+        str(camera.get("cameraType") or "").lower() == "demo"
+        or str(camera.get("streamUrl") or "").startswith("demo://")
+        or str(camera.get("cameraIp") or "").startswith("demo-")
+    )
+
+
 def require_dashboard_access(request: Request) -> dict:
     user = verify_firebase_user(request)
-    if user["role"] not in {"admin", "responder"}:
+    if user["role"] not in {"admin", "dispatcher", "responder"}:
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
     return user
 
 
 def optional_request_user(request: Request) -> dict | None:
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("bearer "):
+    if not (request.cookies.get("crashguard_session") or request.headers.get("authorization")):
         return None
     return verify_firebase_user(request)
 
@@ -428,9 +410,9 @@ def get_user_area_scope(user: dict) -> str | None:
 
 
 def can_access_camera(user: dict, camera: dict | None) -> bool:
-    if camera is None:
-        return False
-    return user.get("role") == "admin"
+    return camera is not None and {"cameras.view", "cameras.monitor"}.issubset(
+        set(user.get("permissions") or [])
+    )
 
 
 def require_camera_access(request: Request, camera_id: str) -> tuple[dict, dict]:
@@ -457,17 +439,51 @@ try:
         crash_classifier_model_error = f"Crash classifier not found: {CRASH_CLASSIFIER_MODEL_PATH}"
         print(f"[crash-classifier] {crash_classifier_model_error}")
 except Exception as error:
-    crash_classifier_model_error = str(error)
-    print(f"[crash-classifier] Could not load {CRASH_CLASSIFIER_MODEL_PATH}: {error}")
+    crash_classifier_model_error = redact_camera_text(str(error))
+    print(f"[crash-classifier] Could not load {CRASH_CLASSIFIER_MODEL_PATH}: {redact_camera_text(str(error))}")
 
 vehicle_model = None
 vehicle_model_error = None
 vehicle_model_path = os.getenv("VEHICLE_MODEL_PATH", "yolov8n.pt")
+vehicle_model_reuses_primary = False
+
+
+def _files_are_byte_identical(first: Path, second: Path) -> bool:
+    """Compare local weight artifacts without trusting names or timestamps."""
+    try:
+        first = first.resolve(strict=True)
+        second = second.resolve(strict=True)
+        if first == second:
+            return True
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        with first.open("rb") as left, second.open("rb") as right:
+            while True:
+                left_chunk = left.read(1024 * 1024)
+                right_chunk = right.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError:
+        return False
+
+
 try:
-    vehicle_model = YOLO(vehicle_model_path)
+    vehicle_model_candidate = Path(vehicle_model_path).expanduser()
+    if _files_are_byte_identical(MODEL_PATH, vehicle_model_candidate):
+        # The exact primary result already contains the same vehicle classes,
+        # confidences and coordinates. Reuse it instead of executing identical
+        # weights twice on the same frame. A distinct configured artifact keeps
+        # the separate detector path below.
+        vehicle_model = model
+        vehicle_model_reuses_primary = True
+        print("[vehicle-detector] Reusing byte-identical primary detector results.")
+    else:
+        vehicle_model = YOLO(vehicle_model_path)
 except Exception as error:
-    vehicle_model_error = str(error)
-    print(f"[vehicle-detector] Could not load vehicle model {vehicle_model_path!r}: {error}")
+    vehicle_model_error = redact_camera_text(str(error))
+    print(f"[vehicle-detector] Could not load vehicle model {vehicle_model_path!r}: {redact_camera_text(str(error))}")
 
 
 def normalize_detection_label(label: str) -> str:
@@ -535,7 +551,9 @@ def draw_filtered_detection_overlay(bgr: np.ndarray, results) -> np.ndarray:
     return img
 
 
-VEHICLE_BOX_LABELS = frozenset({"car", "motorcycle", "bus", "truck", "bicycle"})
+VEHICLE_BOX_LABELS = frozenset(
+    {"car", "motorcycle", "bus", "truck", "bicycle", "vehicle", "van", "suv", "automobile", "auto"}
+)
 PERSON_LABELS = frozenset({"person"})
 
 
@@ -641,7 +659,7 @@ def crash_like_vehicle_interaction(boxes: list[dict]) -> bool:
     if len(boxes) < 2:
         return False
     for index, box_a in enumerate(boxes):
-        for box_b in boxes[index + 1:]:
+        for index_b, box_b in enumerate(boxes[index + 1:], start=index + 1):
             iou = boxes_iou(box_a, box_b)
             distance = boxes_edge_distance(box_a, box_b)
             scale = max(
@@ -651,6 +669,7 @@ def crash_like_vehicle_interaction(boxes: list[dict]) -> bool:
                 float(box_b.get("width") or 0.0),
                 float(box_b.get("height") or 0.0),
             )
+            live_collision_diagnostics.emit('pair', index, index_b, iou, distance, scale)
             if iou >= 0.08 or (distance / scale) <= 0.05:
                 return True
     return False
@@ -669,6 +688,10 @@ def evaluate_crash_case_decision(
     cooldown_ready: bool,
     frame_quality_status: str = "good",
     quality_rejection_reason: str | None = None,
+    temporal_verified: bool | None = None,
+    aftermath_candidate: bool = False,
+    is_static_image: bool = False,
+    supported_candidate_vehicle_count: int = 0,
 ) -> tuple[bool, str | None, str]:
     # Frame quality is checked before anything else: a blurry, too-dark,
     # overexposed, or low-contrast frame makes every downstream signal
@@ -677,41 +700,81 @@ def evaluate_crash_case_decision(
     if frame_quality_status != "good":
         return False, quality_rejection_reason or "low_quality_frame", "skipped"
     if vehicle_count <= 0:
+        if supported_candidate_vehicle_count > 0:
+            return False, "trusted_vehicle_evidence_required", "candidate"
         if person_count > 0:
             return False, "person_only_not_crash", "ignored"
         return False, "no_vehicle_detected", "ignored"
     if not scene_valid:
         return False, "vehicle_outside_roi", "ignored"
-    # crash_confidence is the accident probability, not the classifier's
-    # top-class confidence. The predicted class is kept for logging/debugging,
-    # but persistence decisions must be driven by the accident probability.
-    if crash_confidence < CRASH_UI_CONFIDENCE_THRESHOLD:
-        return False, "non_accident", "ignored"
-    if crash_confidence < CRASH_CASE_CONFIDENCE_THRESHOLD:
-        return False, "below_case_threshold", "ignored"
 
-    # Every baseline signal required by BOTH outcome tiers has now passed:
-    # good frame quality, at least one in-ROI vehicle, accident probability
-    # clears CRASH_CASE_THRESHOLD (0.90). What's
-    # left determines which tier this becomes:
-    #   - confirmed_crash: motion (2+ vehicle proximity/overlap) AND the
-    #     3-frame temporal streak both corroborate the classifier score.
-    #     This is the strongest-evidence tier.
-    #   - high_confidence_review: neither corroborating signal is present
-    #     (or not yet) — a single very-high-confidence frame is still
-    #     enough to raise a Needs Review case (not an auto-confirmed one),
-    #     since a human responder verifies it manually. It is still gated
-    #     by the same duplicate-case and cooldown protections below.
-    is_fully_corroborated = (
-        motion_valid and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS
-    )
-    candidate_decision = "confirmed_crash" if is_fully_corroborated else "high_confidence_review"
+    # When temporal verification is explicitly evaluated:
+    if temporal_verified is True:
+        candidate_decision = "confirmed_crash"
+    elif temporal_verified is False:
+        if aftermath_candidate:
+            candidate_decision = "possible_crash_aftermath"
+        else:
+            return False, "temporal_not_verified", "candidate" if consecutive_positive_frames > 0 else "ignored"
+    else:
+        # crash_confidence is the accident probability, not the classifier's
+        # top-class confidence. The predicted class is kept for logging/debugging,
+        # but persistence decisions must be driven by the accident probability.
+        if crash_confidence < CRASH_UI_CONFIDENCE_THRESHOLD:
+            return False, "non_accident", "ignored"
+        if crash_confidence < CRASH_CASE_CONFIDENCE_THRESHOLD:
+            return False, "below_case_threshold", "ignored"
+
+        if is_static_image:
+            candidate_decision = "possible_crash"
+        elif motion_valid and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS:
+            candidate_decision = "confirmed_crash"
+        elif aftermath_candidate:
+            candidate_decision = "possible_crash_aftermath"
+        elif consecutive_positive_frames < LIVE_CAMERA_REQUIRED_HITS:
+            if motion_valid:
+                return False, "temporal_not_confirmed", "verifying"
+            return False, "interaction_candidate_required", "candidate"
+        else:
+            return False, "interaction_candidate_required", "candidate"
 
     if active_case_exists:
         return False, "active_case_exists", "duplicate_active_case"
     if not cooldown_ready:
         return False, "cooldown_active", "duplicate_cooldown"
     return True, None, candidate_decision
+
+
+def classify_collision_pair_regions(
+    frame: np.ndarray,
+    tiers,
+    *,
+    full_frame_score: float,
+    camera_id: str | None = None,
+) -> dict:
+    from backend.services.collision_pair_classifier import (
+        select_plausible_pairs,
+        build_pair_region,
+        supporting_visual_evidence,
+    )
+    boxes = getattr(tiers, "tracker_input", getattr(tiers, "raw", []))
+    frame_h, frame_w = frame.shape[:2]
+    pairs = select_plausible_pairs(boxes, frame_width=frame_w, frame_height=frame_h)
+    pair_region_score = None
+    if pairs:
+        best_pair = pairs[0]
+        region = build_pair_region(frame, best_pair)
+        if region.valid and region.crop is not None:
+            res = classify_crash_frame(region.crop)
+            pair_region_score = float(res.get("accidentProbability") or 0.0)
+
+    visual_evidence_score = supporting_visual_evidence(full_frame_score, pair_region_score)
+    return {
+        "fullFrameCrashScore": full_frame_score,
+        "pairRegionCrashScore": pair_region_score,
+        "visualEvidenceScore": visual_evidence_score,
+        "accident_detected": False,
+    }
 
 
 def log_crash_decision(
@@ -814,6 +877,7 @@ class CameraDecisionTracker:
                 "hit_window": deque(),
                 "last_alert_at": 0.0,
                 "last_seen_at": 0.0,
+                "detector_event_id": str(uuid.uuid4()),
             }
             self.entries[camera_key] = entry
         return entry
@@ -834,12 +898,18 @@ class CameraDecisionTracker:
             window.append((now, bool(positive)))
             while window and now - window[0][0] > CRASH_TEMPORAL_WINDOW_SECONDS:
                 window.popleft()
+            if not any(hit for _, hit in window):
+                entry["detector_event_id"] = str(uuid.uuid4())
             consecutive = 0
             for _, hit in reversed(window):
                 if not hit:
                     break
                 consecutive += 1
             return consecutive
+
+    def event_id(self, camera_key: str) -> str:
+        with self.lock:
+            return self._entry(camera_key)["detector_event_id"]
 
     def cooldown_ready(self, camera_key: str, *, now: float | None = None) -> bool:
         now = time.time() if now is None else now
@@ -860,7 +930,14 @@ class CameraDecisionTracker:
 CAMERA_DECISION_TRACKER = CameraDecisionTracker()
 
 
-def extract_vehicle_boxes_from_results(results, names, frame: np.ndarray) -> list[dict]:
+def extract_vehicle_boxes_from_results(
+    results, names, frame: np.ndarray, min_confidence: float | None = None
+) -> list[dict]:
+    threshold = (
+        LIVE_CAMERA_VEHICLE_CONFIDENCE_THRESHOLD
+        if min_confidence is None
+        else min_confidence
+    )
     boxes: list[dict] = []
     frame_height, frame_width = frame.shape[:2]
     for result in results:
@@ -870,9 +947,11 @@ def extract_vehicle_boxes_from_results(results, names, frame: np.ndarray) -> lis
             class_id = int(raw_box.cls[0].item())
             label = normalize_box_label(str(names.get(class_id, class_id)))
             if label not in VEHICLE_BOX_LABELS:
+                live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, 'class_not_vehicle')
                 continue
             confidence = float(raw_box.conf[0].item())
-            if confidence < LIVE_CAMERA_VEHICLE_CONFIDENCE_THRESHOLD:
+            if confidence < threshold:
+                live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, 'below_vehicle_confidence')
                 continue
             x1, y1, x2, y2 = [float(value) for value in raw_box.xyxy[0].tolist()]
             x1 = max(0.0, min(x1, frame_width))
@@ -882,6 +961,7 @@ def extract_vehicle_boxes_from_results(results, names, frame: np.ndarray) -> lis
             width = max(0.0, x2 - x1)
             height = max(0.0, y2 - y1)
             if width <= 0 or height <= 0:
+                live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, 'invalid_bbox')
                 continue
             boxes.append(
                 {
@@ -893,23 +973,45 @@ def extract_vehicle_boxes_from_results(results, names, frame: np.ndarray) -> lis
                     "height": height,
                 }
             )
+            live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, None, boxes[-1])
     return boxes
 
 
-def detect_vehicle_boxes(frame: np.ndarray, fallback_results=None) -> list[dict]:
+def detect_vehicle_boxes(
+    frame: np.ndarray,
+    fallback_results=None,
+    min_confidence: float | None = None,
+    imgsz: int | None = None,
+    **kwargs,
+) -> list[dict]:
     """Run a vehicle detector for boxes. Falls back to the active model's boxes."""
-    if vehicle_model is not None:
-        results = vehicle_model.predict(frame, verbose=False)
-        return extract_vehicle_boxes_from_results(
-            results,
-            getattr(vehicle_model, "names", {}),
-            frame,
-        )
-    if fallback_results is not None:
+    predict_kwargs = {}
+    if imgsz is not None:
+        predict_kwargs["imgsz"] = imgsz
+    if vehicle_model is model and fallback_results is not None:
+        live_collision_diagnostics.emit('detector', 'byte_identical_primary_reuse')
         return extract_vehicle_boxes_from_results(
             fallback_results,
             getattr(model, "names", {}),
             frame,
+            min_confidence=min_confidence,
+        )
+    if vehicle_model is not None:
+        results = vehicle_model.predict(frame, verbose=False, **predict_kwargs)
+        live_collision_diagnostics.emit('detector', 'separate_vehicle_model')
+        return extract_vehicle_boxes_from_results(
+            results,
+            getattr(vehicle_model, "names", {}),
+            frame,
+            min_confidence=min_confidence,
+        )
+    if fallback_results is not None:
+        live_collision_diagnostics.emit('detector', 'primary_model_fallback')
+        return extract_vehicle_boxes_from_results(
+            fallback_results,
+            getattr(model, "names", {}),
+            frame,
+            min_confidence=min_confidence,
         )
     return []
 
@@ -992,12 +1094,12 @@ SUPPORTED_VIDEO_CONTENT_TYPES = {
 
 def log_image(message: str):
     """Keep image route logging consistent and easy to scan in demo runs."""
-    print(f"[image] {message}")
+    print(f"[image] {redact_camera_text(message)}")
 
 
 def log_video(message: str):
     """Keep video route logging consistent and easy to scan in demo runs."""
-    print(f"[video] {message}")
+    print(f"[video] {redact_camera_text(message)}")
 
 
 def build_output_url(request: Request, filename: str) -> str:
@@ -1069,7 +1171,7 @@ MOTORCYCLE_OVERLAP_MIN_AREA_THRESHOLD = get_env_float(
 MOTORCYCLE_IOU_THRESHOLD = get_env_float("MOTORCYCLE_IOU_THRESHOLD", 0.045)
 DEMO_FALLBACK_LATITUDE = get_env_float("DEMO_FALLBACK_LATITUDE", 7.1907)
 DEMO_FALLBACK_LONGITUDE = get_env_float("DEMO_FALLBACK_LONGITUDE", 125.4553)
-LIVE_CAMERA_DETECTION_INTERVAL_MS = get_env_int("LIVE_CAMERA_DETECTION_INTERVAL_MS", 500)
+LIVE_CAMERA_DETECTION_INTERVAL_MS = get_env_int("LIVE_CAMERA_DETECTION_INTERVAL_MS", 0)
 _raw_crash_ui_threshold = get_env_float("CRASH_UI_THRESHOLD", 0.80)
 CRASH_UI_CONFIDENCE_THRESHOLD = (
     _raw_crash_ui_threshold / 100.0
@@ -1199,7 +1301,7 @@ def classify_crash_frame(frame: np.ndarray) -> dict:
             "persistenceReason": None,
         }
     except Exception as error:
-        log_stream(f"Crash classifier inference failed: {error}")
+        log_stream(f"Crash classifier inference failed: {redact_camera_text(str(error))}")
         return {
             "crashClass": "unknown",
             "crashConfidence": 0.0,
@@ -1209,7 +1311,7 @@ def classify_crash_frame(frame: np.ndarray) -> dict:
             "predictedClass": "unknown",
             "predictedClassConfidence": 0.0,
             "crashClassifierAvailable": False,
-            "crashClassifierError": str(error),
+            "crashClassifierError": redact_camera_text(str(error)),
             "persistenceReason": "backend_save_failed",
         }
 
@@ -1250,7 +1352,7 @@ LIVE_CAMERA_REQUIRED_HITS = max(
 CRASH_TEMPORAL_WINDOW_SECONDS = get_env_float("CRASH_TEMPORAL_WINDOW_SECONDS", 5.0)
 LIVE_CAMERA_BUFFER_SIZE = get_env_int("LIVE_CAMERA_BUFFER_SIZE", 1)
 LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS = get_env_int("LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS", 10)
-LIVE_CAMERA_PREVIEW_FPS = get_env_int("LIVE_CAMERA_PREVIEW_FPS", 10)
+LIVE_CAMERA_PREVIEW_FPS = get_env_int("LIVE_CAMERA_PREVIEW_FPS", 15)
 LIVE_CAMERA_JPEG_QUALITY = get_env_int("LIVE_CAMERA_JPEG_QUALITY", 75)
 LIVE_CAMERA_USE_SEPARATE_VEHICLE_MODEL = os.getenv(
     "LIVE_CAMERA_USE_SEPARATE_VEHICLE_MODEL", "true"
@@ -1314,7 +1416,7 @@ def decode_uploaded_image(file_path: Path):
     try:
         image_bytes = file_path.read_bytes()
     except Exception as error:
-        raise ValueError(f"Could not read uploaded image: {error}") from error
+        raise ValueError(f"Could not read uploaded image: {redact_camera_text(str(error))}") from error
 
     if not image_bytes:
         raise ValueError("The uploaded image file is empty.")
@@ -1668,7 +1770,7 @@ def create_incident_record(
 
 
 def log_stream(message: str):
-    print(f"[stream] {message}")
+    print(f"[stream] {redact_camera_text(message)}")
 
 
 def build_output_url_from_base(base_url: str, filename: str) -> str:
@@ -1712,6 +1814,11 @@ def detections_to_response_boxes(detections: list[dict]) -> list[dict]:
     return boxes
 
 
+def find_unresolved_camera_case(*args, **kwargs):
+    # Do not silently query SQLite if the operational database is unavailable.
+    return find_pending_camera_incident(*args, **kwargs)
+
+
 def persist_sqlite_crash_case(
     *,
     media_type: str,
@@ -1748,6 +1855,7 @@ def persist_sqlite_crash_case(
     assigned_responder_id: str | None = None,
     responder_id: str | None = None,
     boxes: list[dict] | None = None,
+    detector_event_id: str | None = None,
 ) -> dict | None:
     log_create_case_attempt(
         route=route,
@@ -1763,8 +1871,26 @@ def persist_sqlite_crash_case(
         consecutive_crash_hits=consecutive_crash_hits,
         case_created_attempt=True,
     )
+    if final_decision in {"confirmed_crash", "possible_crash_aftermath"}:
+        event_id = detector_event_id or str(uuid.uuid4())
+        try:
+            return persist_operational_detection({
+                "finalDecision": final_decision, "detectorEventId": event_id,
+                "cameraKey": (camera_id or camera_ip or source_camera) if trigger_status == "camera_detection" else None,
+                "cameraId": camera_id, "crashScore": crash_score, "detectedAt": timestamp,
+                "location": location, "latitude": latitude, "longitude": longitude,
+                "evidenceSummary": {"finalDecision": final_decision, "vehicleCount": vehicle_count,
+                    "personCount": person_count, "sceneValid": scene_valid, "motionValid": motion_valid,
+                    "consecutiveCrashHits": consecutive_crash_hits, "boxes": boxes or []},
+                "media": {"keyFramePath": key_frame_url, "annotatedPath": annotated_url,
+                    "videoPath": annotated_download_url, "thumbnailPath": key_frame_url},
+            })
+        except Exception as error:
+            log_stream(f"Operational incident persistence failed: {type(error).__name__}")
+            return None
+    # One-shot static image review remains the legacy, non-operational contract.
     if trigger_status == "camera_detection" and (camera_ip or camera_id or source_camera):
-        existing_case = find_unresolved_camera_case(
+        existing_case = find_legacy_unresolved_camera_case(
             camera_ip,
             camera_id,
             source_camera,
@@ -1800,39 +1926,66 @@ def persist_sqlite_crash_case(
         or media_paths.get("annotatedPath")
         or media_paths.get("thumbnailPath")
     )
-    log_label = "Camera alert" if trigger_status == "camera_detection" else "Crash case"
+    case_payload = {
+        "caseId": case_id,
+        "status": "pending_review",
+        "confidence": confidence,
+        "detectedAt": timestamp,
+        "updatedAt": timestamp,
+        "location": location,
+        "latitude": latitude if latitude is not None else DEMO_FALLBACK_LATITUDE,
+        "longitude": longitude if longitude is not None else DEMO_FALLBACK_LONGITUDE,
+        "areaId": area_id,
+        "sourceCamera": source_camera or source_file,
+        "cameraId": camera_id,
+        "cameraName": camera_name or source_camera or source_file,
+        "cameraIp": camera_ip,
+        "barangay": barangay or area_id,
+        "roadName": road_name,
+        "assignedResponderId": assigned_responder_id,
+        "responderId": responder_id,
+        "triggerStatus": trigger_status,
+        "accidentDetected": True,
+        # Repository-level safety gate fields (backend.repositories.crash_cases
+        # refuses to persist anything unless these prove a valid crash decision).
+        "finalDecision": final_decision,
+        "vehicleCount": vehicle_count,
+        "sceneValid": scene_valid,
+        "motionValid": motion_valid,
+        "crashScore": crash_score,
+        "consecutiveCrashHits": consecutive_crash_hits,
+        **media_paths,
+    }
+    if final_decision == "confirmed_crash":
+        case_payload.update(
+            {
+                "detectionMode": "temporal_collision",
+                "temporalVerified": True,
+                "temporalCrashScore": max(crash_score, 0.80),
+                "interactionCandidate": True,
+            }
+        )
+    elif final_decision == "possible_crash_aftermath":
+        case_payload.update(
+            {
+                "detectionMode": "aftermath_review",
+                "aftermathCandidate": True,
+                "aftermathScore": max(crash_score, 0.80),
+                "aftermathClassifierScore": max(crash_score, 0.80),
+                "aftermathAbnormalityScore": 0.90,
+                "aftermathPositiveObservations": max(consecutive_crash_hits, 6),
+                "aftermathPersistenceSeconds": max(2.5, consecutive_crash_hits * 0.5),
+            }
+        )
+    elif final_decision == "possible_crash":
+        case_payload.update(
+            {
+                "detectionMode": "static_detection",
+            }
+        )
     try:
         case_item = create_crash_case(
-            {
-                "caseId": case_id,
-                "status": "pending_review",
-                "confidence": confidence,
-                "detectedAt": timestamp,
-                "updatedAt": timestamp,
-                "location": location,
-                "latitude": latitude if latitude is not None else DEMO_FALLBACK_LATITUDE,
-                "longitude": longitude if longitude is not None else DEMO_FALLBACK_LONGITUDE,
-                "areaId": area_id,
-                "sourceCamera": source_camera or source_file,
-                "cameraId": camera_id,
-                "cameraName": camera_name or source_camera or source_file,
-                "cameraIp": camera_ip,
-                "barangay": barangay or area_id,
-                "roadName": road_name,
-                "assignedResponderId": assigned_responder_id,
-                "responderId": responder_id,
-                "triggerStatus": trigger_status,
-                "accidentDetected": True,
-                # Repository-level safety gate fields (backend.repositories.crash_cases
-                # refuses to persist anything unless these prove a confirmed_crash decision).
-                "finalDecision": final_decision,
-                "vehicleCount": vehicle_count,
-                "sceneValid": scene_valid,
-                "motionValid": motion_valid,
-                "crashScore": crash_score,
-                "consecutiveCrashHits": consecutive_crash_hits,
-                **media_paths,
-            },
+            case_payload,
             boxes=boxes,
             frame_path=frame_path,
         )
@@ -1890,19 +2043,15 @@ def validate_stream_url(url: str) -> None:
 
 
 def is_authorized_camera_host(host: str) -> bool:
-    normalized = host.strip().lower()
-    configured_hosts = {
-        item.strip().lower()
-        for item in os.getenv("AUTHORIZED_CAMERA_HOSTS", "").split(",")
-        if item.strip()
-    }
-    if normalized in {"localhost", "127.0.0.1", "::1"} or normalized in configured_hosts:
+    host = host.strip().lower()
+    allowed = {item.strip().lower() for item in os.getenv("AUTHORIZED_CAMERA_HOSTS", "").split(",") if item.strip()}
+    if host in allowed or host == "localhost":
         return True
     try:
-        ip = ipaddress.ip_address(normalized)
-        return ip.is_private or ip.is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
-        return normalized.endswith(".local")
+        return False
+    return address.is_private or address.is_loopback
 
 
 def validate_camera_ip(camera_ip: str) -> str:
@@ -1942,6 +2091,7 @@ def load_camera_config(include_secret: bool = False) -> dict:
     if include_secret:
         config["cameraPassword"] = password
     else:
+        config.pop("cameraUsername", None)
         config["cameraPasswordConfigured"] = bool(password)
     return config
 
@@ -2001,11 +2151,28 @@ def resolve_camera_stream_source(body) -> tuple[str, str, str | None]:
 
 
 def stream_source_label(url: str) -> str:
+    if is_webcam_reference(url):
+        try:
+            return resolve_source(url).friendly_name
+        except ValueError:
+            return "Local Webcam (unavailable)"
     parsed = urlparse(url.strip())
     if parsed.scheme == "demo":
         return f"Demo Camera ({parsed.netloc or 'sample-camera'})"
-    host = parsed.netloc or "stream"
+    host = parsed.hostname or "stream"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
     return f"CCTV ({host})"
+
+
+def camera_client_payload(camera: dict) -> dict:
+    stream_url = camera.get("streamUrl")
+    camera_ip = camera.get("cameraIp")
+    out = public_camera_data(dict(camera))
+    out.pop("streamUrl", None)
+    out["streamConfigured"] = bool(camera_ip or stream_url)
+    out["streamSourceLabel"] = stream_source_label(stream_url) if stream_url else (build_redacted_camera_stream_label(camera_ip) if camera_ip else "None")
+    return out
 
 
 def ensure_stream_host_reachable(url: str, timeout_seconds: float = 4.0) -> None:
@@ -2119,6 +2286,57 @@ class LiveCameraMonitor:
         self.message = "Connecting"
         self.latest_frame: np.ndarray | None = None
         self.latest_jpeg_bytes: bytes | None = None
+        self.frame_seq = 0
+        # A session epoch disambiguates worker recreation/reconnection. Sequence
+        # numbers never reset on this worker; metadata stays attached to pixels.
+        self.frame_epoch = uuid.uuid4().hex
+        # Never derive public provenance from a URL/credential-bearing monitor
+        # key. Unsaved sources receive an opaque identity for this worker.
+        self.frame_camera_id = (
+            camera_id if camera_id and len(camera_id) <= 80
+            and all(c.isascii() and (c.isalnum() or c in "_-") for c in camera_id)
+            else f"live-{uuid.uuid4().hex}"
+        )
+        from backend.services.session_vehicle_tracking import SessionVehicleTracker
+        self.vehicle_tracker = SessionVehicleTracker(self.frame_camera_id, self.frame_epoch)
+        self.latest_frame_epoch = self.frame_epoch
+        self.last_frame_monotonic: float | None = None
+        self.preview_frame_epoch: str | None = None
+        self.preview_frame_monotonic: float | None = None
+        self.source_reported_fps: float | None = None
+        self.model_processing_ms: float | None = None
+        self.inference_completion_age_ms: float | None = None
+        self.frame_copy_ms: float | None = None
+        self.preview_seq = -1
+        self.preview_frame_at: float | None = None
+        self.preview_lock = threading.RLock()
+        self.box_preview_lock = threading.Lock()
+        self.latest_box_frame = None
+        self.box_packet_cache = None
+        self.analysis_lock = threading.Lock()
+        self.frame_available = threading.Event()
+        self.stop_event = threading.Event()
+        self.jpeg_encode_ms: float | None = None
+        self.jpeg_encode_count = 0
+        self.inference_ms: float | None = None
+        self.inference_frame_age_ms: float | None = None
+        self.last_analyzed_frame_seq = 0
+        self.dropped_frame_count = 0
+        self.capture_timestamps = deque(maxlen=300)
+        self.preview_timestamps = deque(maxlen=300)
+        self.ai_timestamps = deque(maxlen=300)
+        self.last_connection_at: float | None = None
+        self.reconnect_count = 0
+        self.stale_frame_events = 0
+        self.was_stale = False
+        self.capture_read_ms: float | None = None
+        self.decoded_arrival_interval_ms: float | None = None
+        self.frame_published_at: float | None = None
+        self.decoder_threads: int | None = None
+        self.capture_buffer_accepted: bool | None = None
+        self.jpeg_encoded_at: float | None = None
+        self.jpeg_send_age_ms: float | None = None
+        self.jpeg_replaced_age_ms: float | None = None
         self.latest_result: dict | None = None
         self.last_checked_at: str | None = None
         self.last_frame_at: float | None = None
@@ -2129,6 +2347,7 @@ class LiveCameraMonitor:
         self.last_vehicle_labels: list[str] = []
         self.last_error: str | None = None
         self.last_alert_at = 0.0
+        self.detector_event_id = str(uuid.uuid4())
         self.last_confidence: float | None = None
         self.last_created_case_id: str | None = None
         self.last_created_notification_id: str | None = None
@@ -2140,11 +2359,13 @@ class LiveCameraMonitor:
         self.lock = threading.Lock()
         self.capture_thread: threading.Thread | None = None
         self.detection_thread: threading.Thread | None = None
+        self.webcam_capture = None
 
     def start(self) -> None:
         if self.running:
             return
         self.running = True
+        self.stop_event.clear()
         self.capture_thread = threading.Thread(
             target=self._capture_loop,
             name=f"camera-capture-{self.camera_ip}",
@@ -2160,6 +2381,17 @@ class LiveCameraMonitor:
 
     def stop(self) -> None:
         self.running = False
+        with self.lock:
+            self.vehicle_tracker.reset(None)
+        self.stop_event.set()
+        self.frame_available.set()
+        if self.stream_url.startswith("webcam://"):
+            if self.webcam_capture is not None:
+                self.webcam_capture.release()
+            if self.capture_thread is not None and self.capture_thread is not threading.current_thread():
+                self.capture_thread.join(timeout=9)
+                if self.capture_thread.is_alive():
+                    raise ValueError("Local webcam capture is still stopping.")
 
     def _set_status(self, status: str, message: str) -> None:
         with self.lock:
@@ -2167,15 +2399,25 @@ class LiveCameraMonitor:
             self.message = message
 
     def _capture_loop(self) -> None:
+        from backend.services.camera_sources import resolve_source, open_webcam, MAX_ATTEMPTS
         self.capture_worker_running = True
         parsed = urlparse(self.stream_url)
+        webcam = parsed.scheme == "webcam"
+        attempts = 0
         try:
             if parsed.scheme == "demo":
                 while self.running:
                     frame = demo_camera_frame(self.label)
+                    received_at = time.time()
+                    received_monotonic = time.monotonic()
                     with self.lock:
                         self.latest_frame = frame
-                        self.last_frame_at = time.time()
+                        self.frame_seq += 1
+                        self.latest_frame_epoch = self.frame_epoch
+                        self.last_frame_at = received_at
+                        self.last_frame_monotonic = received_monotonic
+                        self.capture_timestamps.append(self.last_frame_at)
+                        self.frame_available.set()
                         self.last_error = None
                         if self.status in {"connecting", "reconnecting"}:
                             self.status = "demo"
@@ -2183,77 +2425,135 @@ class LiveCameraMonitor:
                     time.sleep(0.08)
                 return
 
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000"
+            if not webcam:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000"
             while self.running:
+                if webcam:
+                    if attempts >= MAX_ATTEMPTS:
+                        self._set_status("connection-lost", "Local webcam unavailable; restart monitoring to retry.")
+                        break
+                    attempts += 1
                 self._set_status("reconnecting", "Reconnecting")
                 with self.lock:
                     self.reconnecting = True
-                cap = cv2.VideoCapture()
+                cap = None
                 try:
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, max(1, LIVE_CAMERA_BUFFER_SIZE))
-                    cap.open(self.stream_url, cv2.CAP_FFMPEG)
+                    # FFmpeg frame threading adds a reorder pipeline: on this
+                    # 15 Hz feed, the default 12 threads delayed the camera OSD
+                    # by about a second compared with one decoder thread.
+                    if webcam:
+                        cap = open_webcam(resolve_source(self.stream_url))
+                        self.webcam_capture = cap
+                    else:
+                        cap = cv2.VideoCapture()
+                        cap.open(self.stream_url, cv2.CAP_FFMPEG, [
+                            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+                            cv2.CAP_PROP_N_THREADS, 1,
+                        ])
+                        buffer_accepted = cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        self.capture_buffer_accepted = bool(buffer_accepted)
+                        self.decoder_threads = int(cap.get(cv2.CAP_PROP_N_THREADS))
+                        log_stream(f"Camera buffer size=1 accepted={buffer_accepted}; backend=FFmpeg")
                     if not cap.isOpened():
                         with self.lock:
-                            self.last_error = "Camera stream could not be opened."
-                        time.sleep(2)
+                            self.last_error = "Local webcam unavailable or busy." if webcam else "Camera stream could not be opened."
+                        if not webcam:
+                            time.sleep(2)
                         continue
                     self._set_status("monitoring-live", "Monitoring Live")
+                    reported_fps = cap.get(cv2.CAP_PROP_FPS)
                     with self.lock:
+                        self.frame_epoch = uuid.uuid4().hex
+                        self.vehicle_tracker.reset(self.frame_epoch)
+                        self.source_reported_fps = (
+                            float(reported_fps) if isinstance(reported_fps, (int, float))
+                            and np.isfinite(reported_fps) and reported_fps > 0 else None
+                        )
+                        if self.last_connection_at is not None:
+                            self.reconnect_count += 1
+                        self.last_connection_at = time.time()
                         self.reconnecting = False
                     while self.running:
-                        # Low-latency priority: grab newest frame packet, discarding queued stale packets
-                        ok = cap.grab()
-                        if not ok:
-                            with self.lock:
-                                self.last_error = "Camera stream returned no frame."
-                            self._set_status("connection-lost", "Connection Lost")
-                            break
-
-                        # Flush queued stale frames (up to 5) to keep frame buffer fresh
-                        flushed = 0
-                        while flushed < 5 and cap.grab():
-                            flushed += 1
-
-                        ok, frame = cap.retrieve()
+                        # Continuously decode; downstream consumers only ever see the newest frame.
+                        read_started = time.perf_counter()
+                        ok, frame = cap.read()
+                        received_at = time.time()
+                        received_monotonic = time.monotonic()
+                        if webcam and ok and frame is not None:
+                            received_at = cap.received_at
+                            received_monotonic = cap.received_monotonic
+                        read_ms = (time.perf_counter() - read_started) * 1000
                         if not ok or frame is None:
                             with self.lock:
                                 self.last_error = "Camera stream returned no frame."
                             self._set_status("connection-lost", "Connection Lost")
                             break
 
-                        ok_enc, encoded = cv2.imencode(
-                            ".jpg",
-                            frame,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_CAMERA_JPEG_QUALITY],
-                        )
-                        jpeg_bytes = encoded.tobytes() if ok_enc else None
-
                         with self.lock:
+                            self.capture_read_ms = read_ms
+                            self.decoded_arrival_interval_ms = (
+                                (received_at - self.last_frame_at) * 1000 if self.last_frame_at else None
+                            )
                             self.latest_frame = frame
-                            self.latest_jpeg_bytes = jpeg_bytes
-                            self.last_frame_at = time.time()
+                            self.frame_seq += 1
+                            self.latest_frame_epoch = self.frame_epoch
+                            self.last_frame_at = received_at
+                            self.last_frame_monotonic = received_monotonic
+                            self.frame_published_at = time.time()
+                            self.capture_timestamps.append(self.last_frame_at)
+                            self.frame_available.set()
                             self.last_error = None
+                except ValueError:
+                    if not webcam:
+                        raise
+                    with self.lock:
+                        self.last_error = "Local webcam unavailable or busy."
                 finally:
-                    cap.release()
-                time.sleep(1)
+                    if cap is not None:
+                        cap.release()
+                    with self.lock:
+                        self.vehicle_tracker.reset(None)
+                    if webcam:
+                        self.webcam_capture = None
+                        with self.lock:
+                            self.latest_frame = None
+                            self.latest_jpeg_bytes = None
+                            self.latest_box_frame = None
+                            self.box_packet_cache = None
+                            self.last_frame_at = None
+                            self.last_frame_monotonic = None
+                            self.frame_epoch = uuid.uuid4().hex
+                            self.frame_available.clear()
+                        self._set_status("connection-lost", "Local webcam unavailable.")
+                        if attempts < MAX_ATTEMPTS:
+                            self.stop_event.wait(min(8, 2 ** (attempts - 1)))
+                if not webcam:
+                    time.sleep(1)
         finally:
             self.capture_worker_running = False
             with self.lock:
                 self.reconnecting = False
 
     def seed_first_frame(self, frame: np.ndarray) -> None:
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_CAMERA_JPEG_QUALITY],
-        )
-        jpeg_bytes = encoded.tobytes() if ok else None
+        received_at = time.time()
+        received_monotonic = time.monotonic()
+        # Own caller-supplied pixels without holding capture's publication lock.
+        owned_frame = frame.copy()
         with self.lock:
-            self.latest_frame = frame.copy()
-            self.latest_jpeg_bytes = jpeg_bytes
-            self.last_frame_at = time.time()
+            if self.vehicle_tracker.session_id is None:
+                # Explicit source seeding after stop/disconnect is a new session.
+                self.frame_epoch = uuid.uuid4().hex
+                self.vehicle_tracker.reset(self.frame_epoch)
+            self.latest_frame = owned_frame
+            self.frame_seq += 1
+            self.latest_frame_epoch = self.frame_epoch
+            self.last_frame_at = received_at
+            self.last_frame_monotonic = received_monotonic
+            if self.last_connection_at is None:
+                self.last_connection_at = self.last_frame_at
+            self.capture_timestamps.append(self.last_frame_at)
+            self.frame_available.set()
             self.last_error = None
             self.reconnecting = False
             if self.status in {"connecting", "reconnecting"}:
@@ -2261,27 +2561,79 @@ class LiveCameraMonitor:
                 self.message = "Monitoring Live"
 
     def latest_jpeg(self) -> bytes | None:
-        with self.lock:
-            if self.latest_jpeg_bytes is not None:
-                return self.latest_jpeg_bytes
-            frame = None if self.latest_frame is None else self.latest_frame.copy()
-        if frame is None:
-            return None
-        ok, encoded = cv2.imencode(
-            ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_CAMERA_JPEG_QUALITY],
-        )
-        return encoded.tobytes() if ok else None
+        # Serialize preview consumers only. Capture never acquires this lock and
+        # can overwrite its single native-frame slot throughout JPEG compression.
+        with self.preview_lock:
+            with self.lock:
+                seq = self.frame_seq
+                if seq == self.preview_seq:
+                    return self.latest_jpeg_bytes
+                frame = self.latest_frame
+                captured_at = self.last_frame_at
+                captured_monotonic = self.last_frame_monotonic
+                captured_epoch = self.latest_frame_epoch
+            if frame is None:
+                return None
+            started = time.perf_counter()
+            ok, encoded = cv2.imencode(
+                ".jpg", frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_CAMERA_JPEG_QUALITY],
+            )
+            if not ok:
+                return None
+            jpeg_bytes = encoded.tobytes()
+            with self.lock:
+                self.jpeg_replaced_age_ms = (
+                    (time.time() - self.preview_frame_at) * 1000 if self.preview_frame_at else None
+                )
+                self.latest_jpeg_bytes = jpeg_bytes
+                self.preview_seq = seq
+                self.preview_frame_at = captured_at
+                self.preview_frame_monotonic = captured_monotonic
+                self.preview_frame_epoch = captured_epoch
+                self.jpeg_encode_ms = (time.perf_counter() - started) * 1000
+                self.jpeg_encode_count += 1
+                self.jpeg_encoded_at = time.time()
+                self.preview_timestamps.append(time.time())
+            return self.latest_jpeg_bytes
+
+    def latest_preview_packet(self) -> tuple[bytes | None, dict[str, str]]:
+        # Pin metadata to these bytes. The preview lock never covers HTTP send
+        # or capture, and this method cannot build a frame queue.
+        with self.preview_lock:
+            jpeg = self.latest_jpeg()
+            if jpeg is None:
+                return None, {}
+            self.jpeg_send_age_ms = (
+                (time.monotonic() - self.preview_frame_monotonic) * 1000
+                if self.preview_frame_monotonic is not None else None
+            )
+            return jpeg, {
+                "X-Frame-Sequence": str(self.preview_seq),
+                "X-Frame-Session": self.preview_frame_epoch or "",
+                "X-Frame-Camera-Id": self.frame_camera_id,
+                "X-Frame-Decoded-At": str(self.preview_frame_at or ""),
+                "X-Jpeg-Encoded-At": str(self.jpeg_encoded_at or ""),
+                "X-Jpeg-Send-Age-Ms": f"{self.jpeg_send_age_ms or 0:.3f}",
+            }
 
     def mjpeg_stream(self):
-        delay = 1 / max(1, LIVE_CAMERA_PREVIEW_FPS)
+        # perf_counter is monotonic and provides high-resolution deadlines on
+        # Windows, where monotonic() can have a coarse scheduler-tick resolution.
+        deadline = time.perf_counter()
         first_frame_logged = False
         try:
             while self.running:
-                image_bytes = self.latest_jpeg()
+                # Preserve explicit ceilings, follow a slower reported source,
+                # and never accumulate catch-up sends for a slow consumer.
+                fps = min(max(1, LIVE_CAMERA_PREVIEW_FPS), self.source_reported_fps or max(1, LIVE_CAMERA_PREVIEW_FPS))
+                delay = 1 / max(1, fps)
+                if self.stop_event.wait(max(0.0, deadline - time.perf_counter())):
+                    break
+                started = time.perf_counter()
+                image_bytes, frame_headers = self.latest_preview_packet()
                 if image_bytes is None:
-                    time.sleep(delay)
+                    deadline = started + delay
                     continue
                 if not first_frame_logged:
                     first_frame_logged = True
@@ -2293,15 +2645,63 @@ class LiveCameraMonitor:
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    b"Cache-Control: no-store\r\n\r\n"
+                    b"Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                    + f"Content-Length: {len(image_bytes)}\r\n".encode("ascii")
+                    + "".join(f"{key}: {value}\r\n" for key, value in frame_headers.items()).encode("ascii")
+                    + b"\r\n"
                     + image_bytes
                     + b"\r\n"
                 )
-                time.sleep(delay)
+                deadline = max(deadline + delay, time.perf_counter())
         finally:
             log_stream(f"MJPEG stream closed cameraId={self.camera_id or ''} label={self.label}")
 
-    def detection_events(self):
+    def latest_box_packet(self):
+        # One immutable analyzed frame; encoding never holds the capture/model locks.
+        with self.box_preview_lock:
+            with self.lock:
+                item = self.latest_box_frame
+                epoch = self.frame_epoch
+            if item is None or item[1]["sourceFrame"]["sessionId"] != epoch:
+                return None
+            frame, metadata, published = item
+            if (time.perf_counter() - published) * 1000 >= 500:
+                return None
+            if self.box_packet_cache is None or self.box_packet_cache[0] is not item:
+                ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, LIVE_CAMERA_JPEG_QUALITY])
+                if not ok:
+                    return None
+                packet = {**metadata, "imageDataUrl": "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")}
+                self.box_packet_cache = (item, packet)
+            with self.lock:
+                if self.latest_box_frame is not item or self.frame_epoch != epoch:
+                    return None
+            age = (time.perf_counter() - published) * 1000
+            if age >= 500:
+                return None
+            captured = metadata["sourceFrame"]["capturedMonotonic"]
+            source_age = max(0, (time.monotonic() - captured) * 1000) if captured is not None else None
+            return {**self.box_packet_cache[1], "resultAgeMs": age, "validForMs": 500 - age,
+                    "sourceAgeMs": source_age}
+
+    def detection_events(self, boxes_only=False):
+        if boxes_only:
+            last_key = None
+            heartbeat = time.perf_counter()
+            while self.running:
+                with self.lock:
+                    item = self.latest_box_frame
+                    identity = item[1]["sourceFrame"] if item else None
+                    valid = identity is not None and identity["sessionId"] == self.frame_epoch
+                key = (identity["sessionId"], identity["sequence"]) if valid else None
+                if key != last_key:
+                    last_key = key
+                    yield "event: boxes\ndata: " + json.dumps(identity if valid else None) + "\n\n"
+                elif time.perf_counter() - heartbeat >= 10:
+                    heartbeat = time.perf_counter()
+                    yield ": keepalive\n\n"
+                self.stop_event.wait(0.1)
+            return
         last_payload_key = ""
         log_stream(f"SSE connected cameraId={self.camera_id or ''} label={self.label}")
         try:
@@ -2361,7 +2761,7 @@ class LiveCameraMonitor:
                         yield ": keep-alive\n\n"
                     time.sleep(0.5)
                 except Exception as error:
-                    yield f"event: error\ndata: {json.dumps({'message': str(error)})}\n\n"
+                    yield f"event: error\ndata: {json.dumps({'message': redact_camera_text(str(error))})}\n\n"
                     time.sleep(1.0)
         finally:
             log_stream(f"SSE disconnected cameraId={self.camera_id or ''} label={self.label}")
@@ -2384,6 +2784,15 @@ class LiveCameraMonitor:
             )
             status = self.status
             message = self.message
+            stale = latest_frame_age is not None and latest_frame_age > LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS
+            if stale and not self.was_stale:
+                self.stale_frame_events += 1
+            self.was_stale = stale
+            camera_health = (
+                "STALE" if stale else "RECONNECTING" if self.reconnecting
+                else "LIVE" if self.latest_frame is not None and status not in {"connection-lost", "stopped"}
+                else "OFFLINE"
+            )
             frame_width = int(self.latest_frame.shape[1]) if self.latest_frame is not None else None
             frame_height = int(self.latest_frame.shape[0]) if self.latest_frame is not None else None
             latest_frame_url = (
@@ -2400,6 +2809,47 @@ class LiveCameraMonitor:
                 status = "connection-lost"
                 message = "Connection Lost"
             return {
+                "cameraHealth": camera_health,
+                "latestFrameIdentity": {
+                    "cameraId": self.frame_camera_id,
+                    "sessionId": self.latest_frame_epoch,
+                    "sequence": self.frame_seq,
+                    "capturedAt": self.last_frame_at,
+                    "capturedMonotonic": self.last_frame_monotonic,
+                    "width": frame_width,
+                    "height": frame_height,
+                } if self.latest_frame is not None else None,
+                "sourceReportedFps": self.source_reported_fps,
+                "modelProcessingMs": self.model_processing_ms,
+                "inferenceCompletionAgeMs": self.inference_completion_age_ms,
+                "frameCopyMs": self.frame_copy_ms,
+                "framesSkippedBeforeInference": self.dropped_frame_count,
+                "captureReadMs": self.capture_read_ms,
+                "decodedArrivalIntervalMs": self.decoded_arrival_interval_ms,
+                "framePublishedAt": self.frame_published_at,
+                "capturePublishDelayMs": (self.frame_published_at - self.last_frame_at) * 1000 if self.frame_published_at and self.last_frame_at else None,
+                "decoderThreads": self.decoder_threads,
+                "captureBufferAccepted": self.capture_buffer_accepted,
+                "jpegSendAgeMs": self.jpeg_send_age_ms,
+                "jpegReplacedAgeMs": self.jpeg_replaced_age_ms,
+                "frameAgeMs": int(latest_frame_age * 1000) if latest_frame_age is not None else None,
+                "lastConnectionAt": datetime.fromtimestamp(self.last_connection_at).isoformat() if self.last_connection_at else None,
+                "reconnectCount": self.reconnect_count,
+                "staleFrameEvents": self.stale_frame_events,
+                "captureFps": sum(t >= time.time() - 5 for t in self.capture_timestamps) / 5,
+                "previewFps": sum(t >= time.time() - 5 for t in self.preview_timestamps) / 5,
+                "aiFps": sum(t >= time.time() - 5 for t in self.ai_timestamps) / 5,
+                "sourceResolution": f"{frame_width}x{frame_height}",
+                "previewResolution": f"{frame_width}x{frame_height}",
+                "aiResolution": f"{frame_width}x{frame_height}",
+                "jpegEncodeMs": self.jpeg_encode_ms,
+                "jpegEncodeCount": self.jpeg_encode_count,
+                "inferenceMs": self.inference_ms,
+                "inferenceFrameAgeMs": self.inference_frame_age_ms,
+                "previewFrameAgeMs": (
+                    (time.monotonic() - self.preview_frame_monotonic) * 1000
+                    if self.preview_frame_monotonic is not None else None
+                ),
                 "monitorKey": self.monitor_key,
                 "cameraIp": self.camera_ip,
                 "cameraId": self.camera_id,
@@ -2455,16 +2905,57 @@ class LiveCameraMonitor:
             }
 
     def analyze_current_frame(self, *, manual: bool = False) -> dict:
+        if not self.analysis_lock.acquire(blocking=False):
+            raise ValueError("Camera analysis already in progress; waiting for the next frame.")
+        try:
+            return self._analyze_current_frame(manual=manual)
+        finally:
+            self.analysis_lock.release()
+
+    @bounded_inference
+    @live_collision_diagnostics.observe
+    def _analyze_current_frame(self, *, manual: bool = False) -> dict:
         with self.lock:
-            frame = None if self.latest_frame is None else self.latest_frame.copy()
+            # Pin an owned published array; capture replaces rather than mutates
+            # it. The potentially expensive copy belongs outside this lock.
+            source_frame = self.latest_frame
             last_frame_at = self.last_frame_at
-        if frame is None:
+            analyzed_seq = self.frame_seq
+            captured_monotonic = self.last_frame_monotonic
+            captured_epoch = self.latest_frame_epoch
+        inference_started = time.perf_counter()
+        inference_started_at = time.time()
+        if analyzed_seq == self.last_analyzed_frame_seq:
+            raise ValueError("Waiting for a new camera frame.")
+        if source_frame is None:
             raise ValueError("No live camera frame is available for detection yet.")
         if (
             last_frame_at is not None
             and time.time() - last_frame_at > LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS
         ):
             raise ValueError("Latest camera frame is stale; waiting for reconnect.")
+
+        self.dropped_frame_count += max(0, analyzed_seq - self.last_analyzed_frame_seq - 1)
+        self.last_analyzed_frame_seq = analyzed_seq
+        self.inference_frame_age_ms = (
+            (time.monotonic() - captured_monotonic) * 1000 if captured_monotonic is not None
+            else (time.time() - last_frame_at) * 1000 if last_frame_at else None
+        )
+        copy_started = time.perf_counter()
+        frame = source_frame.copy()
+        del source_frame  # Retain only the inference copy if capture advances.
+        self.frame_copy_ms = (time.perf_counter() - copy_started) * 1000
+        source_identity = {
+            "cameraId": self.frame_camera_id,
+            "sessionId": captured_epoch,
+            "sequence": analyzed_seq,
+            "capturedAt": last_frame_at,
+            "capturedMonotonic": captured_monotonic,
+            "width": int(frame.shape[1]),
+            "height": int(frame.shape[0]),
+        }
+        live_collision_diagnostics.emit('begin', analyzed_seq, last_frame_at)
+        live_collision_diagnostics.emit('frame_snapshot', frame)
 
         # Frame quality gate runs on the raw captured frame, before any
         # detection work, so a blurry/dark/overexposed/low-contrast frame
@@ -2473,14 +2964,11 @@ class LiveCameraMonitor:
         frame_quality_status = quality_result["frameQualityStatus"]
         quality_rejection_reason = quality_result["qualityRejectionReason"]
 
-        detection_frame = cv2.resize(
-            frame,
-            (LIVE_CAMERA_FRAME_WIDTH, LIVE_CAMERA_FRAME_HEIGHT),
-            interpolation=cv2.INTER_AREA,
-        )
+        detection_frame = frame  # Preserve native decoded detail for Model 2.
         # Upload detection passes OpenCV-decoded BGR arrays directly to YOLO.
         # Keep the same BGR pipeline here for parity with image uploads.
-        results = model.predict(detection_frame, verbose=False)
+        models_started = time.perf_counter()
+        results = model.predict(detection_frame, imgsz=640, verbose=False)
         detections, _yolo_accident_detected, _yolo_confidence = extract_detections(results)
         classifier_result = classify_crash_frame(detection_frame)
         crash_class = str(classifier_result.get("crashClass") or "unknown")
@@ -2497,10 +2985,18 @@ class LiveCameraMonitor:
         confidence = accident_probability
         crash_suspected = confidence >= CRASH_UI_CONFIDENCE_THRESHOLD
         all_resized_vehicle_boxes = detect_vehicle_boxes(detection_frame, fallback_results=results)
+        if not all_resized_vehicle_boxes and crash_suspected:
+            all_resized_vehicle_boxes = detect_vehicle_boxes(
+                detection_frame, fallback_results=results, min_confidence=0.15
+            )
+        live_collision_diagnostics.emit('inference_end')
+        self.model_processing_ms = (time.perf_counter() - models_started) * 1000
+        box_inference_finished_at = time.time()
         resized_vehicle_boxes, scene_valid = filter_boxes_in_roi(
             all_resized_vehicle_boxes,
             detection_frame,
         )
+        live_collision_diagnostics.emit('roi', all_resized_vehicle_boxes, resized_vehicle_boxes)
         person_count = count_labels_from_results(
             results,
             getattr(model, "names", {}),
@@ -2512,6 +3008,27 @@ class LiveCameraMonitor:
             scale_x=frame.shape[1] / max(1, detection_frame.shape[1]),
             scale_y=frame.shape[0] / max(1, detection_frame.shape[0]),
         )
+        # Reconnects create a new epoch. Inference begun against a retired
+        # epoch must never publish into the replacement session.
+        with self.lock:
+            if captured_epoch != self.frame_epoch:
+                raise ValueError("Discarded analyzed frame from retired camera session.")
+            tracking = self.vehicle_tracker.update(
+                captured_epoch, analyzed_seq,
+                captured_monotonic if captured_monotonic is not None else last_frame_at,
+                response_boxes, frame_width=int(frame.shape[1]), frame_height=int(frame.shape[0]),
+            )
+            # Publish tracking and its exact analyzed frame atomically with the
+            # session guard. This metadata is never consumed as crash evidence.
+            self.latest_box_frame = (frame, {
+                "sourceFrame": dict(source_identity),
+                "inferenceStartedAt": inference_started_at,
+                "inferenceFinishedAt": box_inference_finished_at,
+                "boxes": [dict(box) for box in tracking.boxes],
+                "predictedTracks": [dict(box) for box in tracking.predicted_tracks],
+                "retiredTrackIds": list(tracking.retired_track_ids),
+                "trackingMs": tracking.tracking_ms,
+            }, time.perf_counter())
         checked_at = datetime.now().isoformat()
         best_detection_score = (
             max((item.get("score", 0.0) for item in detections), default=0.0)
@@ -2539,6 +3056,7 @@ class LiveCameraMonitor:
             and scene_valid
         )
 
+        live_collision_diagnostics.emit('before', self.hit_window)
         now_seconds = time.time()
         self.hit_window.append((now_seconds, pre_temporal_positive))
         while (
@@ -2551,6 +3069,8 @@ class LiveCameraMonitor:
             if not hit:
                 break
             consecutive_hits += 1
+        if not any(hit for _, hit in self.hit_window):
+            self.detector_event_id = str(uuid.uuid4())
         temporal_ready = consecutive_hits >= LIVE_CAMERA_REQUIRED_HITS
 
         result_payload = {
@@ -2674,6 +3194,9 @@ class LiveCameraMonitor:
                 location=self.location,
             )
 
+        temporal_verified = bool(temporal_ready and motion_valid)
+        aftermath_candidate = bool(temporal_ready and not motion_valid)
+
         should_create_case, rejection_reason, final_decision = evaluate_crash_case_decision(
             crash_class=crash_class,
             crash_confidence=confidence,
@@ -2686,9 +3209,23 @@ class LiveCameraMonitor:
             cooldown_ready=cooldown_ready,
             frame_quality_status=frame_quality_status,
             quality_rejection_reason=quality_rejection_reason,
+            temporal_verified=temporal_verified,
+            aftermath_candidate=aftermath_candidate,
+            is_static_image=False,
         )
         result_payload["finalDecision"] = final_decision
         result_payload["rejectionReason"] = rejection_reason
+        # Observation evidence and deduplication state have separate meanings.
+        result_payload["temporalCrashVerified"] = bool(
+            temporal_verified and frame_quality_status == "good" and scene_valid and vehicle_count > 0
+        )
+        result_payload["temporalCrashCandidate"] = pre_temporal_positive and not temporal_verified
+        result_payload["existingCase"] = existing_case is not None
+        result_payload["activeBlockingCaseId"] = (existing_case or {}).get("caseId")
+        live_collision_diagnostics.emit(
+            'decision', result_payload, self.hit_window, pre_temporal_positive,
+            CRASH_TEMPORAL_WINDOW_SECONDS, now_seconds,
+        )
 
         if final_decision == "duplicate_active_case" and existing_case:
                 (
@@ -2697,7 +3234,7 @@ class LiveCameraMonitor:
                     duplicate_annotated_path,
                     duplicate_annotated_url,
                 ) = save_detection_snapshot()
-                refreshed_case = replace_case_evidence(
+                refreshed_case = None if existing_case.get("operational") else replace_case_evidence(
                     existing_case["caseId"],
                     key_frame_path=duplicate_key_frame_path or duplicate_annotated_path,
                     thumbnail_path=duplicate_key_frame_path or duplicate_annotated_path,
@@ -2711,8 +3248,8 @@ class LiveCameraMonitor:
                 )
                 result_payload.update(
                     {
-                        "accident_detected": True,
-                        "accidentDetected": True,
+                        "accident_detected": result_payload["temporalCrashVerified"],
+                        "accidentDetected": result_payload["temporalCrashVerified"],
                         "caseId": existing_case["caseId"],
                         "existingCase": True,
                         "persistenceStatus": "blocked_existing_case",
@@ -2752,6 +3289,7 @@ class LiveCameraMonitor:
                     crash_score=confidence,
                     consecutive_crash_hits=consecutive_hits,
                     route="LiveCameraMonitor.analyze_current_frame",
+                    detector_event_id=self.detector_event_id,
                     source_camera=self.label,
                     area_id=self.area_id or "demo",
                     camera_ip=self.camera_ip,
@@ -2768,19 +3306,9 @@ class LiveCameraMonitor:
                     if sqlite_case and sqlite_case.get("casePersistenceStatus") == "created"
                     else None
                 )
-                persistence_status = (
-                    "failed_missing_notification"
-                    if sqlite_case
-                    and sqlite_case.get("casePersistenceStatus") == "created"
-                    and not created_notification_id
-                    else sqlite_case.get("casePersistenceStatus")
-                    if sqlite_case
-                    else "failed"
-                )
+                persistence_status = sqlite_case.get("casePersistenceStatus") if sqlite_case else "failed"
                 persistence_skipped_reason = (
-                    "Crash case was saved, but no notification id was returned."
-                    if persistence_status == "failed_missing_notification"
-                    else "Crash was detected, but the backend could not save a review case."
+                    "Crash was detected, but the backend could not save a review case."
                     if sqlite_case is None
                     else f"Blocked by repository safety gate: {sqlite_case.get('rejectionReason')}"
                     if persistence_status == "rejected"
@@ -2793,12 +3321,18 @@ class LiveCameraMonitor:
                     f"areaId={self.area_id or 'demo'} cameraId={self.camera_id or ''} "
                     f"skipReason={persistence_skipped_reason or ''}"
                 )
-                self.last_alert_at = time.time()
+                if persistence_status == "created":
+                    self.last_alert_at = time.time()
                 result_payload.update(
                     {
                         "accident_detected": True,
                         "accidentDetected": True,
                         "caseId": sqlite_case["caseId"] if sqlite_case else None,
+                        "incidentId": (sqlite_case or {}).get("incidentId"),
+                        "incidentCreated": bool((sqlite_case or {}).get("incidentCreated")),
+                        "notificationCount": int((sqlite_case or {}).get("notificationCount", 0)),
+                        "detectionMode": (sqlite_case or {}).get("detectionMode"),
+                        "reviewCaseId": (sqlite_case or {}).get("reviewCaseId"),
                         "notificationId": created_notification_id,
                         "status": sqlite_case.get("status") if sqlite_case else None,
                         "casePersistenceStatus": (
@@ -2896,6 +3430,11 @@ class LiveCameraMonitor:
                 "Crash classifier accident probability is below the UI suspicion threshold; no review case created."
             )
 
+        result_payload["accident_detected"] = result_payload["temporalCrashVerified"]
+        result_payload["accidentDetected"] = result_payload["temporalCrashVerified"]
+        if final_decision in {"candidate", "verifying"}:
+            message = "Analyzing potential collision..."
+
         # Purely additive UI metadata: never influences should_create_case /
         # evaluate_crash_case_decision above. 80%+ crashScore is a visual-only
         # warning threshold (CRASH_UI_THRESHOLD) — only persistenceReason ==
@@ -2905,7 +3444,7 @@ class LiveCameraMonitor:
         result_payload["caseCreated"] = result_payload.get("persistenceReason") == "case_created"
         # notificationId (not lastCreatedNotificationId, which persists across
         # frames) reflects whether THIS response just created a notification.
-        result_payload["notificationCreated"] = bool(result_payload.get("notificationId"))
+        result_payload["notificationCreated"] = bool(result_payload.get("notificationId") or result_payload.get("notificationCount"))
 
         log_crash_decision(
             camera_id=self.camera_id or self.monitor_key,
@@ -2922,10 +3461,26 @@ class LiveCameraMonitor:
             rejection_reason=result_payload.get("rejectionReason")
             or result_payload.get("persistenceReason"),
             case_created=result_payload["caseCreated"],
-            notification_created=bool(result_payload.get("lastCreatedNotificationId"))
-            and result_payload["caseCreated"],
+            notification_created=result_payload["notificationCreated"] and result_payload["caseCreated"],
         )
         result_payload["lastDetectionLabel"] = best_label
+
+        # Additive live-only provenance; no collision/incident fields derive
+        # from these diagnostics. Never relabel an old result with the new slot.
+        result_payload["sourceFrame"] = source_identity
+        # Detected observations retain exact pixels/coordinates. Predictions are
+        # separate continuity metadata and never enter geometry/count/hit logic.
+        result_payload["boxes"] = [dict(box) for box in tracking.boxes]
+        result_payload["predictedTracks"] = [dict(box) for box in tracking.predicted_tracks]
+        result_payload["retiredTrackIds"] = list(tracking.retired_track_ids)
+        result_payload["trackingMs"] = tracking.tracking_ms
+        result_payload["inferenceStartedAt"] = inference_started_at
+        result_payload["inferenceFinishedAt"] = time.time()
+        result_payload["modelProcessingMs"] = self.model_processing_ms
+        self.inference_completion_age_ms = (
+            (time.monotonic() - captured_monotonic) * 1000 if captured_monotonic is not None else None
+        )
+        result_payload["inferenceSourceAgeAtCompletionMs"] = self.inference_completion_age_ms
 
         with self.lock:
             self.last_checked_at = checked_at
@@ -2947,23 +3502,48 @@ class LiveCameraMonitor:
             if self.status not in {"connection-lost", "reconnecting"}:
                 self.status = status
                 self.message = message
+        with self.lock:
+            self.inference_ms = (time.perf_counter() - inference_started) * 1000
+            self.ai_timestamps.append(time.time())
         return result_payload
 
     def _detection_loop(self) -> None:
         self.detection_worker_running = True
-        interval_s = max(0.2, LIVE_CAMERA_DETECTION_INTERVAL_MS / 1000)
+        interval_s = max(0, LIVE_CAMERA_DETECTION_INTERVAL_MS / 1000)
         try:
             while self.running:
-                time.sleep(interval_s)
-                try:
-                    self.analyze_current_frame(manual=False)
-                except ValueError:
+                if self.stop_event.wait(interval_s):
+                    break
+                if not self.frame_available.wait(timeout=0.1):
                     continue
-                except Exception as error:
-                    with self.lock:
-                        self.last_error = str(error)
-                    log_stream(f"Live camera detection failed: {error}")
+                self.frame_available.clear()
+                if not self.running:
+                    break
+                with self.lock:
+                    scheduled_sequence = self.frame_seq
+                    scheduled_session = self.frame_epoch
+                def analyze_latest(
+                    session_id=scheduled_session,
+                    camera=self,
+                ):
+                    if not camera.running or camera.frame_epoch != session_id:
+                        return
+                    try:
+                        camera.analyze_current_frame(manual=False)
+                    except ValueError:
+                        return
+                    except Exception as error:
+                        with camera.lock:
+                            camera.last_error = redact_camera_text(str(error))
+                        log_stream(f"Live camera detection failed: {redact_camera_text(str(error))}")
+                live_camera_inference_scheduler.submit(
+                    self.frame_camera_id,
+                    scheduled_session,
+                    scheduled_sequence,
+                    analyze_latest,
+                )
         finally:
+            live_camera_inference_scheduler.cancel(self.frame_camera_id, self.frame_epoch)
             self.detection_worker_running = False
 
 
@@ -3030,7 +3610,17 @@ def start_live_camera_monitor(
     output_base: str,
     first_frame: np.ndarray | None = None,
 ) -> LiveCameraMonitor:
+    webcam_source = resolve_source(stream_url) if is_webcam_reference(stream_url) else None
     with LIVE_CAMERA_WORKERS_LOCK:
+        if webcam_source:
+            for candidate in set(LIVE_CAMERA_WORKERS.values()):
+                if is_webcam_reference(candidate.stream_url):
+                    try:
+                        other = resolve_source(candidate.stream_url)
+                    except ValueError:
+                        continue
+                    if other.device_index == webcam_source.device_index and candidate.camera_id != camera_id:
+                        raise ValueError("Local webcam is already assigned to another monitor.")
         keys = live_camera_worker_keys(
             camera_id=camera_id,
             camera_ip=camera_ip,
@@ -3049,7 +3639,9 @@ def start_live_camera_monitor(
             if key in LIVE_CAMERA_WORKERS
         }
         for existing in list(existing_workers):
-            if existing.running and existing.stream_url == stream_url:
+            if existing.running and existing.stream_url == stream_url and (
+                not webcam_source or existing.capture_thread is not None and existing.capture_thread.is_alive()
+            ):
                 return existing
             existing.stop()
         for key, worker in list(LIVE_CAMERA_WORKERS.items()):
@@ -3099,6 +3691,7 @@ def get_requested_or_default_monitor(camera_ip: str | None = None) -> LiveCamera
     return None
 
 
+@bounded_inference
 def image_detection_response_from_bgr(
     output_base: str,
     decoded_image: np.ndarray,
@@ -3134,7 +3727,7 @@ def image_detection_response_from_bgr(
     try:
         results = model.predict(decoded_image, verbose=False)
     except Exception as error:
-        log_fn(f"YOLO inference failed: {error}")
+        log_fn(f"YOLO inference failed: {redact_camera_text(str(error))}")
         raise HTTPException(
             status_code=500,
             detail="Image detection failed during model inference.",
@@ -3185,7 +3778,7 @@ def image_detection_response_from_bgr(
         write_succeeded = bool(cv2.imwrite(str(output_path), annotated_image))
     except Exception as error:
         write_succeeded = False
-        log_fn(f"Annotated image generation failed: {error}")
+        log_fn(f"Annotated image generation failed: {redact_camera_text(str(error))}")
 
     if write_succeeded and output_path.exists() and output_path.stat().st_size > 0:
         annotated_media_url = build_output_url_from_base(output_base, output_name)
@@ -3265,7 +3858,16 @@ def image_detection_response_from_bgr(
         cooldown_ready=cooldown_ready,
         frame_quality_status=frame_quality_status,
         quality_rejection_reason=quality_rejection_reason,
+        temporal_verified=bool(is_camera_detection and motion_valid and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS),
+        aftermath_candidate=bool(is_camera_detection and not motion_valid and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS),
+        is_static_image=not is_camera_detection,
     )
+
+    if is_camera_detection:
+        accident_detected = bool(
+            pre_temporal_positive and motion_valid
+            and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS
+        )
 
     if not should_create_case and final_decision == "duplicate_active_case" and existing_case:
         sqlite_case = dict(existing_case)
@@ -3354,6 +3956,7 @@ def image_detection_response_from_bgr(
             crash_score=best_confidence,
             consecutive_crash_hits=consecutive_positive_frames,
             route="image_detection_response_from_bgr",
+            detector_event_id=CAMERA_DECISION_TRACKER.event_id(camera_key) if is_camera_detection else None,
             source_camera=source_camera or source_file,
             area_id=case_area_id,
             camera_ip=camera_ip,
@@ -3378,10 +3981,6 @@ def image_detection_response_from_bgr(
         elif sqlite_case.get("casePersistenceStatus") != "created":
             persistence_skipped_reason = sqlite_case.get("alertBlockedReason")
             persistence_reason = "duplicate_active_case"
-        elif not sqlite_case.get("createdNotificationId"):
-            persistence_status = "failed_missing_notification"
-            persistence_skipped_reason = "Crash case was saved, but no notification id was returned."
-            persistence_reason = "backend_save_failed"
         else:
             persistence_reason = "case_created"
         if is_camera_detection and persistence_reason == "case_created":
@@ -3414,7 +4013,7 @@ def image_detection_response_from_bgr(
         final_decision=final_decision,
         rejection_reason=rejection_reason or persistence_reason,
         case_created=persistence_reason == "case_created",
-        notification_created=created_notification_id is not None,
+        notification_created=bool(created_notification_id or (sqlite_case or {}).get("notificationCount")),
     )
     if is_camera_detection:
         log_fn(
@@ -3433,6 +4032,11 @@ def image_detection_response_from_bgr(
         "accident_detected": accident_detected,
         "accidentDetected": accident_detected,
         "caseId": sqlite_case["caseId"] if sqlite_case else None,
+        "incidentId": (sqlite_case or {}).get("incidentId"),
+        "incidentCreated": bool((sqlite_case or {}).get("incidentCreated")),
+        "notificationCount": int((sqlite_case or {}).get("notificationCount", 0)),
+        "detectionMode": (sqlite_case or {}).get("detectionMode"),
+        "reviewCaseId": (sqlite_case or {}).get("reviewCaseId"),
         "notificationId": created_notification_id,
         "status": sqlite_case.get("status") if sqlite_case else None,
         "finalDecision": final_decision,
@@ -3454,7 +4058,7 @@ def image_detection_response_from_bgr(
         # creation above. Only "case_created" means a case was actually
         # persisted through the strict confirmed_crash / high_confidence_review gates.
         "caseCreated": persistence_reason == "case_created",
-        "notificationCreated": created_notification_id is not None,
+        "notificationCreated": bool(created_notification_id or (sqlite_case or {}).get("notificationCount")),
         "crashClassifierAvailable": classifier_result.get("crashClassifierAvailable"),
         "crashClassifierError": classifier_result.get("crashClassifierError"),
         "requiredThreshold": required_threshold,
@@ -3538,10 +4142,10 @@ class CameraConnectionIn(BaseModel):
 
 class CameraRecordIn(BaseModel):
     cameraId: str | None = None
-    label: str
+    label: str = "RTSP Camera"
     cameraIp: str | None = None
     streamUrl: str | None = None
-    areaId: str
+    areaId: str = "default"
     barangay: str | None = None
     roadName: str | None = None
     locationDescription: str | None = None
@@ -3630,7 +4234,7 @@ def create_video_writer(width: int, height: int, fps: float):
             if output_path.exists():
                 output_path.unlink()
         except Exception as error:
-            log_video(f"Codec {candidate['codec']} failed: {error}")
+            log_video(f"Codec {candidate['codec']} failed: {redact_camera_text(str(error))}")
             if output_path.exists():
                 output_path.unlink()
             continue
@@ -3763,8 +4367,12 @@ def api_crash_cases(
 
 @app.get("/api/crash-cases/{case_id}")
 def api_crash_case(case_id: str, request: Request):
-    require_dashboard_access(request)
+    user = require_legacy_permission(request, "incidents.view_all", "incidents.view", "incidents.view_assigned")
     case_item = get_crash_case(case_id)
+    if case_item and user["role"] == "responder" and user["uid"] not in {
+        case_item.get("assignedResponderId"), case_item.get("responderId")
+    }:
+        raise HTTPException(status_code=404, detail="Crash case not found.")
     if case_item is None:
         raise HTTPException(status_code=404, detail="Crash case not found.")
     return case_item
@@ -3772,15 +4380,26 @@ def api_crash_case(case_id: str, request: Request):
 
 @app.post("/api/crash-cases/{case_id}/actions")
 def api_crash_case_action(case_id: str, request: Request, body: CrashCaseActionIn):
-    require_dashboard_access(request)
+    permissions = {
+        "review_alert": "incidents.review", "confirm_crash": "incidents.confirm",
+        "mark_false_alarm": "incidents.false_alarm", "dispatch_help": "dispatch.assign",
+        "resolve_case": "response.resolve",
+    }
+    if body.action not in permissions:
+        raise HTTPException(status_code=400, detail="Unsupported case action.")
+    user = require_legacy_permission(request, permissions[body.action])
+    if user["role"] == "responder":
+        case = get_crash_case(case_id)
+        if not case or user["uid"] not in {case.get("assignedResponderId"), case.get("responderId")}:
+            raise HTTPException(status_code=403, detail="Case is outside your assignment scope.")
     try:
-        return apply_action(case_id, body.action, body.actorId, body.notes)
+        return apply_action(case_id, body.action, user["uid"], body.notes)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="Crash case not found.") from error
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     except sqlite3.Error as error:
-        raise HTTPException(status_code=400, detail=f"Database action failed: {error}") from error
+        raise HTTPException(status_code=400, detail=f"Database action failed: {redact_camera_text(str(error))}") from error
 
 
 @app.get("/api/analytics/summary")
@@ -3802,22 +4421,33 @@ def api_analytics_areas(request: Request):
 
 
 def validate_camera_record_payload(body: CameraRecordIn) -> None:
-    if not body.label.strip():
-        raise HTTPException(status_code=400, detail="Camera name is required.")
-    if not body.areaId.strip():
-        raise HTTPException(status_code=400, detail="Area or barangay is required.")
+    if not (body.label or "").strip():
+        body.label = "RTSP Camera"
+    if not (body.areaId or "").strip():
+        body.areaId = "default"
     if not body.cameraIp and not body.streamUrl:
-        raise HTTPException(status_code=400, detail="Either camera IP address or stream URL is required.")
+        raise HTTPException(status_code=400, detail="RTSP stream link is required.")
+    if body.cameraType == "Local Webcam" and not is_webcam_reference(body.streamUrl):
+        raise HTTPException(status_code=400, detail="A configured webcam reference is required.")
     if body.cameraIp:
         try:
             validate_camera_ip(body.cameraIp)
         except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
+            raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     if body.streamUrl:
         try:
-            validate_stream_url(body.streamUrl)
+            resolve_source(body.streamUrl, validate_stream_url)
+            if is_webcam_reference(body.streamUrl) and body.cameraIp:
+                raise ValueError("Local webcam sources cannot have a camera IP.")
+            if is_webcam_reference(body.streamUrl):
+                source = resolve_source(body.streamUrl)
+                for camera in list_cameras(include_inactive=True):
+                    if camera.get("cameraId") != body.cameraId and is_webcam_reference(camera.get("streamUrl")):
+                        other = resolve_source(camera["streamUrl"])
+                        if other.device_index == source.device_index:
+                            raise ValueError("Local webcam is already assigned to another camera.")
         except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
+            raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     if body.latitude is not None and not (-90 <= body.latitude <= 90):
         raise HTTPException(status_code=400, detail="Latitude must be between -90 and 90.")
     if body.longitude is not None and not (-180 <= body.longitude <= 180):
@@ -3837,13 +4467,13 @@ def require_camera_record_editor(request: Request, area_id: str) -> dict:
 def camera_record_payload(body: CameraRecordIn, camera_ip: str | None) -> dict:
     return {
         "cameraId": body.cameraId,
-        "label": body.label.strip(),
+        "label": (body.label or "RTSP Camera").strip(),
         "cameraIp": camera_ip,
-        "areaId": body.areaId,
-        "barangay": body.barangay or body.areaId,
+        "areaId": body.areaId or "default",
+        "barangay": body.barangay or body.areaId or "default",
         "roadName": body.roadName,
         "locationDescription": body.locationDescription,
-        "location": body.location or body.locationDescription or body.roadName,
+        "location": body.location or body.locationDescription or body.roadName or "Main Stream",
         "latitude": body.latitude,
         "longitude": body.longitude,
         "streamUrl": body.streamUrl or (build_redacted_camera_stream_label(camera_ip) if camera_ip else None),
@@ -3856,62 +4486,74 @@ def camera_record_payload(body: CameraRecordIn, camera_ip: str | None) -> dict:
 
 @app.get("/api/cameras")
 def api_cameras(request: Request):
-    user = verify_firebase_user(request)
-    if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Camera access is restricted to Administrators only.")
-    return list_cameras(
-        role=user["role"],
-        user_id=user["uid"],
-        area_id=user.get("areaId"),
-        include_inactive=True,
-    )
+    user = require_legacy_permission(request, "cameras.view")
+    return [camera_client_payload(camera) for camera in list_cameras(
+        role=user["role"], user_id=user["uid"], area_id=user.get("areaId"), include_inactive=True,
+    )]
+
+
+@app.get("/api/cameras/local-webcam-sources")
+def api_local_webcam_sources(request: Request):
+    require_camera_editor(request, "cameras.create")
+    try:
+        return [{"reference": source.reference, "name": source.friendly_name}
+                for source in load_webcam_registry().values()]
+    except ValueError:
+        return []
 
 
 @app.post("/api/cameras")
 def api_create_camera(request: Request, body: CameraRecordIn):
-    require_admin(request)
+    require_camera_editor(request, "cameras.create")
     validate_camera_record_payload(body)
     camera_ip = validate_camera_ip(body.cameraIp) if body.cameraIp else None
-    return upsert_camera(camera_record_payload(body, camera_ip))
+    return camera_client_payload(upsert_camera(camera_record_payload(body, camera_ip)))
 
 
 @app.put("/api/cameras/{camera_id}")
 def api_update_camera(camera_id: str, request: Request, body: CameraRecordIn):
-    require_admin(request)
+    require_camera_editor(request)
     existing_camera = get_camera(camera_id)
     if existing_camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
+    if body.streamUrl is None and not body.cameraIp:
+        body.streamUrl = existing_camera.get("streamUrl")
+        body.cameraIp = existing_camera.get("cameraIp")
+    body.cameraId = camera_id
     validate_camera_record_payload(body)
     body.cameraId = camera_id
     camera_ip = validate_camera_ip(body.cameraIp) if body.cameraIp else None
-    return upsert_camera(camera_record_payload(body, camera_ip))
+    return camera_client_payload(upsert_camera(camera_record_payload(body, camera_ip)))
 
 
 @app.delete("/api/cameras/{camera_id}")
 def api_delete_camera(camera_id: str, request: Request):
-    require_admin(request)
-    if get_camera(camera_id) is None:
+    require_camera_editor(request, "cameras.disable")
+    camera = get_camera(camera_id)
+    if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
+    if is_protected_camera(camera):
+        raise HTTPException(status_code=403, detail="Protected demo cameras cannot be deleted.")
     delete_camera(camera_id)
     return {"ok": True, "cameraId": camera_id, "status": "inactive"}
 
 
 @app.post("/api/cameras/{camera_id}/enable")
 def api_enable_camera(camera_id: str, request: Request):
-    require_admin(request)
+    require_camera_editor(request)
     camera = set_camera_active(camera_id, True)
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
-    return camera
+    return camera_client_payload(camera)
 
 
 @app.post("/api/cameras/{camera_id}/disable")
 def api_disable_camera(camera_id: str, request: Request):
-    require_admin(request)
+    require_camera_editor(request, "cameras.disable")
     camera = set_camera_active(camera_id, False)
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
-    return camera
+    return camera_client_payload(camera)
 
 
 @app.post("/api/camera-assignments")
@@ -3932,12 +4574,16 @@ def api_assign_camera(request: Request, body: CameraAssignmentIn):
 
 @app.get("/api/cameras/{camera_id}")
 def api_camera_by_id(camera_id: str, request: Request):
-    _, camera = require_camera_access(request, camera_id)
-    return camera
+    require_legacy_permission(request, "cameras.view")
+    camera = get_camera(camera_id)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    return camera_client_payload(camera)
 
 
 @app.get("/api/incidents")
-def get_incidents():
+def get_incidents(request: Request):
+    require_legacy_permission(request, "incidents.view_all", "incidents.view")
     try:
         db_cases = list_crash_cases(limit=100)
         if db_cases:
@@ -3959,22 +4605,13 @@ def get_incidents():
                 for case in db_cases
             ]
     except Exception as error:
-        print(f"[incidents] Failed to query SQLite crash cases: {error}")
+        print(f"[incidents] Failed to query SQLite crash cases: {redact_camera_text(str(error))}")
     return incidents[::-1]
 
 
 @app.get("/api/notifications")
 def get_notifications(request: Request):
-    user = None
-    try:
-        user = verify_firebase_user(request)
-    except HTTPException as error:
-        header = request.headers.get("authorization", "")
-        if header.lower().startswith("bearer "):
-            raise error
-
-    if user and user.get("role") == "user":
-        raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
+    user = require_legacy_permission(request, "notifications.view_own")
 
     local_notifications = list_notifications(
         role=user.get("role") if user else None,
@@ -4011,6 +4648,10 @@ def api_archive_notification(notification_id: str, request: Request):
     user = require_dashboard_access(request)
     if user["role"] not in {"admin", "responder"}:
         raise HTTPException(status_code=403, detail="Responder or admin access is required.")
+    if user["role"] == "responder":
+        own = list_notifications(role="responder", responder_id=user["uid"], area_id=user.get("areaId"))
+        if not any(item.get("notificationId") == notification_id and item.get("responderId") == user["uid"] for item in own):
+            raise HTTPException(status_code=404, detail="Notification not found.")
     if not archive_notification(notification_id):
         raise HTTPException(status_code=404, detail="Notification not found.")
     return {"notificationId": notification_id, "archived": True}
@@ -4031,9 +4672,7 @@ def api_debug_create_camera_alert(request: Request, body: DebugCameraAlertIn):
             status_code=403,
             detail="Debug camera alerts are disabled. Set ENABLE_DEBUG_CAMERA_ALERT=true to enable.",
         )
-    user = require_dashboard_access(request)
-    if user["role"] not in {"admin", "responder"}:
-        raise HTTPException(status_code=403, detail="Responder or admin access is required.")
+    user = require_legacy_permission(request, "ai_settings.manage")
 
     created_at = datetime.now().isoformat()
     camera_id = (body.cameraId or "DEVICE-LIVE-CAMERA").strip() or "DEVICE-LIVE-CAMERA"
@@ -4138,7 +4777,7 @@ def api_debug_create_camera_alert(request: Request, body: DebugCameraAlertIn):
 
 
 @app.post("/api/detect/image")
-async def detect_image(
+def detect_image(
     request: Request,
     file: UploadFile = File(...),
     triggerStatus: str | None = Form(default=None),
@@ -4149,6 +4788,7 @@ async def detect_image(
     cameraIp: str | None = Form(default=None),
     location: str | None = Form(default=None),
 ):
+    require_legacy_permission(request, "cameras.monitor")
     file_path = None
     try:
         if file is None:
@@ -4179,8 +4819,8 @@ async def detect_image(
         try:
             decoded_image = decode_uploaded_image(file_path)
         except ValueError as error:
-            log_image(f"Image decode failed: {error}")
-            raise HTTPException(status_code=400, detail=str(error)) from error
+            log_image(f"Image decode failed: {redact_camera_text(str(error))}")
+            raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
 
         log_image(
             "Image decoded successfully "
@@ -4190,6 +4830,8 @@ async def detect_image(
         output_base = str(request.base_url).rstrip("/")
         is_camera_detection = triggerStatus == "camera_detection"
         request_user = optional_request_user(request)
+        if cameraId:
+            require_camera_access(request, cameraId)
         user_area_id = request_user.get("areaId") if request_user else None
         effective_area_id = areaId or (user_area_id if is_camera_detection else None)
         if is_camera_detection and not effective_area_id:
@@ -4227,15 +4869,15 @@ async def detect_image(
     except HTTPException:
         raise
     except Exception as error:
-        log_image(f"Detection error: {error}")
-        raise HTTPException(status_code=500, detail=f"Image detection failed: {error}")
+        log_image(f"Detection error: {redact_camera_text(str(error))}")
+        raise HTTPException(status_code=500, detail=f"Image detection failed: {redact_camera_text(str(error))}")
 
 
 def _detect_stream_frame_sync(base_url: str, body: StreamFrameIn) -> dict:
     try:
         stream_url, fallback_label, camera_ip = resolve_camera_stream_source(body)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
 
     label = body.label or fallback_label
     location = body.location or body.areaId or "Authorized Camera"
@@ -4244,26 +4886,13 @@ def _detect_stream_frame_sync(base_url: str, body: StreamFrameIn) -> dict:
         camera_id = f"STREAM-{hashlib.sha1(body.url.strip().encode('utf-8')).hexdigest()[:10].upper()}"
     log_stream(f"Capturing frame from stream source={label}")
     try:
-        frame = grab_frame_from_stream_url(stream_url)
+        frame = grab_saved_camera_frame(body.cameraId, stream_url) if is_webcam_reference(stream_url) else grab_frame_from_stream_url(stream_url)
     except ValueError as error:
-        log_stream(f"Stream open/read failed: {error}")
+        log_stream(f"Stream open/read failed: {redact_camera_text(str(error))}")
         raise HTTPException(
             status_code=400,
             detail="Unable to connect. Check that RTSP is enabled, the camera account is correct, and the camera is on the same network.",
         ) from error
-
-    upsert_camera(
-        {
-            "cameraId": camera_id,
-            "label": label,
-            "cameraIp": camera_ip,
-            "areaId": body.areaId or "demo",
-            "location": location,
-            "streamUrl": build_redacted_camera_stream_label(camera_ip) if camera_ip else body.url,
-            "cameraType": body.cameraType or "Tapo RTSP",
-            "status": "connected",
-        }
-    )
 
     return image_detection_response_from_bgr(
         base_url,
@@ -4287,49 +4916,14 @@ def _detect_stream_frame_sync(base_url: str, body: StreamFrameIn) -> dict:
 def _test_camera_connection_sync(body: CameraConnectionIn, output_base: str) -> dict:
     try:
         stream_url, fallback_label, camera_ip = resolve_camera_stream_source(body)
-        frame = grab_frame_from_stream_url(stream_url)
+        frame = grab_saved_camera_frame(body.cameraId, stream_url) if is_webcam_reference(stream_url) else grab_frame_from_stream_url(stream_url)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
 
-    label = body.label or fallback_label
-    location = body.location or body.areaId or "Authorized Camera"
-    camera = upsert_camera(
-        {
-            "cameraId": body.cameraId,
-            "label": label,
-            "cameraIp": camera_ip,
-            "areaId": body.areaId,
-            "barangay": body.areaId,
-            "location": location,
-            "streamUrl": build_redacted_camera_stream_label(camera_ip),
-            "cameraType": "Tapo RTSP",
-            "status": "connected",
-        }
-    )
-    worker = start_live_camera_monitor(
-        camera_id=camera["cameraId"],
-        camera_ip=camera_ip,
-        stream_url=stream_url,
-        label=label,
-        area_id=body.areaId,
-        barangay=camera.get("barangay"),
-        road_name=camera.get("roadName"),
-        latitude=camera.get("latitude"),
-        longitude=camera.get("longitude"),
-        location=location,
-        redacted_stream_url=build_redacted_camera_stream_label(camera_ip),
-        output_base=output_base,
-        first_frame=frame,
-    )
     return {
-        "connected": True,
-        "cameraId": camera["cameraId"],
-        "cameraIp": camera_ip,
-        "label": label,
-        "width": int(frame.shape[1]),
-        "height": int(frame.shape[0]),
-        "status": worker.snapshot_status()["status"],
-        "message": "Live monitoring started.",
+        "connected": True, "cameraId": body.cameraId, "cameraIp": camera_ip,
+        "label": body.label or fallback_label, "width": int(frame.shape[1]),
+        "height": int(frame.shape[0]), "status": "connected", "message": "Connection verified.",
     }
 
 
@@ -4345,18 +4939,24 @@ def api_save_camera_settings(request: Request, body: CameraSettingsIn):
     try:
         return save_camera_config(body)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
 
 
 @app.post("/api/cameras/test-connection")
 async def api_test_camera_connection(request: Request, body: CameraConnectionIn):
-    user = verify_firebase_user(request)
-    if user["role"] not in {"admin", "responder"}:
-        raise HTTPException(status_code=403, detail="Responder or admin access is required.")
-    if body.cameraId:
+    require_camera_editor(request, "cameras.update" if body.cameraId else "cameras.create")
+    if is_webcam_reference(body.url):
+        if not body.cameraId:
+            raise HTTPException(status_code=400, detail="A saved cameraId is required for local webcam access.")
+        _, saved = require_camera_access(request, body.cameraId)
+        body.url, body.cameraIp = resolve_saved_camera_stream(saved)
+    if body.cameraId and not body.url and not body.cameraIp:
         camera = get_camera(body.cameraId)
-        if camera and not can_access_camera(user, camera):
-            raise HTTPException(status_code=403, detail="You are not authorized to access this camera.")
+        if camera is None:
+            raise HTTPException(status_code=404, detail="Camera not found.")
+        if is_webcam_reference(camera.get("streamUrl")):
+            require_camera_access(request, body.cameraId)
+        body.url, _ = resolve_saved_camera_stream(camera)
     try:
         output_base = str(request.base_url).rstrip("/")
         return await asyncio.to_thread(_test_camera_connection_sync, body, output_base)
@@ -4396,10 +4996,15 @@ def monitor_for_camera(camera: dict) -> LiveCameraMonitor | None:
 def require_camera_stream_access(request: Request, camera: dict) -> dict:
     token = (request.query_params.get("token") or "").strip()
     if token:
-        user = verify_camera_stream_token(token, camera["cameraId"])
-        if not can_access_camera(user, camera):
-            raise HTTPException(status_code=403, detail="You are not authorized to access this camera.")
-        return user
+        try:
+            user = verify_camera_stream_token(token, camera["cameraId"])
+            if not can_access_camera(user, camera):
+                raise HTTPException(status_code=403, detail="You are not authorized to access this camera.")
+            return user
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
     user = verify_firebase_user(request)
     if not can_access_camera(user, camera):
@@ -4434,45 +5039,81 @@ def resolve_saved_camera_stream(camera: dict) -> tuple[str, str | None]:
         return build_tapo_rtsp_url(camera_ip), camera_ip
     stream_url = (camera.get("streamUrl") or "").strip()
     if stream_url:
-        validate_stream_url(stream_url)
+        resolve_source(stream_url, validate_stream_url)
         return stream_url, None
     raise ValueError("Camera stream is not configured.")
+
+
+def grab_saved_camera_frame(camera_id: str | None, reference: str) -> np.ndarray:
+    """Saved webcam acquisition; active monitoring owns the only device reader."""
+    if not camera_id:
+        raise ValueError("A saved cameraId is required for local webcam access.")
+    camera = get_camera(camera_id)
+    if camera is None or camera.get("isActive") is False:
+        raise ValueError("Camera is unavailable.")
+    saved_reference, _ = resolve_saved_camera_stream(camera)
+    if saved_reference != reference:
+        raise ValueError("Camera source does not match the saved camera.")
+    source = resolve_source(reference)
+    with LIVE_CAMERA_WORKERS_LOCK:
+        worker = monitor_for_camera(camera)
+        if worker is not None:
+            if worker.camera_id != camera_id or worker.stream_url != reference:
+                raise ValueError("Local webcam is owned by another camera.")
+            with worker.lock:
+                if worker.latest_frame is None or worker.last_frame_monotonic is None or time.monotonic() - worker.last_frame_monotonic > LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS:
+                    raise ValueError("Local webcam has no fresh frame.")
+                frame = worker.latest_frame
+            return frame.copy()
+        cap = open_webcam(source)
+        try:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise ValueError("Local webcam unavailable or busy.")
+            return frame
+        finally:
+            cap.release()
 
 
 @app.post("/api/cameras/{camera_id}/monitor/start")
 async def api_start_camera_monitor(camera_id: str, request: Request):
     _, camera = require_camera_access(request, camera_id)
-    if not camera.get("isActive"):
+    if camera.get("isActive") is False:
         raise HTTPException(status_code=400, detail="Camera is inactive.")
-    if not camera.get("detectionEnabled"):
+    if camera.get("detectionEnabled") is False:
         raise HTTPException(status_code=400, detail="Detection is disabled for this camera.")
     try:
         stream_url, camera_ip = resolve_saved_camera_stream(camera)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
+    frame = None
+    if not is_webcam_reference(stream_url):
+        try:
+            frame = await asyncio.to_thread(grab_frame_from_stream_url, stream_url)
+        except Exception:
+            pass
     try:
-        frame = await asyncio.to_thread(grab_frame_from_stream_url, stream_url)
+        worker = start_live_camera_monitor(
+            camera_id=camera["cameraId"],
+            camera_ip=camera_ip,
+            stream_url=stream_url,
+            label=camera["label"],
+            area_id=camera.get("areaId"),
+            barangay=camera.get("barangay"),
+            road_name=camera.get("roadName"),
+            latitude=camera.get("latitude"),
+            longitude=camera.get("longitude"),
+            location=camera.get("location") or camera.get("locationDescription") or camera.get("roadName") or camera["label"],
+            redacted_stream_url=(
+                build_redacted_camera_stream_label(camera_ip)
+                if camera_ip
+                else stream_source_label(stream_url)
+            ),
+            output_base=str(request.base_url).rstrip("/"),
+            first_frame=frame,
+        )
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    worker = start_live_camera_monitor(
-        camera_id=camera["cameraId"],
-        camera_ip=camera_ip,
-        stream_url=stream_url,
-        label=camera["label"],
-        area_id=camera.get("areaId"),
-        barangay=camera.get("barangay"),
-        road_name=camera.get("roadName"),
-        latitude=camera.get("latitude"),
-        longitude=camera.get("longitude"),
-        location=camera.get("location") or camera.get("locationDescription") or camera.get("roadName") or camera["label"],
-        redacted_stream_url=(
-            build_redacted_camera_stream_label(camera_ip)
-            if camera_ip
-            else stream_source_label(stream_url)
-        ),
-        output_base=str(request.base_url).rstrip("/"),
-        first_frame=frame,
-    )
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     upsert_camera({
         **camera,
         "cameraIp": camera_ip,
@@ -4482,7 +5123,7 @@ async def api_start_camera_monitor(camera_id: str, request: Request):
         "detectionEnabled": True,
         "updatedAt": datetime.now().isoformat(),
     })
-    return worker.snapshot_status()
+    return public_camera_data(worker.snapshot_status())
 
 
 @app.post("/api/cameras/{camera_id}/stream-token")
@@ -4522,15 +5163,18 @@ def api_live_camera_status(camera_identifier: str, request: Request):
             "previewAvailable": False,
             "latestResult": None,
         }
-    return worker.snapshot_status()
+    return public_camera_data(worker.snapshot_status())
 
 
 @app.get("/api/camera/status")
-def api_live_camera_status_default(cameraIp: str | None = None):
+def api_live_camera_status_default(request: Request, cameraIp: str | None = None):
+    user = require_legacy_permission(request, "cameras.monitor")
+    if not can_access_camera(user, {}):
+        raise HTTPException(status_code=403, detail="Camera permission denied.")
     try:
         worker = get_requested_or_default_monitor(cameraIp)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     if worker is None:
         return {
             "cameraConnected": False,
@@ -4550,7 +5194,7 @@ def api_live_camera_status_default(cameraIp: str | None = None):
         }
     status = worker.snapshot_status()
     status["lastFrameAt"] = status.get("lastFrameTimestamp")
-    return status
+    return public_camera_data(status)
 
 
 @app.get("/api/cameras/{camera_identifier}/latest-frame.jpg")
@@ -4562,13 +5206,17 @@ def api_live_camera_latest_frame(camera_identifier: str, request: Request):
     worker = monitor_for_camera(camera)
     if worker is None:
         raise HTTPException(status_code=404, detail="Camera is not connected.")
-    image_bytes = worker.latest_jpeg()
+    image_bytes, frame_headers = worker.latest_preview_packet()
     if image_bytes is None:
         raise HTTPException(status_code=404, detail="No camera frame is available yet.")
     return Response(
         content=image_bytes,
         media_type="image/jpeg",
-        headers={"Cache-Control": "no-store"},
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            **frame_headers,
+        },
     )
 
 
@@ -4614,7 +5262,7 @@ def api_live_camera_preview_mjpeg_head(camera_identifier: str, request: Request)
 
 
 @app.get("/api/cameras/{camera_identifier}/events")
-def api_live_camera_events(camera_identifier: str, request: Request):
+def api_live_camera_events(camera_identifier: str, request: Request, boxes_only: bool = False):
     camera = resolve_camera_identifier(camera_identifier)
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
@@ -4623,10 +5271,22 @@ def api_live_camera_events(camera_identifier: str, request: Request):
     if worker is None:
         raise HTTPException(status_code=404, detail="Camera is not connected.")
     return StreamingResponse(
-        worker.detection_events(),
+        worker.detection_events(boxes_only=boxes_only),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/cameras/{camera_identifier}/analysis-packet")
+def api_live_camera_analysis_packet(camera_identifier: str, request: Request):
+    camera = resolve_camera_identifier(camera_identifier)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    require_camera_stream_access(request, camera)
+    worker = monitor_for_camera(camera)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Camera is not connected.")
+    return JSONResponse({"packet": worker.latest_box_packet()}, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/cameras/{camera_identifier}/test-detection")
@@ -4643,21 +5303,24 @@ def api_live_camera_test_detection(camera_identifier: str, request: Request):
     try:
         return worker.analyze_current_frame(manual=True)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     except Exception as error:
-        log_stream(f"Manual live camera detection failed: {error}")
+        log_stream(f"Manual live camera detection failed: {redact_camera_text(str(error))}")
         raise HTTPException(
             status_code=500,
-            detail=f"Manual live camera detection failed: {error}",
+            detail=f"Manual live camera detection failed: {redact_camera_text(str(error))}",
         ) from error
 
 
 @app.post("/api/camera/test-detection")
-def api_live_camera_test_detection_default(cameraIp: str | None = None):
+def api_live_camera_test_detection_default(request: Request, cameraIp: str | None = None):
+    user = require_legacy_permission(request, "cameras.monitor")
+    if not can_access_camera(user, {}):
+        raise HTTPException(status_code=403, detail="Camera permission denied.")
     try:
         worker = get_requested_or_default_monitor(cameraIp)
     except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(status_code=400, detail=redact_camera_text(str(error))) from error
     if worker is None:
         return {
             "frameAvailable": False,
@@ -4678,15 +5341,15 @@ def api_live_camera_test_detection_default(cameraIp: str | None = None):
             "frameAvailable": False,
             "confidence": None,
             "result": "No frame",
-            "error": str(error),
+            "error": redact_camera_text(str(error)),
         }
     except Exception as error:
-        log_stream(f"Manual live camera detection failed: {error}")
+        log_stream(f"Manual live camera detection failed: {redact_camera_text(str(error))}")
         return {
             "frameAvailable": True,
             "confidence": None,
             "result": "Detection error",
-            "error": str(error),
+            "error": redact_camera_text(str(error)),
         }
 
 
@@ -4696,20 +5359,31 @@ async def detect_stream_frame(request: Request, body: StreamFrameIn):
     Grab one frame from an RTSP / HTTP(S) stream and run the same YOLO
     pipeline as uploaded images (used for CCTV-style monitoring from the UI).
     """
+    user = require_legacy_permission(request, "cameras.monitor")
+    if not body.cameraId:
+        raise HTTPException(status_code=400, detail="A saved cameraId is required.")
+    _, camera = require_camera_access(request, body.cameraId)
+    body.url, _ = resolve_saved_camera_stream(camera)
+    body.cameraIp = None
+    body.label = camera.get("label")
+    body.areaId = camera.get("areaId")
+    body.location = camera.get("location")
     base_url = str(request.base_url).rstrip("/")
     try:
         return await asyncio.to_thread(_detect_stream_frame_sync, base_url, body)
     except HTTPException:
         raise
     except Exception as error:
-        log_stream(f"Detection error: {error}")
+        log_stream(f"Detection error: {redact_camera_text(str(error))}")
         raise HTTPException(
-            status_code=500, detail=f"Stream frame detection failed: {error}"
+            status_code=500, detail=f"Stream frame detection failed: {redact_camera_text(str(error))}"
         ) from error
 
 
 @app.post("/api/detect/video")
-async def detect_video(request: Request, file: UploadFile = File(...)):
+@bounded_inference
+def detect_video(request: Request, file: UploadFile = File(...)):
+    require_legacy_permission(request, "cameras.monitor")
     file_path = None
     cap = None
     writer = None
@@ -4957,7 +5631,7 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
                 wrote = bool(cv2.imwrite(str(key_path), best_key_frame))
             except Exception as error:
                 wrote = False
-                log_video(f"Key frame write failed: {error}")
+                log_video(f"Key frame write failed: {redact_camera_text(str(error))}")
 
             if wrote and key_path.exists() and key_path.stat().st_size > 0:
                 annotated_key_frame_url = build_output_url(request, key_name)
@@ -5022,6 +5696,13 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
         # the raw classifier signal for the crashClass field in the response.
         raw_crash_class = "accident" if accident_detected else "non_accident"
 
+        video_temporal_verified = bool(
+            gating_motion_valid and max_crash_positive_streak >= LIVE_CAMERA_REQUIRED_HITS
+        )
+        video_aftermath_candidate = bool(
+            max_crash_positive_streak >= LIVE_CAMERA_REQUIRED_HITS and not gating_motion_valid
+        )
+
         should_create_case, rejection_reason, final_decision = evaluate_crash_case_decision(
             crash_class=raw_crash_class,
             crash_confidence=best_confidence,
@@ -5034,6 +5715,9 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
             cooldown_ready=True,
             frame_quality_status=gating_frame_quality_status,
             quality_rejection_reason=gating_quality_rejection_reason,
+            temporal_verified=video_temporal_verified,
+            aftermath_candidate=video_aftermath_candidate,
+            is_static_image=False,
         )
         if not should_create_case:
             persistence_status = "skipped"
@@ -5099,10 +5783,6 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
             elif sqlite_case.get("casePersistenceStatus") != "created":
                 persistence_skipped_reason = sqlite_case.get("alertBlockedReason")
                 persistence_reason = "duplicate_active_case"
-            elif not sqlite_case.get("createdNotificationId"):
-                persistence_status = "failed_missing_notification"
-                persistence_skipped_reason = "Crash case was saved, but no notification id was returned."
-                persistence_reason = "backend_save_failed"
             else:
                 persistence_reason = "case_created"
 
@@ -5132,7 +5812,7 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
             final_decision=final_decision,
             rejection_reason=rejection_reason or persistence_reason,
             case_created=persistence_reason == "case_created",
-            notification_created=created_notification_id is not None,
+            notification_created=bool(created_notification_id or (sqlite_case or {}).get("notificationCount")),
         )
 
         return {
@@ -5140,6 +5820,11 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
             "accident_detected": accident_detected,
             "accidentDetected": accident_detected,
             "caseId": sqlite_case["caseId"] if sqlite_case else None,
+            "incidentId": (sqlite_case or {}).get("incidentId"),
+            "incidentCreated": bool((sqlite_case or {}).get("incidentCreated")),
+            "notificationCount": int((sqlite_case or {}).get("notificationCount", 0)),
+            "detectionMode": (sqlite_case or {}).get("detectionMode"),
+            "reviewCaseId": (sqlite_case or {}).get("reviewCaseId"),
             "notificationId": created_notification_id,
             "confidence": best_confidence,
             "lastConfidence": best_confidence,
@@ -5160,7 +5845,7 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
             # creation above. Only "case_created" means a case was actually
             # persisted through the strict confirmed_crash / high_confidence_review gates.
             "caseCreated": persistence_reason == "case_created",
-            "notificationCreated": created_notification_id is not None,
+            "notificationCreated": bool(created_notification_id or (sqlite_case or {}).get("notificationCount")),
             "uiThreshold": CRASH_UI_CONFIDENCE_THRESHOLD,
             "caseThreshold": CRASH_CASE_CONFIDENCE_THRESHOLD,
             "vehicleCount": gating_vehicle_count,
@@ -5198,8 +5883,8 @@ async def detect_video(request: Request, file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as error:
-        log_video(f"Detection error: {error}")
-        raise HTTPException(status_code=500, detail=f"Video detection failed: {error}")
+        log_video(f"Detection error: {redact_camera_text(str(error))}")
+        raise HTTPException(status_code=500, detail=f"Video detection failed: {redact_camera_text(str(error))}")
     finally:
         if cap is not None:
             cap.release()

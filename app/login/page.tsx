@@ -3,10 +3,11 @@
 import { FormEvent, useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
+import { Eye, EyeOff, ShieldCheck } from 'lucide-react'
 import { useAuth } from '@/components/auth-provider'
-import { isDashboardRole } from '@/lib/auth-profile'
-import { loginWithSQLite } from '@/lib/api-client'
-import { storeAuthToken } from '@/lib/session-auth'
+import { getCurrentPostgresUser, loginWithPostgres } from '@/lib/api-client'
+import { authenticateAndResolveSession, formatLoginError } from '@/lib/login-lifecycle'
+import { homeForRole } from '@/lib/role-routing'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -20,30 +21,16 @@ export default function LoginPage() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
-
-  const formatLoginError = (loginError: unknown) => {
-    const message = loginError instanceof Error ? loginError.message : ''
-
-    if (message.includes('Invalid email or password') || message.includes('401')) {
-      return 'Invalid email or password. Please check the account and try again.'
-    }
-
-    if (message.includes('Could not reach') || message.includes('Failed to fetch')) {
-      return 'Could not reach the backend login service. Make sure FastAPI is running.'
-    }
-
-    return message || 'Login failed. Please try again.'
-  }
+  const [showPassword, setShowPassword] = useState(false)
 
   useEffect(() => {
     if (loading || !firebaseUser || !profile) return
 
-    if (isDashboardRole(profile.role)) {
-      router.replace('/dashboard')
+    if (profile.mustChangePassword) {
+      router.replace('/change-password')
       return
     }
-
-    router.replace('/samples')
+    router.replace(homeForRole(profile.role))
   }, [firebaseUser, loading, profile, router])
 
   useEffect(() => {
@@ -57,25 +44,12 @@ export default function LoginPage() {
     setSubmitting(true)
 
     try {
-      const response = await loginWithSQLite(email, password)
-      storeAuthToken(response.token)
-      setSessionUser(response.user)
-
-      if (!response.user.active) {
-        throw new Error('This account is inactive.')
-      }
-
-      if (response.user.role === 'user') {
-        router.replace('/samples')
-        return
-      }
-
-      if (isDashboardRole(response.user.role)) {
-        router.replace('/dashboard')
-        return
-      }
-
-      throw new Error('This account role is not supported. Ask an admin to update this account.')
+      const { user, destination } = await authenticateAndResolveSession(email, password, {
+        login: loginWithPostgres,
+        currentUser: getCurrentPostgresUser,
+      })
+      setSessionUser(user)
+      router.replace(destination)
     } catch (submitError) {
       setError(formatLoginError(submitError))
     } finally {
@@ -84,12 +58,13 @@ export default function LoginPage() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-4">
-      <Card className="w-full max-w-md border border-border bg-card/70 p-6">
-        <div className="mb-6 space-y-1 text-center">
-          <h1 className="text-2xl font-bold">CrashGuard Login</h1>
+    <main className="login-light flex min-h-screen items-center justify-center bg-background px-4 py-10 text-foreground">
+      <Card className="w-full max-w-md border border-border bg-card p-6 shadow-xl shadow-slate-200/60 sm:p-8">
+        <div className="mb-7 space-y-2 text-center">
+          <div className="mx-auto flex size-12 items-center justify-center rounded-xl bg-primary text-primary-foreground"><ShieldCheck className="size-6" /></div>
+          <h1 className="text-2xl font-bold tracking-tight">CrashGuard</h1>
           <p className="text-sm text-muted-foreground">
-            Sign in as admin or assigned barangay responder.
+            Secure emergency operations and incident coordination.
           </p>
         </div>
 
@@ -108,14 +83,20 @@ export default function LoginPage() {
 
           <div className="space-y-2">
             <Label htmlFor="password">Password</Label>
-            <Input
-              id="password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              required
-            />
+            <div className="relative">
+              <Input
+                id="password"
+                type={showPassword ? 'text' : 'password'}
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                className="pr-10"
+                required
+              />
+              <Button type="button" variant="ghost" size="icon-sm" className="absolute right-1 top-1/2 -translate-y-1/2" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)}>
+                {showPassword ? <EyeOff /> : <Eye />}
+              </Button>
+            </div>
           </div>
 
           {error ? (
@@ -125,7 +106,7 @@ export default function LoginPage() {
           ) : null}
 
           <Button type="submit" className="w-full" disabled={submitting}>
-            {submitting ? 'Signing in...' : 'Sign in'}
+            {submitting ? 'Signing in…' : 'Sign in'}
           </Button>
 
           <Button asChild type="button" variant="outline" className="w-full">
@@ -133,10 +114,7 @@ export default function LoginPage() {
           </Button>
 
           <p className="text-center text-sm text-muted-foreground">
-            Need an account?{' '}
-            <Link href="/register" className="font-medium text-primary underline-offset-4 hover:underline">
-              Register
-            </Link>
+            Accounts are issued by a CrashGuard administrator.
           </p>
         </form>
       </Card>

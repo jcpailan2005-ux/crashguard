@@ -12,7 +12,7 @@ import {
   Square,
   X,
 } from 'lucide-react'
-import { CctvVideoOverlay } from '@/components/cctv-video-overlay'
+import { CctvVideoOverlay, SynchronizedAnalysisPreview } from '@/components/cctv-video-overlay'
 import { DetectedMediaViewer } from '@/components/detected-media-viewer'
 import {
   DetectionHistoryEntry,
@@ -26,7 +26,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/components/auth-provider'
-import { playAccidentAlert } from '@/lib/accident-alert'
+import { armAccidentAlertAudio, playAccidentAlert } from '@/lib/accident-alert'
 import { APP_CONFIG } from '@/lib/app-config'
 import {
   createCameraStreamAccess,
@@ -42,6 +42,10 @@ import {
 } from '@/lib/api-client'
 import { useDisplayMode } from '@/lib/display-mode'
 import { DetectionBox, DetectionResponse } from '@/lib/types'
+import {
+  isCurrentCrashConfirmed,
+  liveAlarmTracker,
+} from '@/lib/incident-alarm-contract'
 
 interface LiveCameraProps {
   detectionIntervalMs?: number
@@ -75,13 +79,10 @@ interface LiveCameraProps {
 const MEANINGFUL_CONFIDENCE_THRESHOLD =
   APP_CONFIG.detection.meaningfulConfidenceThreshold
 const CRASH_ALERT_REQUIRED_THRESHOLD = 0.2
-const ALERT_DEBOUNCE_MS = APP_CONFIG.detection.alertDebounceMs
 const CRASH_ALERT_VISIBLE_MS = 60_000
 const DEVICE_DETECTION_INTERVAL_MS = 1800
 const CCTV_DETECTION_INTERVAL_MS = 2500
 const STABLE_CRASH_WINDOW_SIZE = 3
-const STABLE_CRASH_REQUIRED_HITS = 2
-const STABLE_CRASH_MIN_DURATION_MS = 2000
 const STABLE_CLEAR_REQUIRED_MISSES = 3
 const BOX_HOLD_MS = 4000
 const CCTV_FIRST_FRAME_TIMEOUT_MS = 15_000
@@ -277,9 +278,7 @@ function buildDisplayResult(result: DetectionResponse): DetectionResponse {
     })
     .filter((d): d is NonNullable<typeof d> => Boolean(d))
 
-  const derivedAccidentDetected =
-    result.accident_detected ||
-    projectDetections.some((d) => d.label.toLowerCase() === 'accident')
+  const derivedAccidentDetected = result.accident_detected
 
   if (derivedAccidentDetected && projectDetections.length === 0) {
     return {
@@ -414,6 +413,15 @@ function getReviewCaseId(result: DetectionResponse): string | null {
 function getCrashAlertKind(result: DetectionResponse): CrashAlertKind {
   const persistenceStatus = getPersistenceStatus(result)
   const reviewCaseId = getReviewCaseId(result)
+  const incidentCreated = result.incident_created === true || result.incidentCreated === true
+
+  if (reviewCaseId && incidentCreated && persistenceStatus !== 'blocked_existing_case') {
+    return 'created'
+  }
+
+  if (persistenceStatus === 'blocked_existing_case') {
+    return 'blocked'
+  }
 
   if (!hasPassedCrashAlertThreshold(result)) {
     return 'skipped'
@@ -421,10 +429,6 @@ function getCrashAlertKind(result: DetectionResponse): CrashAlertKind {
 
   if (reviewCaseId && persistenceStatus !== 'blocked_existing_case') {
     return 'created'
-  }
-
-  if (persistenceStatus === 'blocked_existing_case') {
-    return 'blocked'
   }
 
   return 'skipped'
@@ -447,14 +451,17 @@ function getCrashAlertStatusText(alert: CrashAlertState): string {
   const withThreshold = (message: string) =>
     thresholdLine ? `${message} ${thresholdLine}` : message
 
+  if (alert.kind === 'created') {
+    if (alert.result.detectionMode === 'aftermath_review' || alert.result.detection_mode === 'aftermath_review') {
+      return 'Possible crash aftermath saved for human review. Impact was not observed.'
+    }
+    return 'Temporally verified collision saved. Review case created.'
+  }
+
   if (!hasPassedCrashAlertThreshold(alert.result)) {
     return withThreshold(
       'Detection did not create alert because confidence is below the required 20% threshold.'
     )
-  }
-
-  if (alert.kind === 'created') {
-    return withThreshold('Crash detection saved. Review case created.')
   }
 
   if (alert.kind === 'blocked') {
@@ -485,6 +492,9 @@ function getCrashAlertStatusText(alert: CrashAlertState): string {
 function getCrashAlertTitle(alert: CrashAlertState): string {
   if (alert.kind === 'blocked') return 'Active Crash Case Exists'
   if (alert.kind === 'skipped') return 'Crash Detection Not Saved'
+  if (alert.result.detectionMode === 'aftermath_review' || alert.result.detection_mode === 'aftermath_review') {
+    return 'Possible Crash Aftermath'
+  }
   return 'Crash Detected'
 }
 
@@ -517,8 +527,6 @@ export function LiveCamera({
   const requestInFlightRef = useRef(false)
   const detectionEnabledRef = useRef(false)
   const autoStartDetectionRef = useRef(false)
-  const lastAlertTimestampRef = useRef(0)
-  const lastAlertSignatureRef = useRef('')
   const lastHistorySignatureRef = useRef('')
   const lastHistoryTimestampRef = useRef(0)
   const sourceTabRef = useRef<'device' | 'cctv'>(initialSourceTab)
@@ -528,10 +536,11 @@ export function LiveCamera({
   const cctvPreviewUrlRef = useRef<string | null>(null)
   const cctvAutoStartAttemptedKeyRef = useRef('')
   const cctvAutoStartSuppressedRef = useRef(false)
+  const cctvRecoveryInFlightRef = useRef(false)
+  const cctvLastRecoveryAtRef = useRef(0)
   const cctvStartedAtRef = useRef<number | null>(null)
   const cctvLastFrameAtRef = useRef<number | null>(null)
   const detectionSamplesRef = useRef<LiveDetectionSample[]>([])
-  const crashRunStartedAtRef = useRef<number | null>(null)
   const boxHoldUntilRef = useRef(0)
   const dismissedCrashAlertIdsRef = useRef<Set<string>>(new Set())
 
@@ -552,6 +561,8 @@ export function LiveCamera({
   const [cctvFrameError, setCctvFrameError] = useState('')
   const [cctvPreviewUrl, setCctvPreviewUrl] = useState<string | null>(null)
   const [cctvMjpegUrl, setCctvMjpegUrl] = useState<string | null>(null)
+  const [boxSource, setBoxSource] = useState<{ cameraId: string; eventsUrl: string | null } | null>(null)
+  const [mjpegFailed, setMjpegFailed] = useState(false)
   const [isCctvLive, setIsCctvLive] = useState(false)
   const [overlaySourceSize, setOverlaySourceSize] = useState<{
     width: number
@@ -559,10 +570,21 @@ export function LiveCamera({
   } | null>(null)
   const [modelHint, setModelHint] = useState('')
   const [crashAlert, setCrashAlert] = useState<CrashAlertState | null>(null)
+  const [alarmAudioArmed, setAlarmAudioArmed] = useState(false)
+  const [alarmAudioError, setAlarmAudioError] = useState('')
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
-  const { profile } = useAuth()
+  const { personalPreferences, profile } = useAuth()
+  const alarmAudioEnabled = personalPreferences?.notificationPreferences.alarmAudio ?? true
   const { isAdvancedMode } = useDisplayMode(profile)
+
+  const armAlarmAudio = () => {
+    if (!alarmAudioEnabled) return
+    void armAccidentAlertAudio().then((armed) => {
+      setAlarmAudioArmed(armed)
+      setAlarmAudioError(armed ? '' : 'Browser alarm audio is blocked. Click Arm Alarm Sound again.')
+    })
+  }
 
   useEffect(() => {
     const el = new Audio('/alert-sound.mp3')
@@ -762,12 +784,6 @@ export function LiveCamera({
     boxes: DetectionBox[]
   ) => {
     const now = Date.now()
-    if (result.accident_detected) {
-      crashRunStartedAtRef.current ??= now
-    } else {
-      crashRunStartedAtRef.current = null
-    }
-
     const sample: LiveDetectionSample = {
       accidentDetected: result.accident_detected,
       boxes,
@@ -781,13 +797,7 @@ export function LiveCamera({
     detectionSamplesRef.current = [...detectionSamplesRef.current, sample].slice(-6)
 
     const recent = detectionSamplesRef.current.slice(-STABLE_CRASH_WINDOW_SIZE)
-    const crashHits = recent.filter((item) => item.accidentDetected).length
-    const crashDuration =
-      crashRunStartedAtRef.current == null ? 0 : now - crashRunStartedAtRef.current
-    const stableCrash =
-      result.accident_detected &&
-      (crashHits >= STABLE_CRASH_REQUIRED_HITS ||
-        crashDuration >= STABLE_CRASH_MIN_DURATION_MS)
+    const stableCrash = isCurrentCrashConfirmed(result)
     const consecutiveClean = detectionSamplesRef.current
       .slice()
       .reverse()
@@ -838,6 +848,7 @@ export function LiveCamera({
     setLatestResult((current) => {
       if (
         stability.stableCrash ||
+        ['candidate', 'verifying'].includes(displayResult.finalDecision ?? '') ||
         !accidentOnlyMode ||
         stability.cleanCount >= STABLE_CLEAR_REQUIRED_MISSES
       ) {
@@ -916,25 +927,15 @@ export function LiveCamera({
       }
     }
 
-    if (stability.stableCrash) {
-      showCrashAlert(surfacedResult)
-
-      const now = Date.now()
-      const signature = getDetectionSignature(surfacedResult)
-
-      if (
-        now - lastAlertTimestampRef.current > ALERT_DEBOUNCE_MS ||
-        lastAlertSignatureRef.current !== signature
-      ) {
-        lastAlertTimestampRef.current = now
-        lastAlertSignatureRef.current = signature
-
+    if (liveAlarmTracker.consume(result)) {
+      showCrashAlert(displayResult)
+      if (alarmAudioEnabled && profile?.role !== 'dispatcher') {
         void playAccidentAlert(audioRef.current, alertVolume, { beepRepeats: 3 }).catch(
-          (playbackError) => {
-            console.warn('Could not play alert sound:', playbackError)
-          }
+          () => setAlarmAudioError('Browser alarm audio was blocked. Click Arm Alarm Sound to enable it.')
         )
       }
+    } else if (result.finalDecision === 'possible_crash_aftermath' && result.caseCreated && !result.existingCase) {
+      showCrashAlert(displayResult)
     }
 
     return surfacedResult
@@ -962,7 +963,6 @@ export function LiveCamera({
     detectionEnabledRef.current = false
     autoStartDetectionRef.current = false
     detectionSamplesRef.current = []
-    crashRunStartedAtRef.current = null
     boxHoldUntilRef.current = 0
 
     if (detectionIntervalRef.current) {
@@ -992,6 +992,7 @@ export function LiveCamera({
     }
     setCctvPreviewUrl(null)
     setCctvMjpegUrl(null)
+    setBoxSource(null)
     cctvStartedAtRef.current = null
     cctvLastFrameAtRef.current = null
     cctvMonitorIdRef.current = ''
@@ -1251,6 +1252,30 @@ export function LiveCamera({
   const pollCctvMonitor = async (monitorId: string) => {
     try {
       const status = await getCameraMonitoringStatus(monitorId)
+      if (
+        status.status === 'disconnected' &&
+        autoStartCctv && cameraId?.trim() === monitorId && detectionEnabledRef.current &&
+        !cctvRecoveryInFlightRef.current && Date.now() - cctvLastRecoveryAtRef.current > 5000
+      ) {
+        cctvRecoveryInFlightRef.current = true
+        cctvLastRecoveryAtRef.current = Date.now()
+        try {
+          await startCctvMonitoring(monitorId)
+          const access = await createCameraStreamAccess(monitorId)
+          if (cctvMonitorIdRef.current === monitorId) {
+            setCctvMjpegUrl(access.streamUrl ?? access.previewUrl)
+            setBoxSource({ cameraId: monitorId, eventsUrl: access.eventsUrl })
+            setMjpegFailed(false)
+            cctvStartedAtRef.current = Date.now()
+            setCctvFrameError('')
+          }
+        } catch (recoveryError) {
+          setCctvFrameError(recoveryError instanceof Error ? recoveryError.message : 'Camera reconnect failed.')
+        } finally {
+          cctvRecoveryInFlightRef.current = false
+        }
+        return
+      }
       setCctvConnectionStatus(
         status.message ||
           (status.detectionRunning ? 'Monitoring live' : status.status || 'Connected')
@@ -1344,9 +1369,11 @@ export function LiveCamera({
     setCctvConnectionStatus(connection.status || connection.message || 'Monitoring live')
 
     let streamAccessUrl = getCameraMjpegPreviewUrl(monitorId)
+    let boxEventsUrl: string | null = null
     if (savedCameraId) {
       try {
         const streamAccess = await createCameraStreamAccess(savedCameraId)
+        boxEventsUrl = streamAccess?.eventsUrl ?? null
         if (streamAccess?.streamUrl) {
           streamAccessUrl = streamAccess.streamUrl
         }
@@ -1354,7 +1381,10 @@ export function LiveCamera({
         // Fallback to standard mjpeg URL
       }
     }
+    if (cctvMonitorIdRef.current !== monitorId) return false
+    setMjpegFailed(false)
     setCctvMjpegUrl(streamAccessUrl)
+    setBoxSource({ cameraId: savedCameraId || monitorId, eventsUrl: boxEventsUrl })
 
     await pollCctvMonitor(monitorId)
 
@@ -1445,7 +1475,7 @@ export function LiveCamera({
 
   useEffect(() => {
     const hasSavedSource = Boolean(
-      (initialCctvIp ?? '').trim() || (initialStreamUrl ?? '').trim()
+      (cameraId ?? '').trim() || (initialCctvIp ?? '').trim() || (initialStreamUrl ?? '').trim()
     )
 
     if (
@@ -1471,6 +1501,7 @@ export function LiveCamera({
     void startDetection()
   }, [
     autoStartCctv,
+    cameraId,
     initialCctvIp,
     initialSourceTab,
     initialStreamUrl,
@@ -1486,6 +1517,26 @@ export function LiveCamera({
       : Math.max(detectionIntervalMs, DEVICE_DETECTION_INTERVAL_MS)
   const overlayLabels = sourceTab === 'cctv' && !hasCctvFrameSurface ? [] : liveOverlayLabels
   const overlayBoxes = sourceTab === 'cctv' && !hasCctvFrameSurface ? [] : liveOverlayBoxes
+  const detectionMode = latestResult?.detectionMode ?? latestResult?.detection_mode ?? 'none'
+  const overlayStatusLabels = (() => {
+    if (detectionMode === 'temporal_collision' && latestResult?.accident_detected) {
+      return ['Collision verified']
+    }
+    if (detectionMode === 'aftermath_review' && latestResult?.accident_detected) {
+      return ['Possible crash aftermath']
+    }
+    if (latestResult?.aftermathSuspected) {
+      return ['Crash-like scene under persistence review']
+    }
+    if (overlayLabels.length > 0) {
+      return overlayLabels
+    }
+    return [...new Set(overlayBoxes.map((box) => box.label).filter(Boolean))].slice(0, 4)
+  })()
+  const emptyDetectionLabel =
+    overlayBoxes.length > 0
+      ? 'Vehicle tracked — no verified collision'
+      : 'No vehicle detected in current frame'
   const confidenceDisplay = latestResult
     ? getPrimaryConfidenceDisplay(latestResult)
     : { value: null as number | null, caption: '' }
@@ -1555,14 +1606,13 @@ export function LiveCamera({
           ) : null}
 
           <CctvVideoOverlay
-            annotatedPreviewUrl={resolvedAnnotatedMediaUrl}
-            boxes={overlayBoxes}
+            annotatedPreviewUrl={sourceTab === 'cctv' ? null : resolvedAnnotatedMediaUrl}
+            boxes={sourceTab === 'cctv' ? [] : overlayBoxes}
             boxFit={stream ? 'cover' : 'contain'}
             isDetecting={isDetecting}
             isLive={isStreaming}
-            labels={
-              latestResult && !latestResult.accident_detected ? [] : overlayLabels
-            }
+            labels={overlayStatusLabels}
+            emptyDetectionLabel={emptyDetectionLabel}
             sourceHeight={overlaySourceSize?.height ?? null}
             sourceWidth={overlaySourceSize?.width ?? null}
             timestamp={overlayTimestamp}
@@ -1583,7 +1633,7 @@ export function LiveCamera({
               />
             ) : isCctvLive ? (
               <div className="flex h-full w-full items-center justify-center bg-[var(--media-background)]">
-                {cctvMjpegUrl ? (
+                {cctvMjpegUrl && !mjpegFailed ? (
                   <img
                     key={cctvMjpegUrl}
                     src={cctvMjpegUrl}
@@ -1596,6 +1646,7 @@ export function LiveCamera({
                       )
                     }}
                     onError={() => {
+                      setMjpegFailed(true)
                       if (cctvMonitorIdRef.current) {
                         void pollCctvPreview(cctvMonitorIdRef.current)
                       }
@@ -1659,8 +1710,29 @@ export function LiveCamera({
                         : 'CCTV stream is idle'}
                     </p>
                     <p className="text-sm text-[var(--media-muted-foreground)]">{idleHint}</p>
+                    {sourceTab === 'cctv' && (
+                      <div className="pt-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white gap-1.5"
+                          onClick={() => {
+                            cctvAutoStartAttemptedKeyRef.current = ''
+                            void startDetection()
+                          }}
+                        >
+                          <Play className="h-4 w-4" /> Start Monitoring
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 </div>
+              </div>
+            )}
+
+            {latestResult && ['candidate', 'verifying'].includes(latestResult.finalDecision ?? '') && (
+              <div role="status" className="absolute inset-x-0 bottom-12 bg-amber-950/90 px-4 py-2 text-center text-sm text-amber-100">
+                Analyzing potential collision...
               </div>
             )}
 
@@ -1809,6 +1881,9 @@ export function LiveCamera({
               </div>
             )}
           </CctvVideoOverlay>
+          {!controlRoomMode && sourceTab === 'cctv' && isCctvLive && boxSource && (
+            <SynchronizedAnalysisPreview key={boxSource.cameraId} cameraId={boxSource.cameraId} eventsUrl={boxSource.eventsUrl} />
+          )}
 
           {!controlRoomMode ? (
           <div className="space-y-4 p-4">
@@ -1834,7 +1909,7 @@ export function LiveCamera({
               <div className="grid gap-3 sm:grid-cols-2">
                 <Button
                   type="button"
-                  onClick={startCamera}
+                  onClick={() => { armAlarmAudio(); void startCamera() }}
                   disabled={isStartingCamera || !!stream}
                 >
                   {isStartingCamera ? (
@@ -1965,7 +2040,7 @@ export function LiveCamera({
                 {!isCctvLive ? (
                   <Button
                     type="button"
-                    onClick={() => void startDetection()}
+                    onClick={() => { armAlarmAudio(); void startDetection() }}
                     disabled={!cctvIp.trim() && !streamUrl.trim()}
                   >
                     <Play className="mr-2 h-4 w-4" />
@@ -1984,6 +2059,15 @@ export function LiveCamera({
                   </Button>
                 ) : null}
               </div>
+
+              {alarmAudioEnabled ? (
+                <div className="space-y-1">
+                  <Button type="button" variant="outline" onClick={armAlarmAudio}>
+                    {alarmAudioArmed ? 'Alarm Sound Armed' : 'Arm Alarm Sound'}
+                  </Button>
+                  {alarmAudioError ? <p role="alert" className="text-xs text-destructive">{alarmAudioError}</p> : null}
+                </div>
+              ) : null}
 
               <p className="text-sm text-muted-foreground">
                 {managedCctvMode && !isAdvancedMode
@@ -2018,7 +2102,11 @@ export function LiveCamera({
           <div className="border-b border-border p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <h3 className="text-lg font-semibold">Latest possible crash frame</h3>
+                <h3 className="text-lg font-semibold">
+                  {detectionMode === 'aftermath_review'
+                    ? 'Latest possible crash aftermath frame'
+                    : 'Latest possible crash frame'}
+                </h3>
                 <p className="text-sm text-muted-foreground">
                   Shown only when the model reports a possible crash. Normal traffic is not listed here.
                 </p>
@@ -2027,7 +2115,7 @@ export function LiveCamera({
                 className="min-w-[10.5rem] justify-center border-destructive/50 bg-destructive/20 text-destructive"
                 variant="outline"
               >
-                Possible crash
+                {detectionMode === 'aftermath_review' ? 'Possible crash aftermath' : 'Possible crash'}
               </Badge>
             </div>
           </div>

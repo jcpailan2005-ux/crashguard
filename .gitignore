@@ -64,6 +64,7 @@ backend/uploads/
 backend/uploads/**
 backend/outputs/
 backend/outputs/**
+backend/validation/live_collision_diagnostics/physical_pair_capture_*/
 crash-media/
 crash-media/**
 
@@ -128,3 +129,6 @@ dataset/**/*.mkv
 crash_decision_report.csv
 baseline_report.csv
 retrained_report.csv
+
+# Temporary development / debug scratch files
+scratch_*

@@ -16,6 +16,17 @@ export interface BoundingBox {
 
 export interface DetectionBox {
   label: string
+  classId?: number
+  trackId?: number
+  cameraId?: string
+  sessionId?: string
+  sequence?: number
+  capturedMonotonic?: number
+  lastDetectedSequence?: number
+  observationKind?: 'DETECTED' | 'PREDICTED'
+  detected?: boolean
+  collisionObservation?: boolean
+  trackLifecycle?: 'NEW' | 'ACTIVE' | 'TEMPORARILY_MISSED' | 'RETIRED'
   confidence: number
   x: number
   y: number
@@ -23,10 +34,118 @@ export interface DetectionBox {
   height: number
 }
 
+export interface TrackedVehicle {
+  trackId: number
+  classId: number
+  className: string
+  confidence: number
+  bbox: [number, number, number, number]
+  center: [number, number]
+  centerNormalized: [number, number]
+  historyLength: number
+}
+
+export interface TemporalCrashEvidence {
+  classifier_score?: number
+  interaction_candidate?: boolean
+  approach_detected?: boolean
+  closing_score?: number
+  convergence_score?: number
+  contact_candidate?: boolean
+  velocity_change_score?: number
+  heading_change_score?: number
+  post_contact_observations?: number
+  post_contact_disruption?: boolean
+  post_contact_score?: number
+  min_normalized_center_distance?: number
+  max_iou?: number
+  temporal_score?: number
+  state?: string
+}
+
+export interface AiPerformanceTimings {
+  vehicle_detection_ms: number
+  tracking_ms: number
+  interaction_analysis_ms: number
+  temporal_verification_ms: number
+  total_ai_ms: number
+}
+
+/** Live provenance: capturedAt is host decode-completion UTC seconds, not sensor time.
+ * Monotonic seconds are meaningful only within this backend process/session.
+ */
+export interface LiveBoxPacket {
+  sourceFrame: LiveFrameIdentity
+  inferenceStartedAt: number
+  inferenceFinishedAt: number
+  boxes: DetectionBox[]
+  predictedTracks?: DetectionBox[]
+  retiredTrackIds?: number[]
+  trackingMs?: number
+  imageDataUrl: string
+  resultAgeMs: number
+  sourceAgeMs: number | null
+  validForMs: number
+}
+
+export interface LiveBoxView {
+  packet: LiveBoxPacket
+  expiresAt: number // Browser performance.now(), freshness deadline (500 ms window).
+  receivedAt?: number // Browser performance.now() when packet was received at the client.
+  retentionExpiresAt?: number // Browser performance.now(), visual retention deadline (up to 5s).
+}
+
+export interface LiveFrameIdentity {
+  cameraId: string | null
+  sessionId: string
+  sequence: number
+  capturedAt: number | null
+  capturedMonotonic: number | null
+  width: number | null
+  height: number | null
+}
+
 export interface DetectionResponse {
+  predictedTracks?: DetectionBox[]
+  retiredTrackIds?: number[]
+  trackingMs?: number
+  sourceFrame?: LiveFrameIdentity
+  inferenceStartedAt?: number
+  inferenceFinishedAt?: number
+  /** Serial primary/scene/vehicle model stage, separate from whole analysis time. */
+  modelProcessingMs?: number
+  inferenceSourceAgeAtCompletionMs?: number | null
   success: boolean
   accident_detected: boolean
   caseId?: string | null
+  event_state?: 'IDLE' | 'CANDIDATE' | 'VERIFYING' | 'CONFIRMED' | 'ACTIVE' | 'CLEARED' | 'COOLDOWN' | string
+  eventState?: string | null
+  detector_event_id?: string | null
+  detectorEventId?: string | null
+  incident_created?: boolean
+  incidentCreated?: boolean
+  incident_id?: string | null
+  incidentId?: string | null
+  duplicate_event?: boolean
+  duplicateEvent?: boolean
+  detection_mode?: 'temporal_collision' | 'aftermath_review' | 'none' | string
+  detectionMode?: 'temporal_collision' | 'aftermath_review' | 'none' | string
+  decisionReason?: string | null
+  aftermathCandidate?: boolean
+  aftermathSuspected?: boolean
+  aftermathState?: 'NONE' | 'SUSPECTED' | 'PERSISTENT' | 'REVIEW_CANDIDATE' | 'CLEARED' | string
+  aftermathScore?: number
+  aftermathReason?: string | null
+  rejectionReasons?: string[]
+  reviewRequired?: boolean
+  aftermathAccepted?: boolean
+  aftermathClassifierScore?: number
+  aftermathAbnormalityScore?: number
+  aftermathVehicleCount?: number
+  aftermathPositiveObservations?: number
+  aftermathPersistenceSeconds?: number
+  aftermathEvidence?: Record<string, unknown>
+  aftermathAnalysisMs?: number
   notificationId?: string | null
   status?: string | null
   confidence: number
@@ -59,7 +178,7 @@ export interface DetectionResponse {
   persistenceSkippedReason?: string | null
   rejectionReason?: string | null
   finalDecision?: string | null
-  /** True only when a case was actually persisted (finalDecision === "confirmed_crash" or "high_confidence_review"). */
+  /** True only when a temporally confirmed event was persisted. */
   caseCreated?: boolean | null
   /** True only when a notification was actually persisted alongside the case. */
   notificationCreated?: boolean | null
@@ -70,6 +189,20 @@ export interface DetectionResponse {
   personCount?: number | null
   sceneValid?: boolean | null
   motionValid?: boolean | null
+  interactionCandidate?: boolean | null
+  tracker?: 'ByteTrack' | string | null
+  trackedVehicles?: TrackedVehicle[]
+  activeTracks?: number
+  retainedTracks?: number
+  activePairs?: number
+  involvedTrackIds?: number[]
+  temporalCrashCandidate?: boolean
+  temporalCrashVerified?: boolean
+  temporalCrashScore?: number
+  temporalDecisionReason?: string | null
+  contactTimestamp?: number | null
+  crashEvidence?: TemporalCrashEvidence
+  performance?: AiPerformanceTimings
   consecutiveCrashHits?: number | null
   requiredConsecutiveCrashHits?: number | null
   blurScore?: number | null
@@ -140,6 +273,7 @@ export interface Incident {
 export interface LocalCrashCase {
   caseId: string
   status: CaseStatus
+  detectionMode?: 'temporal_collision' | 'aftermath_review' | string | null
   confidence: number
   createdAt?: string
   detectedAt: string
@@ -187,8 +321,12 @@ export interface CctvCamera {
   latitude?: number | null
   longitude?: number | null
   streamUrl?: string | null
+  streamConfigured?: boolean
+  streamSourceLabel?: string | null
   cameraType?: string | null
   status?: string | null
+  cameraHealth?: string | null
+  lastFrameAgeMs?: number | null
   isActive: boolean
   detectionEnabled: boolean
   lastEventAt?: string | null
@@ -287,6 +425,7 @@ export interface CrashCaseVehicle {
 export interface CrashCase {
   caseId: string
   detectionId: string
+  detectionMode?: 'temporal_collision' | 'aftermath_review' | string | null
   status: CaseStatus
   reviewerId: string | null
   user: CrashCasePerson | null

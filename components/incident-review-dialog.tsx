@@ -35,9 +35,7 @@ import { useAuth } from '@/components/auth-provider'
 import { useToast } from '@/hooks/use-toast'
 import { caseMedia, localCaseToCrashCase } from '@/lib/crash-case-mapper'
 import { applyLocalCrashCaseAction } from '@/lib/api-client'
-import { applyCrashCaseAction } from '@/lib/crash-case-store'
 import { useDisplayMode } from '@/lib/display-mode'
-import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
 import {
   CASE_ACTION_LABELS,
   CaseActionType,
@@ -288,24 +286,11 @@ export function IncidentReviewDialog({
   const handleAction = async (action: CaseActionType) => {
     setSubmittingAction(action)
     try {
-      const db = getFirestoreOrNull()
-      const configError = getFirebaseConfigError()
-
-      if (db && !configError && !caseItem.caseId.startsWith('CASE-')) {
-        await applyCrashCaseAction(db, {
-          action,
-          actorId,
-          caseItem,
-          notes,
-        })
-      } else {
-        const updatedCase = await applyLocalCrashCaseAction(caseItem.caseId, {
-          action,
-          actorId,
-          notes,
-        })
-        onCaseUpdated?.(localCaseToCrashCase(updatedCase))
-      }
+      const updatedCase = await applyLocalCrashCaseAction(caseItem.caseId, {
+        action,
+        notes,
+      })
+      onCaseUpdated?.(localCaseToCrashCase(updatedCase))
       setNotes('')
       toast({
         title: action === 'accept_dispatch' ? 'Dispatch accepted' : CASE_ACTION_LABELS[action],
@@ -386,6 +371,18 @@ export function IncidentReviewDialog({
                       {(caseItem.confidence * 100).toFixed(0)}%
                     </p>
                   </div>
+                  {caseItem.detectionMode ? (
+                    <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+                      <p className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        Detection path
+                      </p>
+                      <p className="break-words text-left text-sm font-semibold leading-snug text-foreground sm:text-right">
+                        {caseItem.detectionMode === 'aftermath_review'
+                          ? 'Possible crash aftermath — impact not observed'
+                          : 'Temporally verified collision'}
+                      </p>
+                    </div>
+                  ) : null}
                   <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
                     <p className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                       Time Detected

@@ -1,17 +1,21 @@
 'use client'
 
-import { createContext, useContext, useEffect, useMemo, useState } from 'react'
-import { AuthUser, getCurrentSQLiteUser } from '@/lib/api-client'
-import { clearStoredAuthToken, getStoredAuthToken } from '@/lib/session-auth'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { useTheme } from 'next-themes'
+import { AuthUser, CrashGuardApiError, getCurrentPostgresUser, logoutFromPostgres } from '@/lib/api-client'
 import { UserProfile } from '@/lib/auth-profile'
+import { phase3, type PersonalPreferences } from '@/lib/phase3-api'
+import { isPersonalTheme } from '@/lib/personal-settings'
 
 interface AuthContextValue {
   authError: string | null
   firebaseUser: AuthUser | null
   loading: boolean
   profile: UserProfile | null
+  personalPreferences: PersonalPreferences | null
   refreshUser: () => Promise<void>
   setSessionUser: (user: AuthUser) => void
+  setPersonalPreferences: (preferences: PersonalPreferences) => void
   signOutUser: () => Promise<void>
 }
 
@@ -20,65 +24,89 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined)
 function toProfile(user: AuthUser): UserProfile {
   return {
     active: user.active,
-    areaId:
-      user.areaId === 'talomo' || user.areaId === 'bago' || user.areaId === 'toril'
-        ? user.areaId
-        : null,
+    areaId: user.areaId,
     createdAt: user.createdAt,
     displayName: user.displayName,
     email: user.email,
     role: user.role,
+    permissions: user.permissions ?? [],
+    mustChangePassword: user.mustChangePassword,
     uid: user.uid,
     updatedAt: user.updatedAt,
   }
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const { setTheme } = useTheme()
   const [authError, setAuthError] = useState<string | null>(null)
   const [firebaseUser, setFirebaseUser] = useState<AuthUser | null>(null)
   const [profile, setProfile] = useState<UserProfile | null>(null)
+  const [personalPreferences, setPersonalPreferences] = useState<PersonalPreferences | null>(null)
   const [loading, setLoading] = useState(true)
+  const sessionEpochRef = useRef(0)
 
-  const setSessionUser = (user: AuthUser) => {
+  const setSessionUser = useCallback((user: AuthUser) => {
+    sessionEpochRef.current += 1
     setAuthError(null)
     setFirebaseUser(user)
     setProfile(toProfile(user))
-  }
+    setLoading(false)
+  }, [])
 
-  const refreshUser = async () => {
-    const token = getStoredAuthToken()
-    if (!token) {
-      setAuthError(null)
-      setFirebaseUser(null)
-      setProfile(null)
-      setLoading(false)
-      return
-    }
-
+  const refreshUser = useCallback(async () => {
+    const requestEpoch = ++sessionEpochRef.current
+    setLoading(true)
     try {
-      const user = await getCurrentSQLiteUser()
-      setSessionUser(user)
+      const user = await getCurrentPostgresUser()
+      if (requestEpoch !== sessionEpochRef.current) return
+      setAuthError(null)
+      setFirebaseUser(user)
+      setProfile(toProfile(user))
     } catch (error) {
-      console.error('Failed to restore SQLite session:', error)
-      clearStoredAuthToken()
+      if (requestEpoch !== sessionEpochRef.current) return
+      if (!(error instanceof CrashGuardApiError && error.status === 401)) {
+        console.error('Failed to restore PostgreSQL session:', error)
+      }
       setFirebaseUser(null)
       setProfile(null)
-      setAuthError('Your saved session expired. Please sign in again.')
+      setAuthError(null)
     } finally {
-      setLoading(false)
+      if (requestEpoch === sessionEpochRef.current) setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     void refreshUser()
-  }, [])
+  }, [refreshUser])
 
-  const signOutUser = async () => {
-    clearStoredAuthToken()
+  useEffect(() => {
+    if (!profile?.uid || profile.mustChangePassword) return
+    let cancelled = false
+    void phase3.ownPreferences()
+      .then(({ preferences }) => {
+        if (cancelled) return
+        setPersonalPreferences(preferences)
+        if (isPersonalTheme(preferences.theme)) setTheme(preferences.theme)
+      })
+      .catch(() => {
+        // Local next-themes persistence remains the safe fallback while the backend is unavailable.
+      })
+    return () => { cancelled = true }
+  }, [profile?.mustChangePassword, profile?.uid, setTheme])
+
+  const signOutUser = useCallback(async () => {
+    sessionEpochRef.current += 1
+    try {
+      await logoutFromPostgres()
+    } catch {
+      // Local cleanup is still required if the backend is unavailable.
+    }
     setAuthError(null)
     setFirebaseUser(null)
     setProfile(null)
-  }
+    setPersonalPreferences(null)
+    setLoading(false)
+  }, [])
 
   const value = useMemo(
     () => ({
@@ -86,11 +114,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       firebaseUser,
       loading,
       profile,
+      personalPreferences,
       refreshUser,
       setSessionUser,
+      setPersonalPreferences,
       signOutUser,
     }),
-    [authError, firebaseUser, loading, profile]
+    [authError, firebaseUser, loading, personalPreferences, profile, refreshUser, setSessionUser, signOutUser]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

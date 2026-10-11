@@ -42,6 +42,8 @@ def init_db() -> None:
             conn,
             "crash_cases",
             {
+                "detectorEventId": "TEXT",
+                "detectionMode": "TEXT",
                 "cameraIp": "TEXT",
                 "cameraId": "TEXT",
                 "cameraName": "TEXT",
@@ -70,6 +72,7 @@ def _ensure_columns(
 def _ensure_indexes(conn: sqlite3.Connection) -> None:
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_crash_cases_cameraId ON crash_cases(cameraId)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_crash_cases_detectorEventId ON crash_cases(detectorEventId)",
         "CREATE INDEX IF NOT EXISTS idx_cameras_areaId ON cameras(areaId)",
         "CREATE INDEX IF NOT EXISTS idx_cameras_status ON cameras(status)",
         "CREATE INDEX IF NOT EXISTS idx_cameras_active ON cameras(isActive)",

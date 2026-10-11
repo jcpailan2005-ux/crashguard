@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS areas (
 
 CREATE TABLE IF NOT EXISTS crash_cases (
   caseId TEXT PRIMARY KEY,
+  detectorEventId TEXT UNIQUE,
+  detectionMode TEXT,
   status TEXT NOT NULL CHECK(status IN ('pending_review', 'under_review', 'confirmed_crash', 'false_alarm', 'dispatched', 'responding', 'arrived', 'resolved')),
   confidence REAL NOT NULL DEFAULT 0,
   detectedAt TEXT NOT NULL,
