@@ -3017,6 +3017,7 @@ class LiveCameraMonitor:
                 captured_epoch, analyzed_seq,
                 captured_monotonic if captured_monotonic is not None else last_frame_at,
                 response_boxes, frame_width=int(frame.shape[1]), frame_height=int(frame.shape[0]),
+                source_frame=frame,
             )
             # Publish tracking and its exact analyzed frame atomically with the
             # session guard. This metadata is never consumed as crash evidence.
