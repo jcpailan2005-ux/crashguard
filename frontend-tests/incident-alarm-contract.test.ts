@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   DispatcherIncidentAlarmTracker,
   getOperationalIncidentId,
+  isCurrentCrashConfirmed,
   shouldEmitOperationalAlarm,
 } from '../lib/incident-alarm-contract.ts'
 
@@ -71,4 +72,18 @@ test('dispatcher sounds only once for a fresh confirmed incident identity', () =
   assert.deepEqual(tracker.consume(notifications, [old, fresh, aftermath]), [])
   assert.deepEqual(tracker.consume([{ id: 'DECLINE', incidentId: 'FRESH', type: 'ASSIGNMENT_DECLINED',
     createdAt: '2026-09-29T00:00:02Z' }], [fresh]), [])
+})
+
+
+test('confirmed collision remains visible when incident persistence fails, without an operational alarm', () => {
+  const result = { accident_detected: true, finalDecision: 'confirmed_crash',
+    incidentCreated: false, incidentId: null, persistenceStatus: 'failed' }
+  assert.equal(isCurrentCrashConfirmed(result), true)
+  assert.equal(shouldEmitOperationalAlarm(result, null), false)
+})
+
+test('candidate, verifying and aftermath states cannot claim a detected collision', () => {
+  for (const finalDecision of ['candidate', 'verifying', 'possible_crash_aftermath']) {
+    assert.equal(isCurrentCrashConfirmed({ accident_detected: true, finalDecision }), false)
+  }
 })

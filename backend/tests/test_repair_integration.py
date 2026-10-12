@@ -1,9 +1,11 @@
-"""CONTROLLED_INTEGRATION_TEST: real PostgreSQL, simulated detector decision.
+"""CONTROLLED_INTEGRATION_TEST: real SQLite, simulated detector decision.
 
 No physical camera and no model inference. All data belongs to an explicitly
-isolated crashguard_test database. No deletion or truncation is performed here.
+isolated temporary SQLite database. No deletion or truncation is performed here.
 """
 import os
+import tempfile
+from pathlib import Path
 import uuid
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -22,8 +24,9 @@ from backend.services.operational_detection import persist_operational_detection
 class ControlledIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not os.getenv('DATABASE_URL', '').rstrip('/').endswith('/crashguard_test'):
-            raise RuntimeError('CONTROLLED_INTEGRATION_TEST requires isolated crashguard_test.')
+        path = Path(os.getenv('CRASHGUARD_SQLITE_PATH', '')).resolve()
+        if not path.is_relative_to(Path(tempfile.gettempdir()).resolve()):
+            raise RuntimeError('CONTROLLED_INTEGRATION_TEST requires temporary SQLite storage.')
         cls.clients = {}
         cls.users = {}
         for role in ('ADMIN', 'DISPATCHER', 'RESPONDER'):
@@ -118,7 +121,7 @@ class ControlledIntegrationTests(unittest.TestCase):
         self.assertEqual(sum(result['incidentCreated'] for result in results), 1)
         self.assertEqual(len({result['incidentId'] for result in results}), 1)
 
-    def test_postgres_camera_responses_and_audit_never_return_credentials(self):
+    def test_sqlite_camera_responses_and_audit_never_return_credentials(self):
         admin = self.clients['ADMIN']
         secret_url = 'rtsp://repair-secret-user:repair-secret-password@192.168.1.17/live'
         response = admin.post('/api/v3/cameras', json={'name':'Privacy test', 'streamReference':secret_url})
@@ -132,7 +135,7 @@ class ControlledIntegrationTests(unittest.TestCase):
         with connection() as conn:
             self.assertEqual(conn.execute('SELECT stream_reference FROM cameras WHERE id=%s', (camera_id,)).fetchone()['stream_reference'], secret_url)
 
-    def test_z_camera_ticket_uses_postgres_session_and_revokes_on_logout(self):
+    def test_z_camera_ticket_uses_sqlite_session_and_revokes_on_logout(self):
         admin = self.clients['ADMIN']
         token = admin.cookies.get('crashguard_session')
         principal = service.authenticate_session(token)

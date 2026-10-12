@@ -5,7 +5,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { Eye, EyeOff, ShieldCheck } from 'lucide-react'
 import { useAuth } from '@/components/auth-provider'
-import { getCurrentPostgresUser, loginWithPostgres } from '@/lib/api-client'
+import { getCurrentSQLiteUser, loginWithSQLite } from '@/lib/api-client'
 import { authenticateAndResolveSession, formatLoginError } from '@/lib/login-lifecycle'
 import { homeForRole } from '@/lib/role-routing'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -16,7 +16,7 @@ import { Label } from '@/components/ui/label'
 
 export default function LoginPage() {
   const router = useRouter()
-  const { authError, firebaseUser, profile, loading, setSessionUser } = useAuth()
+  const { authError, sessionUser, profile, loading, setSessionUser } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
@@ -24,19 +24,19 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false)
 
   useEffect(() => {
-    if (loading || !firebaseUser || !profile) return
+    if (loading || !sessionUser || !profile) return
 
     if (profile.mustChangePassword) {
       router.replace('/change-password')
       return
     }
     router.replace(homeForRole(profile.role))
-  }, [firebaseUser, loading, profile, router])
+  }, [sessionUser, loading, profile, router])
 
   useEffect(() => {
-    if (loading || !firebaseUser || !authError) return
+    if (loading || !sessionUser || !authError) return
     setError(authError)
-  }, [authError, firebaseUser, loading])
+  }, [authError, sessionUser, loading])
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -45,8 +45,8 @@ export default function LoginPage() {
 
     try {
       const { user, destination } = await authenticateAndResolveSession(email, password, {
-        login: loginWithPostgres,
-        currentUser: getCurrentPostgresUser,
+        login: loginWithSQLite,
+        currentUser: getCurrentSQLiteUser,
       })
       setSessionUser(user)
       router.replace(destination)

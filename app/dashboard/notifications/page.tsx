@@ -31,10 +31,8 @@ import {
   resolveBackendMediaUrl,
 } from '@/lib/api-client'
 import { localCaseToCrashCase } from '@/lib/crash-case-mapper'
-import { getCrashCase } from '@/lib/crash-case-store'
 import { APP_CONFIG } from '@/lib/app-config'
 import { useDisplayMode } from '@/lib/display-mode'
-import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
 import { CrashCase, Notification } from '@/lib/types'
 
 type DateFilter = 'today' | 'last7' | 'last30' | 'all' | 'custom'
@@ -135,7 +133,7 @@ export default function NotificationsPage() {
   const [loadingCaseId, setLoadingCaseId] = useState<string | null>(null)
   const [actionNotificationId, setActionNotificationId] = useState<string | null>(null)
   const [selectedCase, setSelectedCase] = useState<CrashCase | null>(null)
-  const { firebaseUser, profile } = useAuth()
+  const { sessionUser, profile } = useAuth()
   const { isAdvancedMode } = useDisplayMode(profile)
   const isNeedsReviewNotification = (notification: Notification) =>
     !notification.read && notification.alertLevel === 'review'
@@ -154,7 +152,7 @@ export default function NotificationsPage() {
                 (item) =>
                   item.alertLevel !== 'review' &&
                   (!item.responderId ||
-                    item.responderId === firebaseUser?.uid ||
+                    item.responderId === sessionUser?.uid ||
                     Boolean(profile.areaId && item.areaId === profile.areaId))
               )
             : items
@@ -175,7 +173,7 @@ export default function NotificationsPage() {
       .finally(() => {
         setLoading(false)
       })
-  }, [firebaseUser?.uid, profile])
+  }, [sessionUser?.uid, profile])
 
   useEffect(() => {
     let cancelled = false
@@ -255,16 +253,6 @@ export default function NotificationsPage() {
     setLoadingCaseId(caseId)
 
     try {
-      const db = getFirestoreOrNull()
-      const configError = getFirebaseConfigError()
-      if (db && !configError && !caseId.startsWith('CASE-')) {
-        const caseItem = await getCrashCase(db, caseId)
-        if (caseItem) {
-          setSelectedCase(caseItem)
-          return
-        }
-      }
-
       const localCase = await getLocalCrashCase(caseId)
       setSelectedCase(localCaseToCrashCase(localCase))
     } catch {
@@ -550,7 +538,7 @@ export default function NotificationsPage() {
       </div>
 
       <IncidentReviewDialog
-        actorId={firebaseUser?.uid ?? 'unknown-user'}
+        actorId={sessionUser?.uid ?? 'unknown-user'}
         caseItem={selectedCase}
         onCaseUpdated={(caseItem) => {
           setSelectedCase(caseItem)

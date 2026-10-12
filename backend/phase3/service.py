@@ -6,8 +6,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from psycopg.errors import UniqueViolation
-from psycopg.types.json import Jsonb
+from sqlite3 import IntegrityError
 
 from backend.camera_privacy import public_camera_data
 from backend.phase3.database import connection
@@ -68,8 +67,8 @@ class Forbidden(DomainError):
     status_code = 403
 
 
-def _json(value: Any) -> Jsonb:
-    return Jsonb(_serialize(value if value is not None else {}))
+def _json(value: Any) -> str:
+    return json.dumps(_serialize(value if value is not None else {}))
 
 
 def _serialize(value: Any) -> Any:
@@ -87,8 +86,8 @@ def _serialize(value: Any) -> Any:
 USER_PRINCIPAL_SQL = """
 SELECT u.id, u.email, u.full_name, u.status, u.must_change_password, u.area_id,
        u.availability_status, u.last_login_at, u.created_at, u.updated_at,
-       COALESCE(array_agg(DISTINCT r.name) FILTER (WHERE r.name IS NOT NULL), '{}') AS roles,
-       COALESCE(array_agg(DISTINCT p.code) FILTER (WHERE p.code IS NOT NULL), '{}') AS permissions
+       COALESCE(group_concat(DISTINCT r.name), '') AS roles,
+       COALESCE(group_concat(DISTINCT p.code), '') AS permissions
 FROM users u
 LEFT JOIN user_roles ur ON ur.user_id=u.id
 LEFT JOIN roles r ON r.id=ur.role_id
@@ -141,7 +140,7 @@ def authenticate_session(token: str) -> dict | None:
         session = conn.execute(
             """SELECT id, user_id FROM sessions
                WHERE token_hash=%s AND revoked_at IS NULL AND expires_at>%s
-               FOR UPDATE""",
+              """,
             (token_hash, now),
         ).fetchone()
         if not session:
@@ -180,7 +179,7 @@ def login(email: str, password: str, *, user_agent: str | None, ip_address: str 
     normalized = (email or "").strip().lower()
     with connection() as conn, conn.transaction():
         account = conn.execute(
-            "SELECT id, password_hash, status FROM users WHERE email=%s FOR UPDATE",
+            "SELECT id, password_hash, status FROM users WHERE email=%s",
             (normalized,),
         ).fetchone()
         if not account or not verify_password(password, account["password_hash"]):
@@ -212,7 +211,7 @@ def logout(session_id: str, actor_id: str) -> None:
             (session_id, actor_id),
         )
         conn.execute(
-            """UPDATE users u SET availability_status='OFFLINE',updated_at=now()
+            """UPDATE users AS u SET availability_status='OFFLINE',updated_at=now()
                WHERE u.id=%s
                  AND u.availability_status='AVAILABLE'
                  AND NOT EXISTS (
@@ -228,7 +227,7 @@ def change_password(actor: dict, current_password: str, new_password: str) -> di
     new_hash = hash_password(new_password)
     with connection() as conn, conn.transaction():
         row = conn.execute(
-            "SELECT password_hash FROM users WHERE id=%s FOR UPDATE", (actor["id"],)
+            "SELECT password_hash FROM users WHERE id=%s", (actor["id"],)
         ).fetchone()
         if not row or not verify_password(current_password, row["password_hash"]):
             raise Forbidden("Current password is incorrect.")
@@ -265,7 +264,7 @@ def update_own_profile(actor: dict, *, full_name: str) -> dict:
         raise DomainError("Full name must be between 2 and 160 characters.")
     with connection() as conn, conn.transaction():
         before = conn.execute(
-            "SELECT full_name FROM users WHERE id=%s FOR UPDATE", (actor["id"],)
+            "SELECT full_name FROM users WHERE id=%s", (actor["id"],)
         ).fetchone()
         if not before:
             raise NotFound("User not found.")
@@ -312,7 +311,7 @@ def update_own_preferences(
         raise DomainError("Notification preferences must be an object.")
     with connection() as conn, conn.transaction():
         before = conn.execute(
-            "SELECT theme,notification_preferences FROM user_preferences WHERE user_id=%s FOR UPDATE",
+            "SELECT theme,notification_preferences FROM user_preferences WHERE user_id=%s",
             (actor["id"],),
         ).fetchone()
         previous_theme = before["theme"] if before else "system"
@@ -375,7 +374,7 @@ def create_user(actor: dict | None, *, email: str, full_name: str, role: str,
             _audit(conn, actor.get("id") if actor else None, "user.created", "user", str(user["id"]),
                    after={"email": email.strip().lower(), "role": role, "status": status})
             result = safe_user(_principal_row(conn, str(user["id"])))
-    except UniqueViolation as error:
+    except IntegrityError as error:
         raise Conflict("An account with that email already exists.") from error
     result["temporaryPassword"] = temporary_password
     return result
@@ -386,7 +385,7 @@ def list_users(*, search: str | None = None, role: str | None = None,
     clauses = ["TRUE"]
     params: list[Any] = []
     if search:
-        clauses.append("(u.email ILIKE %s OR u.full_name ILIKE %s)")
+        clauses.append("(u.email LIKE %s OR u.full_name LIKE %s)")
         params.extend([f"%{search}%", f"%{search}%"])
     if role:
         clauses.append("r.name=%s")
@@ -408,7 +407,7 @@ def update_user_status(actor: dict, user_id: str, status: str) -> dict:
     if status not in {"ACTIVE", "DISABLED", "LOCKED"}:
         raise DomainError("Unsupported account status.")
     with connection() as conn, conn.transaction():
-        before = conn.execute("SELECT status FROM users WHERE id=%s FOR UPDATE", (user_id,)).fetchone()
+        before = conn.execute("SELECT status FROM users WHERE id=%s", (user_id,)).fetchone()
         if not before:
             raise NotFound("User not found.")
         conn.execute(
@@ -440,7 +439,7 @@ def update_user(actor: dict, user_id: str, *, email: str | None,
                    before={"email": before["email"], "fullName": before["full_name"], "areaId": before["area_id"]},
                    after={"email": updated["email"], "fullName": updated["full_name"], "areaId": updated["area_id"]})
             return safe_user(updated)
-    except UniqueViolation as error:
+    except IntegrityError as error:
         raise Conflict("An account with that email already exists.") from error
 
 
@@ -477,8 +476,7 @@ def reset_user_password(actor: dict, user_id: str) -> dict:
 def list_roles() -> list[dict]:
     with connection() as conn:
         rows = conn.execute(
-            """SELECT r.name,r.description,COALESCE(array_agg(p.code ORDER BY p.code)
-               FILTER (WHERE p.code IS NOT NULL),'{}') permissions
+            """SELECT r.name,r.description,COALESCE(group_concat(DISTINCT p.code), '') permissions
                FROM roles r LEFT JOIN role_permissions rp ON rp.role_id=r.id
                LEFT JOIN permissions p ON p.id=rp.permission_id GROUP BY r.id ORDER BY r.name"""
         ).fetchall()
@@ -532,7 +530,7 @@ def upsert_camera(actor: dict, data: dict, camera_id: str | None = None) -> dict
         raise DomainError("Unsupported camera status.")
     with connection() as conn, conn.transaction():
         if camera_id:
-            before = conn.execute("SELECT * FROM cameras WHERE id=%s FOR UPDATE", (camera_id,)).fetchone()
+            before = conn.execute("SELECT * FROM cameras WHERE id=%s", (camera_id,)).fetchone()
             if not before:
                 raise NotFound("Camera not found.")
             row = conn.execute(
@@ -562,7 +560,7 @@ def upsert_camera(actor: dict, data: dict, camera_id: str | None = None) -> dict
 def create_ai_incident(data: dict) -> dict:
     detector_event_id = str(data.get("detectorEventId") or "").strip()
     if not detector_event_id:
-        raise DomainError("detectorEventId is required for PostgreSQL incident identity.")
+        raise DomainError("detectorEventId is required for SQLite incident identity.")
     detection_mode = data.get("detectionMode") or "temporal_collision"
     if detection_mode not in {"temporal_collision", "aftermath_review"}:
         raise DomainError("Unsupported detection mode.")
@@ -570,7 +568,7 @@ def create_ai_incident(data: dict) -> dict:
         camera_key = str(data.get("cameraKey") or "")
         # Serialize competing observations of one camera; the unique event key
         # also protects replay and concurrent processing across workers.
-        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (camera_key or detector_event_id,))
+        # BEGIN IMMEDIATE serializes duplicate-camera/event decisions.
         existing = conn.execute(
             "SELECT id FROM incidents WHERE detector_event_id=%s", (detector_event_id,)
         ).fetchone()
@@ -586,7 +584,7 @@ def create_ai_incident(data: dict) -> dict:
                 return {"incidentId": str(pending["id"]), "incidentCreated": False, "duplicateEvent": True}
         camera_id = data.get("postgresCameraId")
         if not camera_id and data.get("cameraId"):
-            camera = conn.execute("SELECT id FROM cameras WHERE legacy_id=%s OR id::text=%s",
+            camera = conn.execute("SELECT id FROM cameras WHERE legacy_id=%s OR id=%s",
                                   (data["cameraId"], data["cameraId"])).fetchone()
             camera_id = camera["id"] if camera else None
         evidence = {**(data.get("evidenceSummary") or {}), "cameraKey": camera_key}
@@ -695,7 +693,7 @@ def claim_review(actor: dict, incident_id: str, *, minutes: int = 15) -> dict:
     with connection() as conn, conn.transaction():
         row = conn.execute(
             """UPDATE review_cases SET status='UNDER_REVIEW',reviewed_by=%s,review_started_at=now(),
-               claim_expires_at=now()+(%s || ' minutes')::interval,updated_at=now()
+               claim_expires_at=minutes_from_now(%s),updated_at=now()
                WHERE incident_id=%s AND (
                  status='PENDING_REVIEW' OR
                  (status='UNDER_REVIEW' AND (reviewed_by=%s OR claim_expires_at<now()))
@@ -725,7 +723,7 @@ def complete_review(actor: dict, incident_id: str, *, decision: str, priority: s
             raise DomainError("Priority and incident type are required to confirm a crash.")
     with connection() as conn, conn.transaction():
         review = conn.execute(
-            "SELECT * FROM review_cases WHERE incident_id=%s FOR UPDATE", (incident_id,)
+            "SELECT * FROM review_cases WHERE incident_id=%s", (incident_id,)
         ).fetchone()
         if not review:
             raise NotFound("Review case not found.")
@@ -756,7 +754,7 @@ def responder_heartbeat(actor: dict) -> dict:
         raise Forbidden("Responder presence is available only to responder accounts.")
     with connection() as conn, conn.transaction():
         row = conn.execute(
-            """UPDATE users u
+            """UPDATE users AS u
                SET availability_status=CASE
                      WHEN u.availability_status='OFFLINE' AND NOT EXISTS (
                        SELECT 1 FROM assignments a
@@ -785,7 +783,7 @@ def list_responders() -> list[dict]:
                       u.availability_status AS "availabilityStatus",u.area_id AS "areaId",
                       u.last_login_at AS "lastLoginAt",activity.last_seen_at AS "lastSeenAt",
                       CASE
-                        WHEN activity.active_last_seen_at >= now() - make_interval(secs => %s)
+                        WHEN activity.active_last_seen_at >= seconds_ago(%s)
                           THEN 'ONLINE'
                         ELSE 'OFFLINE'
                       END AS "presenceStatus",
@@ -793,26 +791,24 @@ def list_responders() -> list[dict]:
                       active_assignment.status AS "activeAssignmentStatus",
                       active_assignment.incident_id AS "activeIncidentId"
                FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id
-               LEFT JOIN LATERAL (
-                 SELECT max(s.last_used_at) AS last_seen_at,
+               LEFT JOIN (
+                 SELECT s.user_id, max(s.last_used_at) AS last_seen_at,
                         max(s.last_used_at) FILTER (
                           WHERE s.revoked_at IS NULL AND s.expires_at>now()
                         ) AS active_last_seen_at
-                 FROM sessions s WHERE s.user_id=u.id
-               ) activity ON TRUE
-               LEFT JOIN LATERAL (
-                 SELECT a.id,a.status,a.incident_id
-                 FROM assignments a
-                 WHERE a.responder_id=u.id
+                 FROM sessions s GROUP BY s.user_id
+               ) activity ON activity.user_id=u.id
+               LEFT JOIN assignments active_assignment ON active_assignment.id=(
+                 SELECT a.id FROM assignments a WHERE a.responder_id=u.id
                    AND a.status IN ('ASSIGNED','ACCEPTED','EN_ROUTE','ARRIVED','RESPONDING')
                  ORDER BY a.assigned_at DESC LIMIT 1
-               ) active_assignment ON TRUE
+               )
                WHERE r.name='RESPONDER' AND u.status='ACTIVE'
                ORDER BY
                  CASE
-                   WHEN activity.active_last_seen_at >= now() - make_interval(secs => %s)
+                   WHEN activity.active_last_seen_at >= seconds_ago(%s)
                         AND active_assignment.id IS NULL AND u.availability_status='AVAILABLE' THEN 1
-                   WHEN activity.active_last_seen_at >= now() - make_interval(secs => %s) THEN 2
+                   WHEN activity.active_last_seen_at >= seconds_ago(%s) THEN 2
                    ELSE 4
                  END,
                  u.full_name""",
@@ -827,21 +823,21 @@ def list_responders() -> list[dict]:
 
 def assign_responder(actor: dict, incident_id: str, responder_id: str, *, reassign: bool = False) -> dict:
     with connection() as conn, conn.transaction():
-        incident = conn.execute("SELECT state FROM incidents WHERE id=%s FOR UPDATE", (incident_id,)).fetchone()
+        incident = conn.execute("SELECT state FROM incidents WHERE id=%s", (incident_id,)).fetchone()
         if not incident:
             raise NotFound("Incident not found.")
         if incident["state"] not in {"CONFIRMED", "ACTIVE_RESPONSE"}:
             raise Conflict("Only a confirmed unresolved incident can be assigned.")
         responder = conn.execute(
             """SELECT u.id FROM users u JOIN user_roles ur ON ur.user_id=u.id JOIN roles r ON r.id=ur.role_id
-               WHERE u.id=%s AND u.status='ACTIVE' AND r.name='RESPONDER' FOR UPDATE""",
+               WHERE u.id=%s AND u.status='ACTIVE' AND r.name='RESPONDER'""",
             (responder_id,),
         ).fetchone()
         if not responder:
             raise NotFound("Active responder not found.")
         active = conn.execute(
             """SELECT * FROM assignments WHERE incident_id=%s
-               AND status IN ('ASSIGNED','ACCEPTED','EN_ROUTE','ARRIVED','RESPONDING') FOR UPDATE""",
+               AND status IN ('ASSIGNED','ACCEPTED','EN_ROUTE','ARRIVED','RESPONDING')""",
             (incident_id,),
         ).fetchone()
         previous_id = None
@@ -871,7 +867,7 @@ def assign_responder(actor: dict, incident_id: str, responder_id: str, *, reassi
 
 def cancel_assignment(actor: dict, assignment_id: str) -> dict:
     with connection() as conn, conn.transaction():
-        row = conn.execute("SELECT * FROM assignments WHERE id=%s FOR UPDATE", (assignment_id,)).fetchone()
+        row = conn.execute("SELECT * FROM assignments WHERE id=%s", (assignment_id,)).fetchone()
         if not row:
             raise NotFound("Assignment not found.")
         if row["status"] not in ACTIVE_ASSIGNMENT_STATES:
@@ -911,7 +907,7 @@ def transition_assignment(actor: dict, assignment_id: str, target_status: str, *
     if not required_permission or required_permission not in actor["permissions"]:
         raise Forbidden("You do not have permission for this response transition.")
     with connection() as conn, conn.transaction():
-        current = conn.execute("SELECT * FROM assignments WHERE id=%s FOR UPDATE", (assignment_id,)).fetchone()
+        current = conn.execute("SELECT * FROM assignments WHERE id=%s", (assignment_id,)).fetchone()
         if not current:
             raise NotFound("Assignment not found.")
         if str(current["responder_id"]) != actor["id"]:
@@ -1008,16 +1004,16 @@ def analytics_summary() -> dict:
             """SELECT
               (SELECT count(*) FROM cameras WHERE status='ONLINE') active_cameras,
               (SELECT count(*) FROM users WHERE status='ACTIVE') active_users,
-              (SELECT count(*) FROM incidents WHERE detected_at::date=current_date) incidents_today,
-              (SELECT count(*) FROM incidents WHERE detected_at>=date_trunc('week',now())) incidents_week,
-              (SELECT count(*) FROM incidents WHERE detected_at>=date_trunc('month',now())) incidents_month,
+              (SELECT count(*) FROM incidents WHERE date(detected_at)=date('now')) incidents_today,
+              (SELECT count(*) FROM incidents WHERE detected_at>=strftime('%Y-%m-%dT00:00:00+00:00','now','weekday 0','-6 days')) incidents_week,
+              (SELECT count(*) FROM incidents WHERE detected_at>=strftime('%Y-%m-01T00:00:00+00:00','now')) incidents_month,
               (SELECT count(*) FROM review_cases WHERE status='CONFIRMED') confirmed_incidents,
               (SELECT count(*) FROM review_cases WHERE status='FALSE_ALARM') false_alarms,
-              (SELECT round(extract(epoch from avg(reviewed_at-review_started_at)))
+              (SELECT round(avg((julianday(reviewed_at)-julianday(review_started_at))*86400))
                  FROM review_cases WHERE reviewed_at IS NOT NULL AND review_started_at IS NOT NULL) average_review_seconds,
-              (SELECT round(extract(epoch from avg(accepted_at-assigned_at)))
+              (SELECT round(avg((julianday(accepted_at)-julianday(assigned_at))*86400))
                  FROM assignments WHERE accepted_at IS NOT NULL) average_acceptance_seconds,
-              (SELECT round(extract(epoch from avg(resolved_at-assigned_at)))
+              (SELECT round(avg((julianday(resolved_at)-julianday(assigned_at))*86400))
                  FROM assignments WHERE resolved_at IS NOT NULL) average_response_seconds,
               (SELECT count(*) FROM assignments WHERE status IN ('ASSIGNED','ACCEPTED','EN_ROUTE','ARRIVED','RESPONDING')) active_responses,
               (SELECT count(*) FROM review_cases WHERE status='PENDING_REVIEW') pending_reviews,

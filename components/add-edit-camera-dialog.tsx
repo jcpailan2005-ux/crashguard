@@ -641,7 +641,7 @@ export function AddEditCameraDialog({
             {saving ? (
               <>
                 <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                Saving to PostgreSQL...
+                Saving to SQLite...
               </>
             ) : isEditing ? (
               'Save Changes'

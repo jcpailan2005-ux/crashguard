@@ -1018,7 +1018,7 @@ def upsert_user_profile(data: dict) -> dict:
     return dict(row)
 
 
-def _sync_camera_to_postgres(camera_data: dict) -> None:
+def _sync_camera_to_operations(camera_data: dict) -> None:
     try:
         from backend.phase3.database import connection
         legacy_id = camera_data.get("cameraId")
@@ -1069,7 +1069,7 @@ def _sync_camera_to_postgres(camera_data: dict) -> None:
         pass
 
 
-def _sync_camera_active_to_postgres(camera_id: str, active: bool) -> None:
+def _sync_camera_active_to_operations(camera_id: str, active: bool) -> None:
     try:
         from backend.phase3.database import connection
         status_val = "OFFLINE" if active else "DISABLED"
@@ -1094,7 +1094,7 @@ def get_camera(camera_id: str) -> dict | None:
         ).fetchone()
     camera = _row_to_camera(row) if row else None
     if camera and not camera.get("streamUrl"):
-        # Check if PostgreSQL has stream_reference
+        # Check if operational SQLite has stream_reference
         try:
             from backend.phase3.database import connection
             with connection() as pg:
@@ -1161,7 +1161,7 @@ def list_cameras(
             params,
         ).fetchall()
     cameras = [_row_to_camera(row) for row in rows]
-    # Reconcile any missing streamUrl from PostgreSQL
+    # Reconcile any missing streamUrl from operational SQLite
     try:
         from backend.phase3.database import connection
         with connection() as pg:
@@ -1236,7 +1236,7 @@ def upsert_camera(data: dict) -> dict:
             (camera_id,),
         ).fetchone()
     camera = _row_to_camera(row)
-    _sync_camera_to_postgres(camera)
+    _sync_camera_to_operations(camera)
     return camera
 
 
@@ -1247,7 +1247,7 @@ def set_camera_active(camera_id: str, active: bool) -> dict | None:
             "UPDATE cameras SET isActive = ?, updatedAt = ? WHERE cameraId = ?",
             (1 if active else 0, timestamp, camera_id),
         )
-    _sync_camera_active_to_postgres(camera_id, active)
+    _sync_camera_active_to_operations(camera_id, active)
     return get_camera(camera_id)
 
 

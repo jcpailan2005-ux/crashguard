@@ -112,7 +112,7 @@ These items are present in the current codebase:
 - Live camera view includes timestamp overlay, alert debouncing, and meaningful-history filtering.
 - Detection preview dialog exists for annotated images and videos.
 - Backend video processing includes codec fallback and frame skipping.
-- Physical CCTV camera onboarding (RTSP/IP) is implemented with automated health checks, reconnect logic, and PostgreSQL synchronization.
+- Physical CCTV camera onboarding (RTSP/IP) is implemented with automated health checks, reconnect logic, and SQLite synchronization.
 - Dual-Path Crash Detection is fully implemented and tested:
   - Dynamic Temporal Path (Priority 1): detects live collisions in motion (`confirmed_crash` with siren alarm).
   - High-Confidence Aftermath Path (Priority 2): detects stationary post-impact scenes without requiring rollover geometry (`possible_crash_aftermath` with visual review alert for Dispatcher).
@@ -131,7 +131,7 @@ These items are still incomplete, unverified, or mismatched with the intended pr
 - There is a duplicate backend file `backend/carc.py`, which can cause confusion about which app is authoritative. Use `backend/main.py`.
 
 ## Known Mismatches To Be Honest About
-- In-memory data structures in `backend/main.py` serve the fast live camera monitor cycles, while PostgreSQL `127.0.0.1:5433` serves the persistent authority for cameras, crash cases, reviews, and dispatch workflows.
+- In-memory data structures in `backend/main.py` serve the fast live camera monitor cycles. SQLite `data/crashguard-operations.sqlite` owns session authentication, roles, operational incidents, reviews, dispatch, preferences and audit records. SQLite `data/crashguard.sqlite` retains the local camera registry, legacy cases and capture metadata. Runtime requires neither Firebase nor PostgreSQL. `CRASHGUARD_SQLITE_PATH` can override the operational file; database files and sidecars remain local and ignored.
 
 ## Practical Error And Failure Modes
 This section is not mathematically exhaustive, but it covers the current major errors and likely failure cases in this repo.

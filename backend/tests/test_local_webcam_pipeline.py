@@ -133,10 +133,10 @@ class SavedSourceTests(unittest.TestCase):
         with TestClient(app.app) as client:
             self.assertEqual(client.get('/api/cameras/local-webcam-sources').status_code, 401)
             viewer = {'role': 'responder', 'permissions': ['cameras.view'], 'uid': 'viewer'}
-            with patch.object(app, 'verify_firebase_user', return_value=viewer):
+            with patch.object(app, 'verify_session_user', return_value=viewer):
                 self.assertEqual(client.get('/api/cameras/local-webcam-sources').status_code, 403)
             editor = {'role': 'dispatcher', 'permissions': ['cameras.create'], 'uid': 'editor'}
-            with patch.object(app, 'verify_firebase_user', return_value=editor):
+            with patch.object(app, 'verify_session_user', return_value=editor):
                 response = client.get('/api/cameras/local-webcam-sources')
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json(), [{'reference': 'webcam://school-demo-webcam', 'name': 'USB Webcam (REDRAGON Live Camera)'}])

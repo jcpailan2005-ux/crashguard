@@ -4,7 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from psycopg.types.json import Jsonb
+from backend.phase3.service import _json as Jsonb
 
 from backend.phase3.database import connection
 
@@ -82,7 +82,7 @@ def main() -> None:
                    (legacy_case_id,detector_event_id,camera_id,state,detection_mode,ai_score,evidence_summary,
                     media,location,latitude,longitude,detected_at,resolved_at)
                    VALUES (%s,%s,(SELECT id FROM cameras WHERE legacy_id=%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           CASE WHEN %s='RESOLVED' THEN COALESCE(%s::timestamptz,now()) ELSE NULL END)
+                           CASE WHEN %s='RESOLVED' THEN COALESCE(%s,now()) ELSE NULL END)
                    ON CONFLICT(detector_event_id) DO NOTHING RETURNING id""",
                 (legacy_case_id, detector_event_id, value(case, "cameraId"), incident_state, mode,
                  max(0.0, min(1.0, float(value(case, "confidence", "crashScore", default=0) or 0))),

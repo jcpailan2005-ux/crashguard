@@ -4,6 +4,7 @@ import test from 'node:test'
 
 import {
   acceptLiveBoxPacket,
+  cameraAnalysisPacketUrl,
   cameraDetectionGridClass,
   clipAnalysisBoxes,
   createLiveBoxCursor,
@@ -38,6 +39,25 @@ test('matching packets render while wrong camera packets are rejected', () => {
   assert.equal(acceptLiveBoxPacket('CAM-A', packet('CAM-B', 'S1', 1), createLiveBoxCursor(), 10, 1000), null)
 })
 
+test('single-camera packet reads carry the matching preview ticket and preserve cookie fallback', () => {
+  const url = new URL(cameraAnalysisPacketUrl('http://127.0.0.1:8010', 'CAM-A',
+    'http://127.0.0.1:8010/api/cameras/CAM-A/events?token=synthetic-test-ticket&boxes_only=true'))
+  assert.equal(url.pathname, '/api/cameras/CAM-A/analysis-packet')
+  assert.equal(url.searchParams.get('token'), 'synthetic-test-ticket')
+  assert.equal(url.searchParams.has('boxes_only'), false)
+  assert.equal(new URL(cameraAnalysisPacketUrl('http://127.0.0.1:8010', 'CAM-A', null)).search, '')
+})
+
+test('preview tickets cannot be forwarded from another origin or camera', () => {
+  for (const eventsUrl of [
+    'https://untrusted.example.invalid/api/cameras/CAM-A/events?token=synthetic-test-ticket',
+    'http://127.0.0.1:8010/api/cameras/CAM-B/events?token=synthetic-test-ticket',
+    'http://127.0.0.1:8010/unrelated?token=synthetic-test-ticket',
+  ]) {
+    assert.equal(new URL(cameraAnalysisPacketUrl('http://127.0.0.1:8010', 'CAM-A', eventsUrl)).searchParams.has('token'), false)
+  }
+})
+
 test('duplicate sequences, retired sessions, and stale packets are rejected', () => {
   const cursor = createLiveBoxCursor()
   assert.ok(acceptLiveBoxPacket('CAM-A', packet('CAM-A', 'S1', 1), cursor, 10, 1000))
@@ -61,6 +81,31 @@ test('box clipping and contain scaling preserve exact-frame coordinates', () => 
   assert.equal(Math.round(rect.width), 667)
   assert.equal(Math.round(rect.height), 500)
   assert.equal(Math.round(rect.left), 167)
+})
+
+test('a delayed exact-frame packet renders as stale within its explicit delivery window', () => {
+  const delayed = packet('CAM-A', 'S1', 1)
+  delayed.resultAgeMs = 1200
+  delayed.validForMs = 0
+  delayed.retentionForMs = 3800
+  const view = acceptLiveBoxPacket('CAM-A', delayed, createLiveBoxCursor(), 600, 1000)
+  assert.ok(view)
+  assert.equal(view.packet.imageDataUrl, delayed.imageDataUrl)
+  assert.deepEqual(view.packet.boxes, delayed.boxes)
+  assert.equal(view.expiresAt, 1000)
+  assert.equal(view.retentionExpiresAt, 4200)
+})
+
+test('expired delivery, invalid timing, wrong camera and retired sessions remain rejected', () => {
+  const delayed = { ...packet('CAM-A', 'S1', 1), resultAgeMs: 4900, validForMs: 0, retentionForMs: 100 }
+  assert.equal(acceptLiveBoxPacket('CAM-A', delayed, createLiveBoxCursor(), 101, 1000), null)
+  assert.equal(acceptLiveBoxPacket('CAM-B', delayed, createLiveBoxCursor(), 0, 1000), null)
+  assert.equal(acceptLiveBoxPacket('CAM-A', { ...delayed, resultAgeMs: NaN }, createLiveBoxCursor(), 0, 1000), null)
+  assert.equal(acceptLiveBoxPacket('CAM-A', delayed, createLiveBoxCursor(), -1, 1000), null)
+  const cursor = createLiveBoxCursor()
+  assert.ok(acceptLiveBoxPacket('CAM-A', packet('CAM-A', 'S1', 1), cursor, 0, 1000))
+  assert.ok(acceptLiveBoxPacket('CAM-A', packet('CAM-A', 'S2', 1), cursor, 0, 1100))
+  assert.equal(acceptLiveBoxPacket('CAM-A', delayed, cursor, 0, 1200), null)
 })
 
 test('responsive grid supports one, two, four, and five camera layouts', () => {
@@ -90,13 +135,14 @@ test('dedicated route exposes compact filters, readable boxes, expand, and close
   assert.match(grid, /Frame sequence:/)
 })
 
-test('offline cameras remain independent and detection toggle changes rendering only', () => {
+test('offline cameras remain independent and detections cannot be hidden', () => {
   const grid = readFileSync('components/camera-detection-grid.tsx', 'utf8')
   assert.match(grid, /Promise\.allSettled/)
   assert.match(grid, /return 'OFFLINE'/)
   assert.match(grid, /visibleCameras\.map/)
   assert.match(grid, /const view = useCameraAnalysis\(camera\.cameraId\)/)
-  assert.match(grid, /showDetections && loadedFrameKey === packetKey/)
+  assert.match(grid, /loadedFrameKey === packetKey/)
+  assert.doesNotMatch(grid, /setShowDetections|Boxes hidden|Detections OFF/)
   assert.doesNotMatch(grid, /useCameraAnalysis\(camera\.cameraId,\s*showDetections\)/)
 })
 
@@ -120,13 +166,14 @@ test('analysis fallback remains active until a real boxes event arrives', () => 
   assert.doesNotMatch(client, /events\.onopen = \(\) => \{ fallback = false/)
 })
 
-test('Live Monitor removes analyzed-frame presentation from control-room views', () => {
+test('Live Monitor shows synchronized detections in control-room views', () => {
   const page = readFileSync('app/dispatcher/live/page.tsx', 'utf8')
   const workspace = readFileSync('components/cctv-monitor-workspace.tsx', 'utf8')
   const liveCamera = readFileSync('components/live-camera.tsx', 'utf8')
   assert.match(page, /className="sr-only">Live Monitor/)
   assert.match(workspace, /useState<'single' \| 'grid'>\('grid'\)/)
-  assert.doesNotMatch(workspace, /<CameraTileDetectionView|showDetections/)
+  assert.match(workspace, /<CameraDetectionSurface cameraId=\{camera.cameraId\}/)
   assert.match(workspace, /alt=\{`\$\{safeCameraName\(camera\)\} live preview`\}/)
-  assert.match(liveCamera, /!controlRoomMode && sourceTab === 'cctv'/)
+  assert.match(liveCamera, /isCctvLive && analysisPacket/)
+  assert.match(liveCamera, /loadedAnalysisKey === analysisKey/)
 })

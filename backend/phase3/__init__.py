@@ -1,1 +1,1 @@
-"""PostgreSQL-backed Phase 3 operational architecture."""
+"""SQLite-backed operational APIs."""

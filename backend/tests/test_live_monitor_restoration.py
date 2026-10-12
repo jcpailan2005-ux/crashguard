@@ -196,17 +196,17 @@ class PermissionTests(unittest.TestCase):
         for role in ('ADMIN', 'DISPATCHER', 'RESPONDER'):
             for action in ('create', 'update', 'disable'):
                 user = dict(role=role.lower(), permissions=list(ROLE_PERMISSIONS[role]))
-                with patch.object(app, 'verify_firebase_user', return_value=user):
+                with patch.object(app, 'verify_session_user', return_value=user):
                     if role == 'ADMIN' or (role == 'DISPATCHER' and action == 'create'):
                         self.assertIs(app.require_camera_editor(MagicMock(), 'cameras.'+action), user)
                     else:
                         with self.assertRaises(HTTPException):
                             app.require_camera_editor(MagicMock(), 'cameras.'+action)
-        with patch.object(app, 'verify_firebase_user', return_value=dict(role='dispatcher', permissions=['cameras.create'])):
+        with patch.object(app, 'verify_session_user', return_value=dict(role='dispatcher', permissions=['cameras.create'])):
             app.require_camera_editor(MagicMock(), 'cameras.create')
 
     def test_missing_session_does_not_gain_local_dispatcher_access(self):
-        with patch.object(app, 'verify_firebase_user', side_effect=HTTPException(401, 'Authentication required')):
+        with patch.object(app, 'verify_session_user', side_effect=HTTPException(401, 'Authentication required')):
             with self.assertRaises(HTTPException) as ctx:
                 app.require_camera_editor(MagicMock())
             self.assertEqual(ctx.exception.status_code, 401)
@@ -215,7 +215,7 @@ class PermissionTests(unittest.TestCase):
         user = dict(role='admin', permissions=['cameras.disable'])
         for camera, protected in [(dict(cameraType='RTSP'), False), (dict(cameraType='Demo'), True),
                                   (dict(streamUrl='demo://1'), True), (dict(cameraIp='demo-1'), True)]:
-            with patch.object(app, 'verify_firebase_user', return_value=user), patch.object(app, 'get_camera', return_value=camera), patch.object(app, 'delete_camera') as delete:
+            with patch.object(app, 'verify_session_user', return_value=user), patch.object(app, 'get_camera', return_value=camera), patch.object(app, 'delete_camera') as delete:
                 if protected:
                     with self.assertRaises(HTTPException):
                         app.api_delete_camera('CAM', MagicMock())

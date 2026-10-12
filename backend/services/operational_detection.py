@@ -1,4 +1,4 @@
-"""Detection-to-dispatch boundary; PostgreSQL owns operational incidents.
+"""Detection-to-dispatch boundary; operational SQLite owns operational incidents.
 
 Decision evaluation remains with the detector. This service never turns a
 candidate into a confirmed crash or synthesizes verifier measurements.

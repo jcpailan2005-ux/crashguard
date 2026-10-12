@@ -18,7 +18,7 @@ export async function authenticateAndResolveSession<TUser extends AuthenticatedL
 ): Promise<{ user: TUser; destination: string }> {
   await dependencies.login(email, password)
   // A successful POST is not enough. This request proves the browser accepted
-  // the HttpOnly cookie and the backend can resolve its PostgreSQL session.
+  // the HttpOnly cookie and the backend can resolve its SQLite session.
   const user = await dependencies.currentUser()
   if (!user.active) throw new Error('This account is inactive.')
   if (user.mustChangePassword) return { user, destination: '/change-password' }

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -17,11 +19,19 @@ def _unique_email(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}@test.crashguard.local"
 
 
-class Phase3PostgresTests(unittest.TestCase):
+class Phase3SQLiteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not os.getenv("DATABASE_URL", "").rstrip("/").endswith("crashguard_test"):
-            raise RuntimeError("Phase 3 integration tests require the isolated crashguard_test database.")
+        cls.temp = tempfile.TemporaryDirectory(prefix='crashguard-operations-tests-')
+        cls.previous_path = os.environ.get('CRASHGUARD_SQLITE_PATH')
+        os.environ['CRASHGUARD_SQLITE_PATH'] = str(Path(cls.temp.name) / 'operations.sqlite')
+        cls.addClassCleanup(cls.temp.cleanup)
+        def restore():
+            if cls.previous_path is None:
+                os.environ.pop('CRASHGUARD_SQLITE_PATH', None)
+            else:
+                os.environ['CRASHGUARD_SQLITE_PATH'] = cls.previous_path
+        cls.addClassCleanup(restore)
         app = FastAPI()
         app.include_router(router)
         cls.app = app
@@ -29,7 +39,8 @@ class Phase3PostgresTests(unittest.TestCase):
 
     def setUp(self):
         with connection() as conn, conn.transaction():
-            conn.execute("TRUNCATE users,areas,cameras,incidents CASCADE")
+            for table in ('incidents', 'cameras', 'users', 'areas'):
+                conn.execute(f'DELETE FROM {table}')
         self.accounts = {}
         for name, role in (
             ("admin", "ADMIN"), ("dispatcher", "DISPATCHER"),
@@ -318,7 +329,7 @@ class Phase3PostgresTests(unittest.TestCase):
         responder_id = self.accounts["responder"]["user"]["id"]
         with connection() as conn, conn.transaction():
             conn.execute(
-                "UPDATE sessions SET last_used_at=now()-interval '2 minutes' WHERE user_id=%s",
+                "UPDATE sessions SET last_used_at=seconds_ago(120) WHERE user_id=%s",
                 (responder_id,),
             )
             conn.execute(
@@ -386,7 +397,7 @@ class Phase3PostgresTests(unittest.TestCase):
         )
         with connection() as conn, conn.transaction():
             conn.execute(
-                "UPDATE sessions SET last_used_at=now()-interval '2 minutes' WHERE user_id=%s",
+                "UPDATE sessions SET last_used_at=seconds_ago(120) WHERE user_id=%s",
                 (second_id,),
             )
         response = self.client.get(
@@ -401,7 +412,24 @@ class Phase3PostgresTests(unittest.TestCase):
             "OFFLINE",
         )
 
+    def restore_camera_create_permission(self):
+        with connection() as conn, conn.transaction():
+            conn.execute("""INSERT OR IGNORE INTO role_permissions(role_id,permission_id)
+                            SELECT r.id,p.id FROM roles r CROSS JOIN permissions p
+                            WHERE r.name='DISPATCHER' AND p.code='cameras.create'""")
+
+    def test_dispatcher_explicit_camera_create_permission(self):
+        response = self.client.post('/api/v3/cameras', headers=self.headers('dispatcher'),
+                                    json={'name': 'Authorized Dispatcher Camera'})
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_dispatcher_camera_read_does_not_grant_camera_mutation(self):
+        # A view-only role must not gain write access; current dispatchers also
+        # receive explicit cameras.create through the existing migration.
+        with connection() as conn, conn.transaction():
+            conn.execute("""DELETE FROM role_permissions WHERE role_id=(SELECT id FROM roles WHERE name='DISPATCHER')
+                            AND permission_id=(SELECT id FROM permissions WHERE code='cameras.create')""")
+        self.addCleanup(self.restore_camera_create_permission)
         area = self.client.post(
             "/api/v3/areas",
             headers=self.headers("admin"),

@@ -1,4 +1,4 @@
-// Backend API response types and Firestore case types for Car Crash Detection System.
+// Backend API response types and case types for Car Crash Detection System.
 import { CaseActionType, CaseStatus } from '@/lib/incident-status'
 
 export type CrashCaseTriggerStatus =
@@ -86,6 +86,7 @@ export interface LiveBoxPacket {
   resultAgeMs: number
   sourceAgeMs: number | null
   validForMs: number
+  retentionForMs?: number // Exact image+boxes delivery window; freshness remains 500 ms.
 }
 
 export interface LiveBoxView {

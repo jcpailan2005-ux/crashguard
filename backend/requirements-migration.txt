@@ -1,0 +1,5 @@
+# Optional historical PostgreSQL import/migration tools only.
+SQLAlchemy==2.0.52
+alembic==1.19.1
+psycopg==3.3.4
+psycopg-binary==3.3.4

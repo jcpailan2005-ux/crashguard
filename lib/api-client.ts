@@ -19,7 +19,7 @@ import {
 } from './types'
 import { APP_CONFIG } from '@/lib/app-config'
 import { fetchWithBackendTimeout } from '@/lib/backend-fetch'
-import { acceptLiveBoxPacket, createLiveBoxCursor } from '@/lib/camera-analysis-view'
+import { acceptLiveBoxPacket, cameraAnalysisPacketUrl, createLiveBoxCursor } from '@/lib/camera-analysis-view'
 
 export const BACKEND_URL = APP_CONFIG.backendUrl
 const USE_MOCK_DATA = APP_CONFIG.useMockData
@@ -77,12 +77,9 @@ function normalizeDetectionResponse(result: DetectionResponse): DetectionRespons
     result.annotated_media_url ??
     result.annotated_key_frame_url ??
     null
-  const projectDetections = result.detections
-    .map((d) => {
-      const normalized = normalizeProjectLabel(d.label)
-      return normalized ? { ...d, label: normalized } : null
-    })
-    .filter((d): d is NonNullable<typeof d> => Boolean(d))
+  const projectDetections = result.detections.map(d => ({
+    ...d, label: normalizeProjectLabel(d.label) ?? d.label,
+  }))
 
   const backendConfidence = Number.isFinite(Number(result.confidence))
     ? Number(result.confidence)
@@ -472,7 +469,7 @@ export interface AuthResponse {
   user: AuthUser
 }
 
-export async function loginWithPostgres(email: string, password: string): Promise<AuthResponse> {
+export async function loginWithSQLite(email: string, password: string): Promise<AuthResponse> {
   const response = await fetchWithBackendTimeout(`${NORMALIZED_BACKEND_URL}/api/v3/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -488,21 +485,17 @@ export async function loginWithPostgres(email: string, password: string): Promis
   return (await response.json()) as AuthResponse
 }
 
-/** @deprecated Compatibility name for older components; uses PostgreSQL v3 auth. */
-export const loginWithSQLite = loginWithPostgres
 
-export async function logoutFromPostgres(): Promise<void> {
+export async function logoutFromSQLite(): Promise<void> {
   await apiCall<{ success: boolean }>('/api/v3/auth/logout', { method: 'POST' })
 }
 
-export async function getCurrentPostgresUser(): Promise<AuthUser> {
+export async function getCurrentSQLiteUser(): Promise<AuthUser> {
   return apiCall<{ user: AuthUser }>('/api/v3/auth/me').then((result) => result.user)
 }
 
-/** @deprecated Compatibility name for older components; uses PostgreSQL v3 auth. */
-export const getCurrentSQLiteUser = getCurrentPostgresUser
 
-export async function changePostgresPassword(
+export async function changeSQLitePassword(
   currentPassword: string,
   newPassword: string
 ): Promise<AuthUser> {
@@ -706,7 +699,8 @@ export async function createCameraStreamAccess(cameraId: string): Promise<Camera
 export function subscribeCameraBoxes(
   cameraId: string,
   eventsUrl: string | null,
-  receive: (view: LiveBoxView | null) => void
+  receive: (view: LiveBoxView | null) => void,
+  reportIssue?: (message: string | null) => void
 ): () => void {
   let stopped = false
   let inFlight = false
@@ -723,19 +717,37 @@ export function subscribeCameraBoxes(
     const timeout = setTimeout(() => requestController.abort(), 2000)
     const started = performance.now()
     try {
-      const response = await fetch(`${NORMALIZED_BACKEND_URL}/api/cameras/${encodeURIComponent(cameraId)}/analysis-packet`, {
+      const response = await fetch(cameraAnalysisPacketUrl(NORMALIZED_BACKEND_URL, cameraId, eventsUrl), {
         headers: await authHeaders(), credentials: 'include', cache: 'no-store', signal: requestController.signal,
       })
-      if (!response.ok) throw new Error('Analysis preview unavailable')
+      if (stopped) return
+      if (!response.ok) {
+        reportIssue?.(response.status === 401 ? 'Reconnect this camera to renew detection access.'
+          : response.status === 403 ? 'Camera detection access denied.'
+          : response.status === 404 ? 'Start monitoring to receive object detections.'
+          : 'Detection frames are unavailable. Retrying automatically.')
+        fallback = true
+        receive(null)
+        return
+      }
       const { packet } = await response.json() as { packet: LiveBoxPacket | null }
       if (stopped) return
-      if (!packet) { receive(null); return }
+      if (!packet) { fallback = true; reportIssue?.('Waiting for an analyzed detection frame.'); receive(null); return }
       const transportMs = performance.now() - started
       const now = performance.now()
       const view = acceptLiveBoxPacket(cameraId, packet, cursor, transportMs, now)
-      if (view) receive(view)
+      if (view) { reportIssue?.(null); receive(view) }
+      else if (packet.sourceFrame.sessionId !== cursor.lastFrame?.sessionId ||
+               packet.sourceFrame.sequence !== cursor.lastFrame?.sequence) {
+        fallback = true
+        reportIssue?.('Detection frame expired in transit. Retrying automatically.')
+      }
     } catch {
-      if (!stopped) receive(null)
+      fallback = true
+      if (!stopped) {
+        reportIssue?.('Detection frames could not be received. Check the backend connection.')
+        receive(null)
+      }
     } finally {
       clearTimeout(timeout)
       inFlight = false
@@ -1183,4 +1195,19 @@ export async function getDashboardStats() {
       lastDetectionTime: null,
     }
   }
+}
+
+/** Area-scoped status backed only by the SQLite operational API. */
+export function getLiveCameraSession(areaId: string) {
+  return apiCall<{ session: Record<string, unknown> | null }>(`/api/v3/live-camera-sessions/${encodeURIComponent(areaId)}`)
+}
+
+export function updateLiveCameraSession(areaId: string, payload: {
+  active?: boolean
+  latestDetection?: DetectionResponse | null
+  livePreviewDataUrl?: string | null
+}) {
+  return apiCall<{ success: boolean }>(`/api/v3/live-camera-sessions/${encodeURIComponent(areaId)}`, {
+    method: 'PUT', body: JSON.stringify(payload),
+  })
 }

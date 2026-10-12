@@ -69,7 +69,7 @@ export default function UploadPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const lastAlarmedIncidentIdRef = useRef<string | null>(null)
   const { toast } = useToast()
-  const { firebaseUser, personalPreferences, profile } = useAuth()
+  const { sessionUser, personalPreferences, profile } = useAuth()
   const alarmAudioEnabled = personalPreferences?.notificationPreferences.alarmAudio ?? true
   const router = useRouter()
 

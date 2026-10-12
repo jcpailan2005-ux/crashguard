@@ -7,6 +7,7 @@ import { armAccidentAlertAudio, classifyAlarmPlaybackError, playAccidentAlert, p
 import { enqueueFreshDispatcherAlarms } from '@/lib/dispatcher-alarm-delivery'
 import { DispatcherIncidentAlarmTracker } from '@/lib/incident-alarm-contract'
 import { phase3 } from '@/lib/phase3-api'
+import Link from 'next/link'
 
 /** Lives in the dispatcher layout, so route changes cannot stop incident polling or disarm audio. */
 export function DispatcherAlarmMonitor() {
@@ -14,6 +15,7 @@ export function DispatcherAlarmMonitor() {
   const [playing, setPlaying] = useState(false)
   const [error, setError] = useState('')
   const [playbackStatus, setPlaybackStatus] = useState('')
+  const [collisionIncidentId, setCollisionIncidentId] = useState<string | null>(null)
   const trackerRef = useRef(new DispatcherIncidentAlarmTracker())
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const armedRef = useRef(false)
@@ -79,6 +81,9 @@ export function DispatcherAlarmMonitor() {
           }
         )
         queueRef.current = delivery.pending
+        if (delivery.eligible.length > 0) {
+          setCollisionIncidentId(delivery.eligible[delivery.eligible.length - 1])
+        }
         if (!armedRef.current && delivery.eligible.length > 0) {
           setError('A new confirmed incident arrived while the siren was unarmed. Arm the siren for future incidents.')
         }
@@ -122,6 +127,14 @@ export function DispatcherAlarmMonitor() {
 
   return (
     <div className="flex items-center gap-2">
+      {collisionIncidentId ? (
+        <div role="alert" className="fixed right-4 top-20 z-50 flex items-center gap-3 rounded-lg border border-red-500 bg-red-950 p-4 text-white shadow-lg">
+          <Link href={`/dispatcher/review?incident=${encodeURIComponent(collisionIncidentId)}`} className="font-semibold underline">
+            Collision Detected — Review Incident
+          </Link>
+          <Button type="button" variant="secondary" size="sm" onClick={() => setCollisionIncidentId(null)}>Dismiss</Button>
+        </div>
+      ) : null}
       <Button type="button" size="sm" variant={armed ? 'default' : 'outline'} onClick={() => void toggle()}
         aria-label={armed ? 'Mute dispatcher collision alarm' : 'Arm dispatcher collision alarm'}>
         {armed ? <Volume2 className="mr-1 h-4 w-4" /> : <VolumeX className="mr-1 h-4 w-4" />}

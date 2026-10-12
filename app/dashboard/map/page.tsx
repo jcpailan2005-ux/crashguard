@@ -30,7 +30,6 @@ import { caseMedia as getCaseMedia, localCaseToCrashCase as mapLocalCaseToCrashC
 import {
   subscribeCrashCases,
 } from '@/lib/crash-case-store'
-import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
 import { ACTIVE_CASE_STATUSES, getCaseStatusLabel, getIncidentTitle } from '@/lib/incident-status'
 import { getCaseStatusClass } from '@/lib/theme-status'
 import { CrashCase, DetectionBox, LocalCrashCase } from '@/lib/types'
@@ -206,19 +205,10 @@ export default function LiveMapPage() {
   const [mediaLoadError, setMediaLoadError] = useState(false)
   const [deciding, setDeciding] = useState<'legit_crash' | 'false_alarm' | null>(null)
   const handledUrlCaseIdRef = useRef<string | null>(null)
-  const { firebaseUser, profile } = useAuth()
+  const { sessionUser, profile } = useAuth()
   const { toast } = useToast()
 
   useEffect(() => {
-    const db = getFirestoreOrNull()
-    const configError = getFirebaseConfigError()
-
-    if (!db || configError) {
-      setStoreError(configError ?? 'Firestore is not ready.')
-      setLoading(false)
-      return
-    }
-
     if (profile?.role === 'responder' && !profile.areaId) {
       setStoreError('Responder account has no assigned area. Ask an admin to update users/{uid}.')
       setLoading(false)
@@ -226,7 +216,6 @@ export default function LiveMapPage() {
     }
 
     return subscribeCrashCases(
-      db,
       (nextCases) => {
         setCases(nextCases)
         setStoreError(null)
@@ -328,7 +317,7 @@ export default function LiveMapPage() {
     return [selectedCase, ...activeCases]
   }, [activeCases, selectedCase])
   const media = getCaseMedia(selectedCase)
-  const actorId = firebaseUser?.uid ?? ''
+  const actorId = sessionUser?.uid ?? ''
   const canDecide =
     selectedCase?.status === 'pending_review' || selectedCase?.status === 'under_review'
 
@@ -342,7 +331,7 @@ export default function LiveMapPage() {
     setDeciding(decision)
     try {
       if (!selectedCase.caseId.startsWith('CASE-')) {
-        throw new Error('Legacy Firestore cases are read-only. Open the Dispatcher review queue for operational decisions.')
+        throw new Error('Legacy cases are read-only. Open the Dispatcher review queue for operational decisions.')
       }
       if (selectedCase.status === 'pending_review') {
         await applyLocalCrashCaseAction(selectedCase.caseId, { action: 'review_alert' })

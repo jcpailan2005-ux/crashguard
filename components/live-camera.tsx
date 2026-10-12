@@ -12,7 +12,7 @@ import {
   Square,
   X,
 } from 'lucide-react'
-import { CctvVideoOverlay, SynchronizedAnalysisPreview } from '@/components/cctv-video-overlay'
+import { CctvVideoOverlay } from '@/components/cctv-video-overlay'
 import { DetectedMediaViewer } from '@/components/detected-media-viewer'
 import {
   DetectionHistoryEntry,
@@ -30,6 +30,7 @@ import { armAccidentAlertAudio, playAccidentAlert } from '@/lib/accident-alert'
 import { APP_CONFIG } from '@/lib/app-config'
 import {
   createCameraStreamAccess,
+  subscribeCameraBoxes,
   detectFromFile,
   detectFromStreamUrl,
   fetchCameraPreviewFrameObjectUrl,
@@ -41,7 +42,7 @@ import {
   testCameraConnection,
 } from '@/lib/api-client'
 import { useDisplayMode } from '@/lib/display-mode'
-import { DetectionBox, DetectionResponse } from '@/lib/types'
+import { DetectionBox, DetectionResponse, LiveBoxView } from '@/lib/types'
 import {
   isCurrentCrashConfirmed,
   liveAlarmTracker,
@@ -271,12 +272,9 @@ function hasMeaningfulDetection(result: DetectionResponse): boolean {
 }
 
 function buildDisplayResult(result: DetectionResponse): DetectionResponse {
-  const projectDetections = result.detections
-    .map((d) => {
-      const normalized = normalizeProjectLabel(d.label)
-      return normalized ? { ...d, label: normalized } : null
-    })
-    .filter((d): d is NonNullable<typeof d> => Boolean(d))
+  const projectDetections = result.detections.map(d => ({
+    ...d, label: normalizeProjectLabel(d.label) ?? d.label,
+  }))
 
   const derivedAccidentDetected = result.accident_detected
 
@@ -451,6 +449,10 @@ function getCrashAlertStatusText(alert: CrashAlertState): string {
   const withThreshold = (message: string) =>
     thresholdLine ? `${message} ${thresholdLine}` : message
 
+  if (isCurrentCrashConfirmed(alert.result) && alert.kind === 'skipped') {
+    return `Collision detected. Incident could not be saved. ${alert.result.persistenceSkippedReason ?? 'Check the backend storage connection.'}`
+  }
+
   if (alert.kind === 'created') {
     if (alert.result.detectionMode === 'aftermath_review' || alert.result.detection_mode === 'aftermath_review') {
       return 'Possible crash aftermath saved for human review. Impact was not observed.'
@@ -490,6 +492,7 @@ function getCrashAlertStatusText(alert: CrashAlertState): string {
 }
 
 function getCrashAlertTitle(alert: CrashAlertState): string {
+  if (isCurrentCrashConfirmed(alert.result)) return 'Collision Detected'
   if (alert.kind === 'blocked') return 'Active Crash Case Exists'
   if (alert.kind === 'skipped') return 'Crash Detection Not Saved'
   if (alert.result.detectionMode === 'aftermath_review' || alert.result.detection_mode === 'aftermath_review') {
@@ -562,8 +565,30 @@ export function LiveCamera({
   const [cctvPreviewUrl, setCctvPreviewUrl] = useState<string | null>(null)
   const [cctvMjpegUrl, setCctvMjpegUrl] = useState<string | null>(null)
   const [boxSource, setBoxSource] = useState<{ cameraId: string; eventsUrl: string | null } | null>(null)
-  const [mjpegFailed, setMjpegFailed] = useState(false)
   const [isCctvLive, setIsCctvLive] = useState(false)
+  const [analysisView, setAnalysisView] = useState<LiveBoxView | null>(null)
+  const [analysisIssue, setAnalysisIssue] = useState<string | null>(null)
+  const [loadedAnalysisKey, setLoadedAnalysisKey] = useState('')
+  const [analysisClock, setAnalysisClock] = useState(0)
+  useEffect(() => {
+    setAnalysisView(null)
+    setLoadedAnalysisKey('')
+    setAnalysisIssue(null)
+    if (!boxSource || !isCctvLive) return
+    return subscribeCameraBoxes(boxSource.cameraId, boxSource.eventsUrl, incoming => {
+      if (incoming) setAnalysisView(incoming)
+    }, setAnalysisIssue)
+  }, [boxSource?.cameraId, boxSource?.eventsUrl, isCctvLive])
+  useEffect(() => {
+    if (!analysisView) return
+    const timer = window.setInterval(() => setAnalysisClock(performance.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [analysisView])
+  const analysisPacket = analysisView?.packet
+  const analysisKey = analysisPacket
+    ? `${analysisPacket.sourceFrame.cameraId}:${analysisPacket.sourceFrame.sessionId}:${analysisPacket.sourceFrame.sequence}`
+    : ''
+  const [mjpegFailed, setMjpegFailed] = useState(false)
   const [overlaySourceSize, setOverlaySourceSize] = useState<{
     width: number
     height: number
@@ -685,7 +710,7 @@ export function LiveCamera({
   }, [stream])
 
   useEffect(() => {
-    if (!crashAlert) {
+    if (!crashAlert || isCurrentCrashConfirmed(crashAlert.result)) {
       return
     }
 
@@ -743,6 +768,7 @@ export function LiveCamera({
     const id = [
       kind,
       reviewCaseId,
+      result.detectorEventId,
       result.notificationId,
       result.persistenceStatus,
       result.alertBlockedReason,
@@ -836,7 +862,7 @@ export function LiveCamera({
     options: { emitFrameResult: boolean }
   ) => {
     const displayResult = buildDisplayResult(result)
-    const displayBoxes = getDetectionOverlayBoxes(displayResult)
+    const displayBoxes = getDetectionOverlayBoxes(result)
     const stability = recordDetectionSample(displayResult, displayBoxes)
     const surfacedResult = stability.stableCrash
       ? stability.stableResult
@@ -858,12 +884,12 @@ export function LiveCamera({
       return current
     })
 
-    if (displayBoxes.length > 0 && (stability.stableCrash || !accidentOnlyMode)) {
+    if (displayBoxes.length > 0) {
       boxHoldUntilRef.current = stability.timestamp + BOX_HOLD_MS
       setLiveOverlayBoxes(surfacedBoxes)
     } else if (
       stability.timestamp >= boxHoldUntilRef.current &&
-      (!accidentOnlyMode || stability.cleanCount >= STABLE_CLEAR_REQUIRED_MISSES)
+      stability.cleanCount >= STABLE_CLEAR_REQUIRED_MISSES
     ) {
       setLiveOverlayBoxes(surfacedBoxes)
     }
@@ -927,8 +953,9 @@ export function LiveCamera({
       }
     }
 
+    if (isCurrentCrashConfirmed(result)) showCrashAlert(displayResult)
+
     if (liveAlarmTracker.consume(result)) {
-      showCrashAlert(displayResult)
       if (alarmAudioEnabled && profile?.role !== 'dispatcher') {
         void playAccidentAlert(audioRef.current, alertVolume, { beepRepeats: 3 }).catch(
           () => setAlarmAudioError('Browser alarm audio was blocked. Click Arm Alarm Sound to enable it.')
@@ -1133,7 +1160,7 @@ export function LiveCamera({
       return null
     }
 
-    // Keep preview payload small enough for Firestore documents.
+    // Keep preview payload small enough for local preview payloads.
     const maxWidth = 360
     const scale = Math.min(1, maxWidth / videoElement.videoWidth)
     const targetWidth = Math.max(1, Math.floor(videoElement.videoWidth * scale))
@@ -1510,7 +1537,7 @@ export function LiveCamera({
   ])
 
   const isStreaming = !!stream || isCctvLive
-  const hasCctvFrameSurface = Boolean(cctvPreviewUrl || resolvedAnnotatedMediaUrl)
+  const hasCctvFrameSurface = Boolean(analysisPacket || cctvPreviewUrl || resolvedAnnotatedMediaUrl)
   const effectiveDetectionIntervalMs =
     sourceTab === 'cctv'
       ? Math.max(detectionIntervalMs, CCTV_DETECTION_INTERVAL_MS)
@@ -1607,14 +1634,16 @@ export function LiveCamera({
 
           <CctvVideoOverlay
             annotatedPreviewUrl={sourceTab === 'cctv' ? null : resolvedAnnotatedMediaUrl}
-            boxes={sourceTab === 'cctv' ? [] : overlayBoxes}
+            boxes={sourceTab === 'cctv'
+              ? (loadedAnalysisKey === analysisKey ? analysisPacket?.boxes ?? [] : [])
+              : overlayBoxes}
             boxFit={stream ? 'cover' : 'contain'}
             isDetecting={isDetecting}
             isLive={isStreaming}
             labels={overlayStatusLabels}
             emptyDetectionLabel={emptyDetectionLabel}
-            sourceHeight={overlaySourceSize?.height ?? null}
-            sourceWidth={overlaySourceSize?.width ?? null}
+            sourceHeight={sourceTab === 'cctv' && analysisPacket ? analysisPacket.sourceFrame.height : overlaySourceSize?.height ?? null}
+            sourceWidth={sourceTab === 'cctv' && analysisPacket ? analysisPacket.sourceFrame.width : overlaySourceSize?.width ?? null}
             timestamp={overlayTimestamp}
           >
             {stream ? (
@@ -1631,6 +1660,23 @@ export function LiveCamera({
                   )
                 }}
               />
+            ) : isCctvLive && analysisPacket ? (
+              <>
+                <img key={analysisKey} src={analysisPacket.imageDataUrl}
+                  alt="Analyzed camera frame with object detections"
+                  className="h-full w-full object-contain"
+                  onLoad={event => {
+                    const dimensionsMatch = event.currentTarget.naturalWidth === analysisPacket.sourceFrame.width &&
+                      event.currentTarget.naturalHeight === analysisPacket.sourceFrame.height
+                    setLoadedAnalysisKey(dimensionsMatch ? analysisKey : '')
+                    setAnalysisIssue(dimensionsMatch ? null : 'Analyzed image dimensions do not match its detections.')
+                  }}
+                  onError={() => { setLoadedAnalysisKey(''); setAnalysisIssue('Analyzed image could not be displayed.') }} />
+                <Badge className="absolute bottom-12 left-3 z-10 bg-black/85 text-white">
+                  {analysisView && analysisClock < analysisView.expiresAt ? 'Analyzed frame' : 'Last analyzed frame - stale'}
+                  {' / '}{analysisPacket.boxes.length} detected objects
+                </Badge>
+              </>
             ) : isCctvLive ? (
               <div className="flex h-full w-full items-center justify-center bg-[var(--media-background)]">
                 {cctvMjpegUrl && !mjpegFailed ? (
@@ -1730,9 +1776,15 @@ export function LiveCamera({
               </div>
             )}
 
-            {latestResult && ['candidate', 'verifying'].includes(latestResult.finalDecision ?? '') && (
+            {sourceTab === 'cctv' && analysisIssue ? (
+              <div role="status" className="absolute inset-x-0 bottom-20 z-10 bg-amber-950/90 px-4 py-2 text-center text-sm text-amber-100">
+                {analysisIssue}
+              </div>
+            ) : null}
+
+            {!crashAlert && latestResult && ['candidate', 'verifying'].includes(latestResult.finalDecision ?? '') && (
               <div role="status" className="absolute inset-x-0 bottom-12 bg-amber-950/90 px-4 py-2 text-center text-sm text-amber-100">
-                Analyzing potential collision...
+                Checking motion ? no collision confirmed yet
               </div>
             )}
 
@@ -1881,9 +1933,7 @@ export function LiveCamera({
               </div>
             )}
           </CctvVideoOverlay>
-          {!controlRoomMode && sourceTab === 'cctv' && isCctvLive && boxSource && (
-            <SynchronizedAnalysisPreview key={boxSource.cameraId} cameraId={boxSource.cameraId} eventsUrl={boxSource.eventsUrl} />
-          )}
+
 
           {!controlRoomMode ? (
           <div className="space-y-4 p-4">

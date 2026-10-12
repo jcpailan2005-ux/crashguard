@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 
 type Source = 'incidents' | 'notifications' | 'audit' | 'analytics' | 'settings' | 'assignments'
 const COPY: Record<Source, [string, string]> = {
-  incidents: ['Incidents', 'Authoritative PostgreSQL incident records and current workflow state.'],
+  incidents: ['Incidents', 'Authoritative SQLite incident records and current workflow state.'],
   notifications: ['Notifications', 'Alerts addressed to your authenticated account.'],
   audit: ['Audit logs', 'Immutable records of privileged and operational actions.'],
   analytics: ['Operational analytics', 'Live counts computed from authoritative records.'],

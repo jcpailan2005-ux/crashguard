@@ -21,8 +21,8 @@ class CameraRolePermissionsTest(unittest.TestCase):
     def test_require_camera_editor_allows_admin_and_dispatcher_with_explicit_grant(self):
         for role in ("admin", "dispatcher"):
             user = {"uid": f"user-{role}", "role": role, "email": f"{role}@test.com", "permissions": ["cameras.update"]}
-            # Mock verify_firebase_user
-            with unittest.mock.patch("backend.main.verify_firebase_user", return_value=user):
+            # Mock verify_session_user
+            with unittest.mock.patch("backend.main.verify_session_user", return_value=user):
                 req = mock_request_with_user(role)
                 result = require_camera_editor(req)
                 self.assertEqual(result["role"], role)
@@ -30,7 +30,7 @@ class CameraRolePermissionsTest(unittest.TestCase):
     def test_require_camera_editor_blocks_responder_and_other(self):
         for role in ("responder", "user", "guest"):
             user = {"uid": f"user-{role}", "role": role, "email": f"{role}@test.com", "permissions": ["cameras.update"]}
-            with unittest.mock.patch("backend.main.verify_firebase_user", return_value=user):
+            with unittest.mock.patch("backend.main.verify_session_user", return_value=user):
                 req = mock_request_with_user(role)
                 with self.assertRaises(HTTPException) as ctx:
                     require_camera_editor(req)
@@ -39,12 +39,12 @@ class CameraRolePermissionsTest(unittest.TestCase):
 
     def test_require_admin_allows_only_admin(self):
         user_admin = {"uid": "user-admin", "role": "admin"}
-        with unittest.mock.patch("backend.main.verify_firebase_user", return_value=user_admin):
+        with unittest.mock.patch("backend.main.verify_session_user", return_value=user_admin):
             req = mock_request_with_user("admin")
             self.assertEqual(require_admin(req)["role"], "admin")
 
         user_disp = {"uid": "user-disp", "role": "dispatcher"}
-        with unittest.mock.patch("backend.main.verify_firebase_user", return_value=user_disp):
+        with unittest.mock.patch("backend.main.verify_session_user", return_value=user_disp):
             req = mock_request_with_user("dispatcher")
             with self.assertRaises(HTTPException) as ctx:
                 require_admin(req)
@@ -53,7 +53,7 @@ class CameraRolePermissionsTest(unittest.TestCase):
     def test_require_dashboard_access_allows_admin_dispatcher_responder(self):
         for role in ("admin", "dispatcher", "responder"):
             user = {"uid": f"user-{role}", "role": role}
-            with unittest.mock.patch("backend.main.verify_firebase_user", return_value=user):
+            with unittest.mock.patch("backend.main.verify_session_user", return_value=user):
                 req = mock_request_with_user(role)
                 self.assertEqual(require_dashboard_access(req)["role"], role)
 

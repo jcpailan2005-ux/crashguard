@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { AlertTriangle, Grid2X2, ListFilter, MapPin, Maximize2, Plus, RefreshCw, Save, Search, Trash2, Video } from 'lucide-react'
 
 import { LiveCamera } from '@/components/live-camera'
+import { CameraDetectionSurface } from '@/components/camera-detection-grid'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -1141,6 +1142,7 @@ export function CctvMonitorWorkspace({ managementMode = false, initialCameraId }
                       aria-label={`Select ${safeCameraName(camera)}`}
                     >
                       <div className="relative aspect-video overflow-hidden bg-zinc-950">
+                        <CameraDetectionSurface cameraId={camera.cameraId}>
                         {previewUrl ? (
                           <img
                             src={previewUrl}
@@ -1152,6 +1154,7 @@ export function CctvMonitorWorkspace({ managementMode = false, initialCameraId }
                             Camera preview unavailable
                           </div>
                         )}
+                        </CameraDetectionSurface>
                         <div className="absolute left-2 top-2 max-w-[70%] rounded bg-black/70 px-2 py-1 text-xs font-medium text-white">
                           <span className="block truncate">{safeCameraName(camera)}</span>
                         </div>
@@ -1162,6 +1165,11 @@ export function CctvMonitorWorkspace({ managementMode = false, initialCameraId }
                             </Badge>
                           ))}
                         </div>
+                        {status?.latestResult?.finalDecision === 'confirmed_crash' ? (
+                          <div role="alert" className="absolute inset-x-0 bottom-8 bg-red-950/95 px-3 py-2 text-center font-semibold text-white">
+                            Collision Detected
+                          </div>
+                        ) : null}
                         {alertId ? <Link
                           href={isAdmin ? `/admin/incidents?incident=${encodeURIComponent(alertId)}` : `/dispatcher/review?incident=${encodeURIComponent(alertId)}`}
                           className="absolute bottom-2 left-2"

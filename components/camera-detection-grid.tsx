@@ -1,7 +1,7 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Camera, Eye, EyeOff, Maximize2, RefreshCw } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { Camera, Maximize2, RefreshCw } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -83,11 +83,8 @@ function useCameraAnalysis(cameraId: string) {
 
   useEffect(() => {
     if (!view) return
-    const expiresAt = view.retentionExpiresAt ?? performance.now()
-    const timeout = window.setTimeout(() => setView(null), Math.max(0, expiresAt - performance.now()))
     const clock = window.setInterval(() => setClock((value) => !value), 250)
     return () => {
-      window.clearTimeout(timeout)
       window.clearInterval(clock)
     }
   }, [view])
@@ -98,17 +95,15 @@ function useCameraAnalysis(cameraId: string) {
 function ExactDetectionFrame({
   cameraId,
   view,
-  showDetections,
   expanded = false,
 }: {
   cameraId: string
   view: LiveBoxView | null
-  showDetections: boolean
   expanded?: boolean
 }) {
   const [loadedFrameKey, setLoadedFrameKey] = useState<string | null>(null)
   const now = typeof performance === 'undefined' ? 0 : performance.now()
-  const visible = Boolean(view && now < (view.retentionExpiresAt ?? 0))
+  const visible = Boolean(view)
   const packet = visible ? view!.packet : null
   const frame = packet?.sourceFrame
   const width = frame?.width ?? 0
@@ -137,7 +132,7 @@ function ExactDetectionFrame({
             )}
             onError={() => setLoadedFrameKey(null)}
           />
-          {showDetections && loadedFrameKey === packetKey ? (
+          {loadedFrameKey === packetKey ? (
             <svg
               className="pointer-events-none absolute inset-0 h-full w-full"
               viewBox={`0 0 ${width} ${height}`}
@@ -173,9 +168,11 @@ function ExactDetectionFrame({
           ) : null}
           <div className="absolute bottom-2 left-2 flex flex-wrap gap-1.5">
             <Badge className="bg-black/85 text-white hover:bg-black/85">
+              {view && now < view.expiresAt ? 'Fresh' : 'Last analyzed frame ? stale'}
+            </Badge>
+            <Badge className="bg-black/85 text-white hover:bg-black/85">
               {boxes.length} {boxes.length === 1 ? 'vehicle' : 'vehicles'}
             </Badge>
-            {!showDetections ? <Badge variant="secondary">Boxes hidden</Badge> : null}
           </div>
         </>
       ) : (
@@ -187,19 +184,25 @@ function ExactDetectionFrame({
   )
 }
 
+/** Always show detections on their exact source image for network and USB cameras. */
+export function CameraDetectionSurface({ cameraId, children }: { cameraId: string; children: ReactNode }) {
+  const view = useCameraAnalysis(cameraId)
+  return view
+    ? <div className="absolute inset-0 flex items-center justify-center"><ExactDetectionFrame cameraId={cameraId} view={view} /></div>
+    : <>{children}</>
+}
+
 function DetectionCameraTile({
   camera,
   status,
-  showDetections,
 }: {
   camera: CctvCamera
   status?: CameraMonitoringStatus
-  showDetections: boolean
 }) {
   const view = useCameraAnalysis(camera.cameraId)
   const [expanded, setExpanded] = useState(false)
   const now = typeof performance === 'undefined' ? 0 : performance.now()
-  const packet = view && now < (view.retentionExpiresAt ?? 0) ? view.packet : null
+  const packet = view?.packet ?? null
   const boxes = packet
     ? clipAnalysisBoxes(packet.boxes, packet.sourceFrame.width ?? 0, packet.sourceFrame.height ?? 0)
     : []
@@ -232,7 +235,7 @@ function DetectionCameraTile({
       </div>
 
       <div className="p-3">
-        <ExactDetectionFrame cameraId={camera.cameraId} view={view} showDetections={showDetections} />
+        <ExactDetectionFrame cameraId={camera.cameraId} view={view} />
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3 text-sm">
@@ -251,7 +254,7 @@ function DetectionCameraTile({
             <DialogTitle>{cameraName(camera)}</DialogTitle>
             <DialogDescription>Large exact analyzed frame with synchronized vehicle annotations.</DialogDescription>
           </DialogHeader>
-          <ExactDetectionFrame cameraId={camera.cameraId} view={view} showDetections={showDetections} expanded />
+          <ExactDetectionFrame cameraId={camera.cameraId} view={view} expanded />
           <div className="grid gap-2 rounded-md bg-muted/60 p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
             <p><span className="text-muted-foreground">Type:</span> {sourceType}</p>
             <p><span className="text-muted-foreground">Health:</span> {health}</p>
@@ -274,7 +277,6 @@ export function CameraDetectionGrid() {
   const [cameras, setCameras] = useState<CctvCamera[]>([])
   const [statuses, setStatuses] = useState<Record<string, CameraMonitoringStatus>>({})
   const [filter, setFilter] = useState<CameraFilter>('all')
-  const [showDetections, setShowDetections] = useState(true)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -330,10 +332,6 @@ export function CameraDetectionGrid() {
           ))}
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button type="button" size="sm" variant="outline" aria-pressed={showDetections} onClick={() => setShowDetections((value) => !value)}>
-            {showDetections ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
-            Detections {showDetections ? 'ON' : 'OFF'}
-          </Button>
           <Button type="button" size="sm" variant="outline" onClick={() => { void loadCameras(); void loadStatuses() }} disabled={loading}>
             <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />Refresh
           </Button>
@@ -354,7 +352,7 @@ export function CameraDetectionGrid() {
             key={camera.cameraId}
             camera={camera}
             status={statuses[camera.cameraId]}
-            showDetections={showDetections}
+
           />
         ))}
       </div>

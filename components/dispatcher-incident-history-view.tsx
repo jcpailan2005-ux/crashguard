@@ -847,7 +847,7 @@ export function DispatcherIncidentHistoryView({
             <RefreshCw className="h-8 w-8 animate-spin text-primary" />
             <p className="text-sm font-medium text-foreground">Synchronizing Incident History...</p>
             <p className="text-xs text-muted-foreground">
-              Retrieving authoritative PostgreSQL incident audit logs and response timelines
+              Retrieving authoritative SQLite incident audit logs and response timelines
             </p>
           </div>
         </Card>

@@ -1,3 +1,17 @@
+# Current inference verification — October 13, 2026
+
+The detector loads and produces vehicle boxes. A 500 ms packet-delivery deadline
+was dropping boxes before they reached the display; delivery retention is now
+separate from freshness. The reloaded Bago worker produced 104 nonempty box
+packets during a bounded 25-second check, with up to 10 boxes per frame.
+The expanded-camera fetch now also carries its matching preview ticket. The user
+confirmed that bounding boxes are visible in the expanded Bago view after this fix.
+
+See [the current inference audit](docs/inference-box-delivery-audit-2026-10-13.md)
+for model/dependency evidence, the delivery fix, tests and remaining limitations.
+The report below is historical codec verification from April, not a current
+end-to-end inference or collision-accuracy certification.
+
 # Final Verification Report - April 18, 2026
 
 ## ✅ All Tasks Completed Successfully

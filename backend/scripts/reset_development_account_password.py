@@ -27,7 +27,7 @@ def reset_password(email: str, new_password: str) -> None:
 
     with connection() as conn, conn.transaction():
         account = conn.execute(
-            "SELECT id, status FROM users WHERE email=%s FOR UPDATE",
+            "SELECT id, status FROM users WHERE email=%s",
             (normalized_email,),
         ).fetchone()
         if not account:
@@ -50,7 +50,7 @@ def reset_password(email: str, new_password: str) -> None:
         conn.execute(
             """INSERT INTO audit_logs(action,entity_type,entity_id,metadata)
                VALUES ('bootstrap.password_reset','user',%s,
-                       '{"source":"reset_development_account_password"}'::jsonb)""",
+                       '{"source":"reset_development_account_password"}')""",
             (str(account["id"]),),
         )
 

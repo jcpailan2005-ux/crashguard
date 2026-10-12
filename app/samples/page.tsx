@@ -11,12 +11,6 @@ import {
   Loader,
   Video,
 } from 'lucide-react'
-import {
-  doc,
-  onSnapshot,
-  serverTimestamp,
-  setDoc,
-} from 'firebase/firestore'
 
 import { DashboardHeader, Sidebar } from '@/components/dashboard-sidebar'
 import { DetectedMediaViewer } from '@/components/detected-media-viewer'
@@ -28,10 +22,8 @@ import { Card } from '@/components/ui/card'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useToast } from '@/hooks/use-toast'
 import { useAuth } from '@/components/auth-provider'
-import { detectFromFile } from '@/lib/api-client'
+import { detectFromFile, getLiveCameraSession, updateLiveCameraSession } from '@/lib/api-client'
 import { APP_CONFIG } from '@/lib/app-config'
-import { db } from '@/lib/firebase'
-import { getFirebaseConfigError } from '@/lib/firebase-guards'
 import { AreaId, getAreaLabel } from '@/lib/locations'
 import { LOCATION_TABS, SAMPLES, Sample } from '@/lib/sample-data'
 import { DetectionResponse } from '@/lib/types'
@@ -45,15 +37,10 @@ interface LiveCameraSession {
   updatedAt?: unknown
 }
 
-/** Firestore rejects `undefined` anywhere in document data; optional API fields must be stripped. */
-function detectionPayloadForFirestore(result: DetectionResponse): Record<string, unknown> {
-  return JSON.parse(JSON.stringify(result)) as Record<string, unknown>
-}
-
 function SamplesPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { authError, firebaseUser, loading, profile, signOutUser } = useAuth()
+  const { authError, sessionUser, loading, profile, signOutUser } = useAuth()
   const [mounted, setMounted] = useState(false)
   const [selectedSample, setSelectedSample] = useState<Sample | null>(null)
   const [isDialogOpen, setIsDialogOpen] = useState(false)
@@ -101,7 +88,7 @@ function SamplesPageContent() {
   useEffect(() => {
     if (!mounted || loading) return
 
-    if (!firebaseUser || !profile) {
+    if (!sessionUser || !profile) {
       router.replace('/login')
       return
     }
@@ -109,7 +96,7 @@ function SamplesPageContent() {
     if (!profile.active) {
       signOutUser().finally(() => router.replace('/login'))
     }
-  }, [firebaseUser, loading, mounted, profile, router, signOutUser])
+  }, [sessionUser, loading, mounted, profile, router, signOutUser])
 
   useEffect(() => {
     if (responderArea || !canReadLiveSessions) return
@@ -117,81 +104,36 @@ function SamplesPageContent() {
     setLiveSession(null)
     setLiveSessionSubscribeError(null)
 
-    if (!db) {
-      setLiveSessionSubscribeError(getFirebaseConfigError())
-      return
-    }
-
-    const unsubscribe = onSnapshot(
-      doc(db, 'live_camera_sessions', selectedLocation),
-      (snapshot) => {
-        setLiveSessionSubscribeError(null)
-        if (!snapshot.exists()) {
-          setLiveSession(null)
-          return
+    let stopped = false
+    let inFlight = false
+    const poll = async () => {
+      if (inFlight) return
+      inFlight = true
+      try {
+        const result = await getLiveCameraSession(selectedLocation)
+        if (!stopped) {
+          setLiveSession(result.session as LiveCameraSession | null)
+          setLiveSessionSubscribeError(null)
         }
-
-        setLiveSession(snapshot.data() as LiveCameraSession)
-      },
-      (error) => {
-        console.error('Failed to subscribe to live camera session:', error)
-        setLiveSessionSubscribeError(
-          error instanceof Error ? error.message : 'Could not subscribe to live status.'
-        )
-        setLiveSession(null)
-      }
-    )
-
-    return () => unsubscribe()
+      } catch (error) {
+        if (!stopped) setLiveSessionSubscribeError(error instanceof Error ? error.message : 'Could not load live status.')
+      } finally { inFlight = false }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 3000)
+    return () => { stopped = true; window.clearInterval(timer) }
   }, [canReadLiveSessions, responderArea, selectedLocation])
 
   const updateResponderLiveSession = async (
     payload: Partial<Pick<LiveCameraSession, 'active' | 'latestDetection' | 'livePreviewDataUrl'>>
   ) => {
-    if (!responderArea || !firebaseUser) return
-    if (!db) {
-      toast({
-        title: 'Firebase is not configured',
-        description: getFirebaseConfigError() ?? 'Firestore is not ready.',
-        variant: 'destructive',
-      })
-      return
-    }
-
-    const docData: Record<string, unknown> = {
-      areaId: responderArea,
-      responderUid: firebaseUser.uid,
-      updatedAt: serverTimestamp(),
-    }
-
-    if (payload.active !== undefined) {
-      docData.active = payload.active
-    }
-
-    if ('latestDetection' in payload) {
-      const ld = payload.latestDetection
-      docData.latestDetection =
-        ld == null ? null : detectionPayloadForFirestore(ld)
-    }
-
-    if ('livePreviewDataUrl' in payload) {
-      docData.livePreviewDataUrl = payload.livePreviewDataUrl ?? null
-    }
-
+    if (!responderArea || !sessionUser) return
     try {
-      await setDoc(doc(db, 'live_camera_sessions', responderArea), docData, {
-        merge: true,
-      })
+      await updateLiveCameraSession(responderArea, payload)
     } catch (error) {
-      console.error('Failed to publish responder live camera status:', error)
-      toast({
-        title: 'Firebase: could not publish camera status',
-        description:
-          error instanceof Error
-            ? error.message
-            : 'Check Firestore rules for live_camera_sessions and your network.',
-        variant: 'destructive',
-      })
+      toast({ title: 'Could not publish camera status',
+        description: error instanceof Error ? error.message : 'Check the backend connection.',
+        variant: 'destructive' })
     }
   }
 
@@ -228,7 +170,7 @@ function SamplesPageContent() {
     return null
   }
 
-  if (!firebaseUser || !profile || !profile.active) {
+  if (!sessionUser || !profile || !profile.active) {
     return null
   }
 
@@ -307,7 +249,7 @@ function SamplesPageContent() {
               <AlertTriangle className="h-4 w-4" />
               <AlertDescription>
                 This account is a responder but has no <code className="text-xs">areaId</code> in
-                Firestore <code className="text-xs">users/{'{uid}'}</code>. Add{' '}
+                the local account profile. Add{' '}
                 <code className="text-xs">areaId: &quot;talomo&quot;</code> (or bago/toril) so the
                 live camera can publish to the correct document. Until then you will see the admin
                 gallery instead of the camera panel.
@@ -398,7 +340,7 @@ function SamplesPageContent() {
                 <div>
                   <h2 className="text-lg font-semibold">Live {selectedLocation.toUpperCase()} Camera</h2>
                   <p className="text-sm text-muted-foreground">
-                    Realtime responder camera status mirrored to admin (Firebase), not a direct video
+                    Realtime responder camera status shared with admin, not a direct video
                     feed.
                   </p>
                 </div>
@@ -437,8 +379,8 @@ function SamplesPageContent() {
                 <Alert variant="destructive" className="mt-4">
                   <AlertTriangle className="h-4 w-4" />
                   <AlertDescription>
-                    Could not read live status from Firebase: {liveSessionSubscribeError}. Check
-                    Firestore rules and that this app uses the same Firebase project as the
+                    Could not read live status from the backend: {liveSessionSubscribeError}. Check
+                    the backend connection for the
                     responder session.
                   </AlertDescription>
                 </Alert>
@@ -493,7 +435,7 @@ function SamplesPageContent() {
                     <div>
                       <h3 className="text-sm font-semibold">Live {selectedLocation.toUpperCase()} Camera</h3>
                       <p className="text-xs text-muted-foreground">
-                        Realtime responder status mirrored from Firebase.
+                        Realtime responder status mirrored from the backend.
                       </p>
                     </div>
 

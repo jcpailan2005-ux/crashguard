@@ -132,3 +132,8 @@ retrained_report.csv
 
 # Temporary development / debug scratch files
 scratch_*
+
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite.backup-*

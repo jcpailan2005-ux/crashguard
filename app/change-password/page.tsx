@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { useAuth } from '@/components/auth-provider'
-import { changePostgresPassword } from '@/lib/api-client'
+import { changeSQLitePassword } from '@/lib/api-client'
 import { homeForRole } from '@/lib/role-routing'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -31,7 +31,7 @@ export default function ChangePasswordPage() {
     setSaving(true)
     setError('')
     try {
-      const user = await changePostgresPassword(currentPassword, newPassword)
+      const user = await changeSQLitePassword(currentPassword, newPassword)
       setSessionUser(user)
       router.replace(homeForRole(user.role))
     } catch (caught) {

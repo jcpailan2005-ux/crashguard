@@ -17,7 +17,7 @@ ACCOUNTS = (
 def reset_existing(email: str) -> str:
     temporary = generate_temporary_password()
     with connection() as conn, conn.transaction():
-        user = conn.execute("SELECT id FROM users WHERE email=%s FOR UPDATE", (email,)).fetchone()
+        user = conn.execute("SELECT id FROM users WHERE email=%s", (email,)).fetchone()
         if not user:
             raise RuntimeError(f"Cannot reset missing bootstrap account {email}.")
         conn.execute(
@@ -31,7 +31,7 @@ def reset_existing(email: str) -> str:
         )
         conn.execute(
             """INSERT INTO audit_logs(action,entity_type,entity_id,metadata)
-               VALUES ('bootstrap.password_reset','user',%s,'{"source":"seed_initial_accounts"}'::jsonb)""",
+               VALUES ('bootstrap.password_reset','user',%s,'{"source":"seed_initial_accounts"}')""",
             (str(user["id"]),),
         )
     return temporary

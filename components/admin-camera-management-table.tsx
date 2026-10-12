@@ -313,7 +313,7 @@ export function AdminCameraManagementTable({ onViewCamera }: AdminCameraManageme
             </Badge>
           </div>
           <p className="text-xs text-muted-foreground">
-            Authoritative CCTV camera repository backed by PostgreSQL. Manage stream credentials, test live feeds, and control camera activation.
+            Authoritative CCTV camera repository backed by SQLite. Manage stream credentials, test live feeds, and control camera activation.
           </p>
         </div>
 
@@ -371,7 +371,7 @@ export function AdminCameraManagementTable({ onViewCamera }: AdminCameraManageme
                 <TableCell colSpan={7} className="h-32 text-center text-xs text-muted-foreground">
                   <div className="flex flex-col items-center justify-center gap-2">
                     <Loader2 className="w-5 h-5 animate-spin text-primary" />
-                    <span>Loading camera registry from PostgreSQL...</span>
+                    <span>Loading camera registry from SQLite...</span>
                   </div>
                 </TableCell>
               </TableRow>

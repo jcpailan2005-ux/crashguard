@@ -9,10 +9,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.phase3.database import DatabaseUnavailable, check_database
 from backend.phase3 import service
+from backend.phase3.database import connection
+import json
 
 
 router = APIRouter(prefix="/api/v3", tags=["Phase 3 Operations"])
 SESSION_COOKIE = "crashguard_session"
+
+
+class LiveCameraSessionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    active: bool | None = None
+    latestDetection: dict[str, Any] | None = None
+    livePreviewDataUrl: str | None = Field(default=None, max_length=400000)
 
 
 class LoginIn(BaseModel):
@@ -435,6 +444,40 @@ def availability(body: AvailabilityIn,
 def notifications(unreadOnly: bool = False,
                   user: dict = Depends(require_permission("notifications.view_own"))):
     return {"notifications": _call(service.list_notifications, user, unread_only=unreadOnly)}
+
+
+@router.get("/live-camera-sessions/{area_id}")
+def live_camera_session(area_id: str, user: dict = Depends(require_permission('profile.view_own'))):
+    if user.get('role') not in {'admin', 'dispatcher'} and user.get('areaId') != area_id:
+        raise HTTPException(status_code=403, detail='Outside your assigned area.')
+    with connection() as conn:
+        row = conn.execute('SELECT payload,updated_at FROM live_camera_sessions WHERE area_id=%s',
+                           (area_id,)).fetchone()
+    return {'session': {**json.loads(row['payload']), 'updatedAt': row['updated_at'].isoformat()}
+            if row else None}
+
+
+@router.put("/live-camera-sessions/{area_id}")
+def update_live_camera_session(area_id: str, body: LiveCameraSessionIn,
+                               user: dict = Depends(require_permission('assignments.view_own'))):
+    if user.get('role') != 'responder' or user.get('areaId') != area_id:
+        raise HTTPException(status_code=403, detail='Outside your assigned area.')
+    payload = body.model_dump(exclude_unset=True)
+    preview = payload.get('livePreviewDataUrl')
+    if preview and not preview.startswith('data:image/jpeg;base64,'):
+        raise HTTPException(status_code=422, detail='Preview must be a JPEG data URL.')
+    if len(json.dumps(payload)) > 500000:
+        raise HTTPException(status_code=422, detail='Live status exceeds the size limit.')
+    with connection() as conn, conn.transaction():
+        previous = conn.execute('SELECT payload FROM live_camera_sessions WHERE area_id=%s',
+                                (area_id,)).fetchone()
+        merged = {**(json.loads(previous['payload']) if previous else {}), **payload,
+                  'areaId': area_id, 'responderUid': user['id']}
+        conn.execute('''INSERT INTO live_camera_sessions(area_id,responder_id,payload)
+                        VALUES (%s,%s,%s) ON CONFLICT(area_id) DO UPDATE SET
+                        responder_id=excluded.responder_id,payload=excluded.payload,updated_at=now()''',
+                     (area_id, user['id'], json.dumps(merged)))
+    return {'success': True}
 
 
 @router.post("/notifications/{notification_id}/read")

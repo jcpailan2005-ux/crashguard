@@ -21,7 +21,6 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { subscribeCrashCases, summarizeCaseCounts } from '@/lib/crash-case-store'
-import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
 import { CrashCase } from '@/lib/types'
 
 const STAT_CARDS = [
@@ -70,17 +69,7 @@ export default function DashboardPage() {
   const { profile } = useAuth()
 
   useEffect(() => {
-    const db = getFirestoreOrNull()
-    const configError = getFirebaseConfigError()
-
-    if (!db || configError) {
-      setStoreError(configError ?? 'Firestore is not ready.')
-      setLoading(false)
-      return
-    }
-
     return subscribeCrashCases(
-      db,
       (nextCases) => {
         setCases(nextCases)
         setStoreError(null)

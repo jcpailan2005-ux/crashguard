@@ -3,6 +3,21 @@ import type { DetectionBox, LiveBoxPacket, LiveBoxView, LiveFrameIdentity } from
 export const FRESHNESS_LIMIT_MS = 500
 export const VISUAL_RETENTION_LIMIT_MS = 5000
 
+/** Carry the existing scoped preview ticket only to its matching backend camera. */
+export function cameraAnalysisPacketUrl(backendUrl: string, cameraId: string, eventsUrl: string | null): string {
+  const base = backendUrl.replace(/\/+$/, '')
+  const path = `/api/cameras/${encodeURIComponent(cameraId)}`
+  const packet = new URL(`${base}${path}/analysis-packet`)
+  if (eventsUrl) {
+    const events = new URL(eventsUrl, `${base}/`)
+    const ticket = events.searchParams.get('token')
+    if (ticket && events.origin === packet.origin && events.pathname === `${path}/events`) {
+      packet.searchParams.set('token', ticket)
+    }
+  }
+  return packet.toString()
+}
+
 export interface LiveBoxCursor {
   lastFrame: LiveFrameIdentity | null
   retiredSessions: Set<string>
@@ -21,6 +36,9 @@ export function acceptLiveBoxPacket(
 ): LiveBoxView | null {
   const frame = packet.sourceFrame
   const remaining = Math.min(FRESHNESS_LIMIT_MS, packet.validForMs, FRESHNESS_LIMIT_MS - packet.resultAgeMs) - transportMs
+  const retainedDelivery = packet.retentionForMs != null
+    ? Math.min(packet.retentionForMs, VISUAL_RETENTION_LIMIT_MS - packet.resultAgeMs) - transportMs
+    : remaining
   if (
     !frame ||
     !frame.sessionId ||
@@ -28,7 +46,10 @@ export function acceptLiveBoxPacket(
     frame.cameraId !== cameraId ||
     !frame.width || !Number.isFinite(frame.width) || frame.width <= 0 ||
     !frame.height || !Number.isFinite(frame.height) || frame.height <= 0 ||
-    !Number.isFinite(remaining) || remaining <= 0 ||
+    !Number.isFinite(packet.resultAgeMs) || packet.resultAgeMs < 0 ||
+    !Number.isFinite(packet.validForMs) || packet.validForMs < 0 ||
+    !Number.isFinite(transportMs) || transportMs < 0 ||
+    !Number.isFinite(remaining) || !Number.isFinite(retainedDelivery) || retainedDelivery <= 0 ||
     !packet.imageDataUrl.startsWith('data:image/jpeg;base64,') ||
     !Array.isArray(packet.boxes)
   ) return null
@@ -48,15 +69,17 @@ export function acceptLiveBoxPacket(
   }
   cursor.lastFrame = frame
 
-  const remainingRetention = Math.max(100, VISUAL_RETENTION_LIMIT_MS - packet.resultAgeMs) - transportMs
+  const remainingRetention = packet.retentionForMs != null
+    ? retainedDelivery
+    : VISUAL_RETENTION_LIMIT_MS - packet.resultAgeMs - transportMs
   return {
     packet: {
       ...packet,
       sourceAgeMs: packet.sourceAgeMs == null ? null : packet.sourceAgeMs + transportMs,
     },
-    expiresAt: now + remaining,
+    expiresAt: now + Math.max(0, remaining),
     receivedAt: now,
-    retentionExpiresAt: now + Math.max(100, remainingRetention),
+    retentionExpiresAt: now + Math.max(0, remainingRetention),
   }
 }
 

@@ -349,8 +349,8 @@ def user_from_sqlite_session(request: Request) -> dict | None:
     return verify_session_token(token)
 
 
-def verify_firebase_user(request: Request) -> dict:
-    """Compatibility name; PostgreSQL sessions are the sole network identity."""
+def verify_session_user(request: Request) -> dict:
+    """Authenticate the cookie-backed operational SQLite session."""
     from backend.phase3.routes import current_user
     principal = current_user(request)
     if principal.get("mustChangePassword"):
@@ -364,21 +364,21 @@ def verify_firebase_user(request: Request) -> dict:
 
 
 def require_legacy_permission(request: Request, *codes: str) -> dict:
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     if not set(codes).intersection(user.get("permissions", [])):
         raise HTTPException(status_code=403, detail="Permission denied.")
     return user
 
 
 def require_admin(request: Request) -> dict:
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
     return user
 
 
 def require_camera_editor(request: Request, permission: str = "cameras.update") -> dict:
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     if user["role"] not in {"admin", "dispatcher"} or permission not in user.get("permissions", []):
         raise HTTPException(status_code=403, detail=f"Permission required: {permission}")
     return user
@@ -393,7 +393,7 @@ def is_protected_camera(camera: dict) -> bool:
 
 
 def require_dashboard_access(request: Request) -> dict:
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     if user["role"] not in {"admin", "dispatcher", "responder"}:
         raise HTTPException(status_code=403, detail="You do not have permission to access this page.")
     return user
@@ -402,7 +402,7 @@ def require_dashboard_access(request: Request) -> dict:
 def optional_request_user(request: Request) -> dict | None:
     if not (request.cookies.get("crashguard_session") or request.headers.get("authorization")):
         return None
-    return verify_firebase_user(request)
+    return verify_session_user(request)
 
 
 def get_user_area_scope(user: dict) -> str | None:
@@ -416,7 +416,7 @@ def can_access_camera(user: dict, camera: dict | None) -> bool:
 
 
 def require_camera_access(request: Request, camera_id: str) -> tuple[dict, dict]:
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     camera = get_camera(camera_id)
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
@@ -2665,7 +2665,10 @@ class LiveCameraMonitor:
             if item is None or item[1]["sourceFrame"]["sessionId"] != epoch:
                 return None
             frame, metadata, published = item
-            if (time.perf_counter() - published) * 1000 >= 500:
+            # Delivery retention is separate from freshness. A delayed client
+            # may inspect the exact image+boxes as stale without treating it as
+            # a new live observation or putting boxes on a newer raw frame.
+            if (time.perf_counter() - published) * 1000 >= 5000:
                 return None
             if self.box_packet_cache is None or self.box_packet_cache[0] is not item:
                 ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, LIVE_CAMERA_JPEG_QUALITY])
@@ -2677,11 +2680,12 @@ class LiveCameraMonitor:
                 if self.latest_box_frame is not item or self.frame_epoch != epoch:
                     return None
             age = (time.perf_counter() - published) * 1000
-            if age >= 500:
+            if age >= 5000:
                 return None
             captured = metadata["sourceFrame"]["capturedMonotonic"]
             source_age = max(0, (time.monotonic() - captured) * 1000) if captured is not None else None
-            return {**self.box_packet_cache[1], "resultAgeMs": age, "validForMs": 500 - age,
+            return {**self.box_packet_cache[1], "resultAgeMs": age, "validForMs": max(0, 500 - age),
+                    "retentionForMs": 5000 - age,
                     "sourceAgeMs": source_age}
 
     def detection_events(self, boxes_only=False):
@@ -3434,7 +3438,9 @@ class LiveCameraMonitor:
         result_payload["accident_detected"] = result_payload["temporalCrashVerified"]
         result_payload["accidentDetected"] = result_payload["temporalCrashVerified"]
         if final_decision in {"candidate", "verifying"}:
-            message = "Analyzing potential collision..."
+            message = "Checking motion ? no collision confirmed yet"
+        elif final_decision == "confirmed_crash":
+            message = "Collision detected. Review the incident."
 
         # Purely additive UI metadata: never influences should_create_case /
         # evaluate_crash_case_decision above. 80%+ crashScore is a visual-only
@@ -4324,7 +4330,7 @@ def auth_login(body: AuthLoginIn):
 
 @app.get("/api/auth/me")
 def auth_me(request: Request):
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     return {"user": user["profile"]}
 
 
@@ -5007,7 +5013,7 @@ def require_camera_stream_access(request: Request, camera: dict) -> dict:
         except Exception:
             pass
 
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     if not can_access_camera(user, camera):
         raise HTTPException(status_code=403, detail="You are not authorized to access this camera.")
     return user
@@ -5149,7 +5155,7 @@ def api_stop_camera_monitor(camera_id: str, request: Request):
 
 @app.get("/api/cameras/{camera_identifier}/status")
 def api_live_camera_status(camera_identifier: str, request: Request):
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     camera = resolve_camera_identifier(camera_identifier)
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")
@@ -5292,7 +5298,7 @@ def api_live_camera_analysis_packet(camera_identifier: str, request: Request):
 
 @app.post("/api/cameras/{camera_identifier}/test-detection")
 def api_live_camera_test_detection(camera_identifier: str, request: Request):
-    user = verify_firebase_user(request)
+    user = verify_session_user(request)
     camera = resolve_camera_identifier(camera_identifier)
     if camera is None:
         raise HTTPException(status_code=404, detail="Camera not found.")

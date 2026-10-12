@@ -41,10 +41,8 @@ import {
   resolveBackendMediaUrl,
 } from '@/lib/api-client'
 import { localCaseToCrashCase } from '@/lib/crash-case-mapper'
-import { getCrashCase } from '@/lib/crash-case-store'
 import { APP_CONFIG } from '@/lib/app-config'
 import { useDisplayMode } from '@/lib/display-mode'
-import { getFirebaseConfigError, getFirestoreOrNull } from '@/lib/firebase-guards'
 import { CrashCase, Notification } from '@/lib/types'
 
 type DateFilter = 'recent' | 'today' | 'last30' | 'all' | 'custom'
@@ -167,7 +165,7 @@ export default function AllNotificationsPage() {
   const [loadingCaseId, setLoadingCaseId] = useState<string | null>(null)
   const [actionNotificationId, setActionNotificationId] = useState<string | null>(null)
   const [selectedCase, setSelectedCase] = useState<CrashCase | null>(null)
-  const { firebaseUser, profile } = useAuth()
+  const { sessionUser, profile } = useAuth()
   const { isAdvancedMode } = useDisplayMode(profile)
   const role = String(profile?.role ?? '').toLowerCase()
   const canDelete = role === 'admin' && isAdvancedMode
@@ -181,7 +179,7 @@ export default function AllNotificationsPage() {
             ? items.filter(
                 (item) =>
                   !item.responderId ||
-                  item.responderId === firebaseUser?.uid ||
+                  item.responderId === sessionUser?.uid ||
                   Boolean(profile?.areaId && item.areaId === profile.areaId)
               )
             : items
@@ -192,7 +190,7 @@ export default function AllNotificationsPage() {
         setStoreError(error instanceof Error ? error.message : 'Could not load notifications.')
       })
       .finally(() => setLoading(false))
-  }, [firebaseUser?.uid, profile?.areaId, role])
+  }, [sessionUser?.uid, profile?.areaId, role])
 
   useEffect(() => {
     void loadNotifications(true)
@@ -236,16 +234,6 @@ export default function AllNotificationsPage() {
     setLoadingCaseId(caseId)
 
     try {
-      const db = getFirestoreOrNull()
-      const configError = getFirebaseConfigError()
-      if (db && !configError && !caseId.startsWith('CASE-')) {
-        const caseItem = await getCrashCase(db, caseId)
-        if (caseItem) {
-          setSelectedCase(caseItem)
-          return
-        }
-      }
-
       const localCase = await getLocalCrashCase(caseId)
       setSelectedCase(localCaseToCrashCase(localCase))
     } catch {
@@ -550,7 +538,7 @@ export default function AllNotificationsPage() {
       </div>
 
       <IncidentReviewDialog
-        actorId={firebaseUser?.uid ?? 'unknown-user'}
+        actorId={sessionUser?.uid ?? 'unknown-user'}
         caseItem={selectedCase}
         onCaseUpdated={(caseItem) => {
           setSelectedCase(caseItem)

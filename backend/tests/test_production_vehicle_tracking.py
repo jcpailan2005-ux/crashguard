@@ -486,6 +486,148 @@ class LowCadenceContinuityTests(unittest.TestCase):
                 self.assertEqual(first, current)
 
 
+class PairContinuityReadinessTests(unittest.TestCase):
+    # Visible image texture supplies evidence; participant names stay test-only.
+    setUp = LowCadenceContinuityTests.setUp
+    observe = LowCadenceContinuityTests.observe
+
+    @staticmethod
+    def participants(step):
+        return [("A", (40+step, 60, 100+step, 110), (200,)*3),
+                ("B", (330+step, 60, 390+step, 110), (35,)*3)]
+
+    def assert_no_transfer(self, ids, owners):
+        self.assertEqual(len(ids), len(set(ids.values())))
+        for physical_vehicle, identity in ids.items():
+            self.assertEqual(owners.setdefault(identity, physical_vehicle), physical_vehicle)
+
+    def test_two_distinct_vehicles_keep_pair_across_three_low_cadence_observations(self):
+        original = None
+        for timestamp, step in [(0, 0), (.8, 20), (1.6, 40)]:
+            result, ids = self.observe(timestamp, self.participants(step))
+            original = ids if original is None else original
+            self.assertEqual(ids, original)
+            self.assertNotEqual(ids['A'], ids['B'])
+            self.assertTrue(all(b['detected'] and b['observationKind']=='DETECTED' for b in result.boxes))
+
+    def test_pair_order_reversal_keeps_both_physical_owners(self):
+        original = None
+        owners = {}
+        for i in range(4):
+            _, ids = self.observe(i*.8, self.participants(i*20), reverse=bool(i%2))
+            original = ids if original is None else original
+            self.assertEqual(ids, original)
+            self.assert_no_transfer(ids, owners)
+
+    def test_pair_temporary_miss_returns_same_owner_without_counting_prediction(self):
+        first, original = self.observe(0, self.participants(0))
+        second, ids = self.observe(.2, self.participants(4))
+        missed, alone = self.observe(.4, self.participants(8)[:1])
+        returned, ids = self.observe(.6, self.participants(12))
+        self.assertEqual(ids, original)
+        self.assertEqual(alone, {'A': original['A']})
+        self.assertEqual([p['trackId'] for p in missed.predicted_tracks], [original['B']])
+        self.assertFalse(missed.predicted_tracks[0]['detected'])
+        self.assertFalse(missed.predicted_tracks[0]['collisionObservation'])
+        shared = [r for r in (first, second, missed, returned)
+                  if set(original.values()).issubset({b['trackId'] for b in r.boxes
+                      if b['detected'] and b['observationKind']=='DETECTED'})]
+        self.assertEqual(len(shared), 3)
+        self.assertNotIn(missed, shared)
+
+    def test_one_member_fragments_while_other_safely_continues(self):
+        _, original = self.observe(0, self.participants(0))
+        self.observe(.2, self.participants(4))
+        changed = self.participants(8)
+        changed[1] = ('B', changed[1][1], (150, 40, 40))
+        _, current = self.observe(.4, changed)
+        self.assertEqual(current['A'], original['A'])
+        self.assertNotEqual(current['B'], original['B'])
+        self.assertNotEqual(current['B'], original['A'])
+
+    def test_ambiguous_crossing_fragments_both_instead_of_swapping(self):
+        _, original = self.observe(0, [('A', (40,60,100,110), (160,)*3),
+                                     ('B', (120,60,180,110), (160,)*3)])
+        result, crossing = self.observe(.3, [('B', (81,60,141,110), (160,)*3),
+                                           ('A', (79,60,139,110), (160,)*3)])
+        self.assertTrue(set(original.values()).isdisjoint(crossing.values()))
+        _, separated = self.observe(.5, [('A', (120,60,180,110), (160,)*3),
+                                         ('B', (40,60,100,110), (160,)*3)])
+        self.assertTrue(set(original.values()).isdisjoint(separated.values()))
+        self.assertNotEqual(separated['A'], separated['B'])
+
+    def test_overtaking_keeps_distinct_pair_owners(self):
+        original = None
+        owners = {}
+        for i in range(18):
+            participants = [('A', (40+i*6,50,100+i*6,100), (200,)*3),
+                            ('B', (75+i*2,150,135+i*2,200), (35,)*3)]
+            _, ids = self.observe(i*.1, participants, reverse=bool(i%2))
+            original = ids if original is None else original
+            self.assertEqual(ids, original)
+            self.assert_no_transfer(ids, owners)
+
+    def test_close_following_similar_vehicles_keep_distinct_ids(self):
+        original = None
+        owners = {}
+        for i in range(8):
+            _, ids = self.observe(i*.1, [('A', (140+i*2,60,200+i*2,110), (160,)*3),
+                                         ('B', (60+i*2,60,120+i*2,110), (160,)*3)], reverse=bool(i%2))
+            original = ids if original is None else original
+            self.assertEqual(ids, original)
+            self.assert_no_transfer(ids, owners)
+
+    def test_new_vehicle_near_missed_member_never_takes_its_id(self):
+        _, original = self.observe(0, self.participants(0))
+        self.observe(.2, self.participants(4))
+        self.observe(.4, self.participants(8)[:1])
+        _, current = self.observe(.6, [self.participants(12)[0],
+                                       ('new', (342,60,402,110), (150,40,40))])
+        self.assertEqual(current['A'], original['A'])
+        self.assertNotIn(current['new'], original.values())
+
+    def test_predicted_only_pair_does_not_add_real_shared_observations(self):
+        first, ids = self.observe(0, self.participants(0))
+        empty, _ = self.observe(.2, [])
+        self.assertEqual(empty.boxes, ())
+        self.assertEqual({p['trackId'] for p in empty.predicted_tracks}, set(ids.values()))
+        self.assertTrue(all(not p['detected'] and p['observationKind']=='PREDICTED'
+                            and not p['collisionObservation'] for p in empty.predicted_tracks))
+        self.assertEqual(sum(set(ids.values()).issubset({b['trackId'] for b in r.boxes})
+                             for r in (first, empty)), 1)
+
+    def test_retired_pair_ids_are_not_reused_within_session(self):
+        _, original = self.observe(0, self.participants(0))
+        for i in range(1, 5):
+            self.observe(i*.2, [])
+        self.assertTrue(set(original.values()).isdisjoint(self.tracker.tracks))
+        _, returned = self.observe(1, self.participants(0))
+        self.assertTrue(set(original.values()).isdisjoint(returned.values()))
+
+    def test_pair_camera_namespaces_remain_isolated(self):
+        _, bago = self.observe(0, self.participants(0))
+        other = SessionVehicleTracker('FOBOS', 'slow')
+        boxes = [detection(*bbox) for _,bbox,_ in self.participants(0)]
+        usb = other.update('slow', 1, 0, boxes, frame_width=600, frame_height=300)
+        self.assertEqual(set(bago.values()), {b['trackId'] for b in usb.boxes})
+        self.observe(.2, [])
+        self.assertTrue(all(t.missed_frames==0 for t in other.tracks.values()))
+        self.assertTrue(all(b['cameraId']=='FOBOS' for b in usb.boxes))
+
+    def test_pair_session_reset_discards_old_identity_evidence(self):
+        _, original = self.observe(0, self.participants(0))
+        self.observe(.2, self.participants(4))
+        self.tracker.reset('replacement')
+        self.assertIsNone(self.tracker.previous_gray)
+        self.assertEqual(self.tracker.tracks, {})
+        with self.assertRaises(ValueError):
+            self.observe(.4, self.participants(8))
+        new = self.tracker.update('replacement', 1, .4,
+            [detection(*bbox) for _,bbox,_ in self.participants(8)], frame_width=600, frame_height=300)
+        self.assertNotEqual(('slow', original['A']), (new.boxes[0]['sessionId'],new.boxes[0]['trackId']))
+        self.assertTrue(all(len(t.state.history)==1 for t in self.tracker.tracks.values()))
+
+
 class ProductionTrackingTests(unittest.TestCase):
     def prepare(self):
         m, ns = worker()
