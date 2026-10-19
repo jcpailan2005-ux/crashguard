@@ -27,6 +27,7 @@ import {
   resolveBackendMediaUrl,
 } from '@/lib/api-client'
 import { caseMedia as getCaseMedia, localCaseToCrashCase as mapLocalCaseToCrashCase } from '@/lib/crash-case-mapper'
+import { clipAnalysisBoxes, pixelCoordinatePercent } from '@/lib/camera-analysis-view'
 import {
   subscribeCrashCases,
 } from '@/lib/crash-case-store'
@@ -145,25 +146,26 @@ function EvidenceImageWithBoxes({
   src: string
 }) {
   const [naturalSize, setNaturalSize] = useState({ width: 1, height: 1 })
-  const visibleBoxes = boxes?.filter((box) => box.width > 0 && box.height > 0) ?? []
-  const toPercent = (value: number, axis: 'x' | 'y') => {
-    if (value <= 1) return value * 100
-    return (value / (axis === 'x' ? naturalSize.width : naturalSize.height)) * 100
-  }
+  const [loadedSource, setLoadedSource] = useState<string | null>(null)
+  const visibleBoxes = loadedSource === src ? clipAnalysisBoxes(boxes ?? [], naturalSize.width, naturalSize.height) : []
+  const toPercent = (value: number, axis: 'x' | 'y') =>
+    pixelCoordinatePercent(value, axis === 'x' ? naturalSize.width : naturalSize.height)
 
   return (
     <div className="flex justify-center">
       <div className="relative inline-block max-w-full">
         <img
+          key={src}
           src={src}
           alt="Detected crash evidence"
           className="block max-h-64 max-w-full object-contain"
-          onError={onError}
+          onError={() => { setLoadedSource(null); onError?.() }}
           onLoad={(event) => {
             setNaturalSize({
               width: event.currentTarget.naturalWidth || 1,
               height: event.currentTarget.naturalHeight || 1,
             })
+            setLoadedSource(src)
           }}
         />
         {visibleBoxes.length > 0 ? (
@@ -471,7 +473,7 @@ export default function LiveMapPage() {
                       ) : (
                         <EvidenceImageWithBoxes
                           src={media.previewUrl}
-                          boxes={selectedCase.boxes}
+                          boxes={media.previewIsAnnotated ? [] : selectedCase.boxes}
                           onError={() => setMediaLoadError(true)}
                         />
                       )

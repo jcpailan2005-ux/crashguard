@@ -18,6 +18,14 @@ export function isCurrentCrashConfirmed(result: IncidentAlarmResult): boolean {
   return result.accident_detected === true && result.finalDecision === 'confirmed_crash'
 }
 
+export function collisionResultLabel(result: IncidentAlarmResult): string {
+  if (isCurrentCrashConfirmed(result)) return 'Collision detected - review required'
+  if (result.finalDecision === 'possible_crash_aftermath') return 'Possible aftermath - review required'
+  if (result.finalDecision === 'candidate' || result.finalDecision === 'verifying') return 'Potential collision - verifying'
+  if (result.finalDecision === 'possible_crash' || result.accident_detected) return 'Possible crash - review required'
+  return 'No collision classified'
+}
+
 export class LiveAlarmTracker {
   private seen = new Set<string>()
   private startedAt: number

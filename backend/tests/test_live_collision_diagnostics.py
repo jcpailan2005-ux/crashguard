@@ -28,7 +28,7 @@ def load_worker(strip_diagnostics=False):
     tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
     functions = {
         'get_env_int', 'get_env_float', 'normalize_confidence_fraction',
-        'normalize_detection_label', 'normalize_box_label', 'box_center',
+        'normalize_detection_label', 'normalize_box_label', 'result_class_label', 'box_center', 'collision_vehicle_boxes',
         'parse_crash_roi', 'filter_boxes_in_roi', 'boxes_iou', 'boxes_edge_distance',
         'crash_like_vehicle_interaction', 'evaluate_crash_case_decision',
         'extract_vehicle_boxes_from_results', 'detect_vehicle_boxes',
@@ -40,7 +40,7 @@ def load_worker(strip_diagnostics=False):
         'LIVE_CAMERA_REQUIRED_HITS', 'CRASH_TEMPORAL_WINDOW_SECONDS',
         'LIVE_CAMERA_FREEZE_TIMEOUT_SECONDS', 'LIVE_CAMERA_VEHICLE_CONFIDENCE_THRESHOLD',
         'LIVE_CAMERA_PERSON_CONFIDENCE_THRESHOLD', 'LIVE_CAMERA_ALERT_COOLDOWN_SECONDS',
-        'VEHICLE_BOX_LABELS', 'PERSON_LABELS',
+        'VEHICLE_BOX_LABELS', 'ROAD_VEHICLE_BOX_LABELS', 'PERSON_LABELS',
     }
     body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in functions]
     body += [n for n in tree.body if isinstance(n, ast.Assign)
@@ -161,11 +161,10 @@ class LiveDiagnosticsTests(unittest.TestCase):
         # Interaction is NOT a qualification gate.
         self.assertTrue(rows[-1]['motion_valid'])
 
-    def test_three_hits_confirm_and_capture_timing(self):
+    def test_three_classifier_hits_do_not_confirm_stationary_overlap(self):
         output, rows, _ = self.run_sequence([.95]*3, True)
-        self.assertEqual(output[-1][0], 'confirmed_crash')
-        self.assertEqual(rows[-1]['streak_action'], 'CONFIRM')
-        self.assertTrue(rows[-1]['accident_detected'])
+        self.assertNotEqual(output[-1][0], 'confirmed_crash')
+        self.assertFalse(rows[-1]['accident_detected'])
         self.assertEqual(rows[-1]['seconds_since_previous_analyzed_observation'], 1)
         for r in rows:
             self.assertTrue(r['telemetry_complete'])
@@ -173,9 +172,8 @@ class LiveDiagnosticsTests(unittest.TestCase):
             self.assertLessEqual(r['inference_start'], r['inference_end'])
             self.assertLessEqual(r['inference_end'], r['decision_time'])
 
-    @unittest.expectedFailure
     def test_distinct_physical_pairs_must_not_share_three_hit_confirmation(self):
-        """Production safety gate: known failure until pair ownership is implemented."""
+        """Former XFAIL: different pairs cannot borrow a camera-wide streak."""
         pair_ab = [raw('car', bbox=(0, 0, 20, 20)), raw('car', bbox=(19, 0, 39, 20))]
         pair_cd = [raw('car', bbox=(30, 30, 50, 50)), raw('car', bbox=(49, 30, 69, 50))]
         pair_ef = [raw('car', bbox=(55, 0, 75, 20)), raw('car', bbox=(74, 0, 94, 20))]
@@ -185,9 +183,9 @@ class LiveDiagnosticsTests(unittest.TestCase):
         self.assertEqual([row['streak_after'] for row in rows], [1, 2, 3])
         self.assertNotEqual(outcomes[-1][0], 'confirmed_crash')
 
-    def test_one_vehicle_qualifies_but_aftermath_not_confirmation(self):
+    def test_one_vehicle_classifier_streak_is_not_persistent_aftermath_proof(self):
         out, rows, _ = self.run_sequence([.95]*3, True, boxes=[raw('motorcycle')])
-        self.assertEqual(out[-1][0], 'possible_crash_aftermath')
+        self.assertNotEqual(out[-1][0], 'possible_crash_aftermath')
         self.assertFalse(out[-1][2])
         self.assertTrue(all(r['observation_qualified'] for r in rows))
         self.assertEqual(rows[-1]['qualification_failures'], [])
@@ -252,14 +250,14 @@ class LiveDiagnosticsTests(unittest.TestCase):
             if 'roi' in kwargs:
                 self.assertEqual(rows[-1]['vehicles'][0]['rejection_reason'], 'vehicle_outside_roi')
 
-    def test_empty_vehicle_retry_records_both_real_passes(self):
+    def test_classifier_cannot_lower_vehicle_admission_threshold(self):
         off, _, n0 = self.run_sequence([.95], False, boxes=[raw('motorcycle', .3)])
         on, rows, n1 = self.run_sequence([.95], True, boxes=[raw('motorcycle', .3)])
         self.assertEqual(off, on)
-        self.assertEqual((n0,n1), (2,2))
-        self.assertEqual(len(rows[0]['detector_passes']), 2)
-        self.assertEqual([v['accepted'] for v in rows[0]['vehicles']], [False,True])
-        self.assertEqual([v['acceptance_threshold'] for v in rows[0]['vehicles']], [.4,.15])
+        self.assertEqual((n0,n1), (1,1))
+        self.assertEqual(len(rows[0]['detector_passes']), 1)
+        self.assertEqual([v['accepted'] for v in rows[0]['vehicles']], [False])
+        self.assertEqual([v['acceptance_threshold'] for v in rows[0]['vehicles']], [.4])
 
     def test_collection_failure_is_isolated_and_context_cleared(self):
         off, _, _ = self.run_sequence([.95]*3, False)

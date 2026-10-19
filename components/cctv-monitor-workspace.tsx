@@ -1168,6 +1168,9 @@ export function CctvMonitorWorkspace({ managementMode = false, initialCameraId }
                         {status?.latestResult?.finalDecision === 'confirmed_crash' ? (
                           <div role="alert" className="absolute inset-x-0 bottom-8 bg-red-950/95 px-3 py-2 text-center font-semibold text-white">
                             Collision Detected
+                            {status.latestResult.notificationWarning ? (
+                              <p className="text-xs font-normal">{status.latestResult.notificationWarning}</p>
+                            ) : null}
                           </div>
                         ) : null}
                         {alertId ? <Link

@@ -183,6 +183,9 @@ export interface DetectionResponse {
   caseCreated?: boolean | null
   /** True only when a notification was actually persisted alongside the case. */
   notificationCreated?: boolean | null
+  notificationStatus?: string | null
+  notificationWarning?: string | null
+  evidenceWarning?: string | null
   /** The object detector's own label for the highest-confidence box ("car", "bus", "truck", ...), or "none".
    * Kept separate from crash-decision fields on purpose — never overwritten by crashScore/finalDecision. */
   detectedObjectLabel?: string | null

@@ -99,6 +99,12 @@ export function clipAnalysisBoxes(boxes: DetectionBox[], width: number, height: 
   })
 }
 
+/** API coordinates are source-image pixels, including values at or below one. */
+export function pixelCoordinatePercent(value: number, sourceLength: number): number {
+  return Number.isFinite(value) && Number.isFinite(sourceLength) && sourceLength > 0
+    ? value / sourceLength * 100 : 0
+}
+
 export function fitMediaRect(
   sourceWidth: number,
   sourceHeight: number,

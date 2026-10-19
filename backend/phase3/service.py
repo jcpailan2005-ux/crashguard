@@ -6,7 +6,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from sqlite3 import IntegrityError
+from sqlite3 import IntegrityError, Error as SQLiteError
 
 from backend.camera_privacy import public_camera_data
 from backend.phase3.database import connection
@@ -557,6 +557,73 @@ def upsert_camera(actor: dict, data: dict, camera_id: str | None = None) -> dict
     return public_camera_data(clean)
 
 
+def _create_dispatcher_notifications(conn, incident_id: str) -> list[dict]:
+    return conn.execute(
+        """INSERT INTO notifications(user_id,incident_id,type,title,message)
+           SELECT ur.user_id,%s,'NEW_CRASH_REVIEW','New crash review',%s
+           FROM user_roles ur JOIN roles r ON r.id=ur.role_id
+           JOIN users u ON u.id=ur.user_id
+           WHERE r.name='DISPATCHER' AND u.status='ACTIVE' RETURNING id""",
+        (incident_id, f"Incident {incident_id} requires dispatcher review."),
+    ).fetchall()
+
+
+def _deliver_incident_notifications(conn, incident_id: str) -> dict:
+    existing = conn.execute(
+        "SELECT count(*) AS n FROM notifications WHERE incident_id=%s AND type='NEW_CRASH_REVIEW'",
+        (incident_id,),
+    ).fetchone()['n']
+    if existing:
+        return {'notificationCount': 0, 'notificationStatus': 'delivered', 'notificationWarning': None}
+    try:
+        # A delivery failure rolls back only delivery, preserving the incident,
+        # review, alert and evidence. Re-observing the same event retries safely.
+        with conn.transaction():
+            rows = _create_dispatcher_notifications(conn, incident_id)
+    except SQLiteError as error:
+        recorded = conn.execute(
+            "SELECT id FROM incident_timeline WHERE incident_id=%s AND event_type='NOTIFICATION_DELIVERY_FAILED' LIMIT 1",
+            (incident_id,),
+        ).fetchone()
+        if not recorded:
+            _timeline(conn, incident_id, 'NOTIFICATION_DELIVERY_FAILED', None,
+                      {'errorType': type(error).__name__})
+        return {'notificationCount': 0, 'notificationStatus': 'failed',
+                'notificationWarning': 'Incident saved. Dispatcher notification delivery failed; retry is pending.'}
+    return {'notificationCount': len(rows), 'notificationStatus': 'delivered' if rows else 'no_recipients',
+            'notificationWarning': None if rows else 'Incident saved. No active dispatcher recipients are configured.'}
+
+
+def _merge_verified_participants(conn, incident_id: str, evidence: dict | None):
+    if not evidence or not evidence.get('temporalCrashVerified'):
+        return
+    row = conn.execute('SELECT evidence_summary FROM incidents WHERE id=%s', (incident_id,)).fetchone()
+    previous = row['evidence_summary']
+    if previous.get('trackingSessionId') != evidence.get('trackingSessionId'):
+        return
+    participants = sorted(set(previous.get('involvedTrackIds') or ()) | set(evidence.get('involvedTrackIds') or ()))
+    if participants == sorted(previous.get('involvedTrackIds') or ()):
+        return
+    merged = {**previous, 'involvedTrackIds': participants,
+              'additionalContactEvidence': {'verifiedPairTrackIds': evidence.get('verifiedPairTrackIds'),
+                  'temporalEvidence': evidence.get('temporalEvidence'), 'sourceFrame': evidence.get('sourceFrame')}}
+    # Keep original snapshot coordinates, media and timestamps attached to their
+    # original frame; an additional contact augments rather than replaces them.
+    conn.execute('UPDATE incidents SET evidence_summary=%s WHERE id=%s', (_json(merged), incident_id))
+    _timeline(conn, incident_id, 'VEHICLE_PARTICIPANTS_UPDATED', None, {'involvedTrackIds': participants})
+
+
+def retry_ai_incident_notifications(detector_event_id: str, evidence: dict | None = None) -> dict | None:
+    """Retry delivery only for a still-recorded event; never create an incident."""
+    with connection() as conn, conn.transaction():
+        row = conn.execute('SELECT id FROM incidents WHERE detector_event_id=%s',
+                           (detector_event_id,)).fetchone()
+        if not row:
+            return None
+        _merge_verified_participants(conn, str(row['id']), evidence)
+        return _deliver_incident_notifications(conn, str(row['id']))
+
+
 def create_ai_incident(data: dict) -> dict:
     detector_event_id = str(data.get("detectorEventId") or "").strip()
     if not detector_event_id:
@@ -573,8 +640,15 @@ def create_ai_incident(data: dict) -> dict:
             "SELECT id FROM incidents WHERE detector_event_id=%s", (detector_event_id,)
         ).fetchone()
         if existing:
-            return {"incidentId": str(existing["id"]), "incidentCreated": False, "duplicateEvent": True}
-        if camera_key:
+            incident_id = str(existing['id'])
+            _merge_verified_participants(conn, incident_id, data.get('evidenceSummary'))
+            return {"incidentId": incident_id, "incidentCreated": False, "duplicateEvent": True,
+                    **_deliver_incident_notifications(conn, incident_id)}
+        evidence_input = data.get('evidenceSummary') or {}
+        pair_owned = bool(evidence_input.get('temporalCrashVerified')
+                          and evidence_input.get('trackingSessionId')
+                          and len(evidence_input.get('involvedTrackIds') or []) >= 2)
+        if camera_key and not pair_owned:
             pending = conn.execute(
                 """SELECT i.id FROM incidents i JOIN review_cases rc ON rc.incident_id=i.id
                    WHERE i.evidence_summary->>'cameraKey'=%s
@@ -608,14 +682,7 @@ def create_ai_incident(data: dict) -> dict:
         alert = conn.execute(
             "INSERT INTO alerts(incident_id,type) VALUES (%s,'NEW_CRASH_REVIEW') RETURNING id", (incident_id,)
         ).fetchone()
-        notification_rows = conn.execute(
-            """INSERT INTO notifications(user_id,incident_id,type,title,message)
-               SELECT ur.user_id,%s,'NEW_CRASH_REVIEW','New crash review',%s
-               FROM user_roles ur JOIN roles r ON r.id=ur.role_id
-               JOIN users u ON u.id=ur.user_id
-               WHERE r.name='DISPATCHER' AND u.status='ACTIVE' RETURNING id""",
-            (incident_id, f"Incident {incident_id} requires dispatcher review."),
-        ).fetchall()
+        delivery = _deliver_incident_notifications(conn, incident_id)
         _timeline(conn, incident_id, "AI_INCIDENT_CREATED", None,
                   {"detectionMode": detection_mode, "score": data.get("crashScore")})
         _timeline(conn, incident_id, "REVIEW_CASE_CREATED", None, {"reviewCaseId": str(review["id"])})
@@ -628,7 +695,7 @@ def create_ai_incident(data: dict) -> dict:
         "incidentCreated": True,
         "duplicateEvent": False,
         "createdAt": incident["created_at"].isoformat(),
-        "notificationCount": len(notification_rows),
+        **delivery,
     }
 
 

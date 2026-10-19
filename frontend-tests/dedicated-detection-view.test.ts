@@ -177,3 +177,25 @@ test('Live Monitor shows synchronized detections in control-room views', () => {
   assert.match(liveCamera, /isCctvLive && analysisPacket/)
   assert.match(liveCamera, /loadedAnalysisKey === analysisKey/)
 })
+
+test('contain geometry preserves source coordinates after resize and resolution changes', () => {
+  assert.deepEqual(fitMediaRect(1920, 1080, 400, 400, 'contain'),
+    { left: 0, top: 87.5, width: 400, height: 225 })
+  assert.deepEqual(fitMediaRect(640, 480, 800, 450, 'contain'),
+    { left: 100, top: 0, width: 600, height: 450 })
+  const resized = fitMediaRect(1920, 1080, 800, 800, 'contain')!
+  assert.equal(resized.top, 175)
+  assert.equal(resized.width, 800)
+  assert.equal(resized.height, 450)
+})
+
+test('browser camera boxes use the uploaded image instead of newer live video pixels', () => {
+  const camera = readFileSync('components/live-camera.tsx', 'utf8')
+  assert.match(camera, /reader\.readAsDataURL\(frameFile\)/)
+  assert.match(camera, /src=\{deviceAnalysis\.image\}/)
+  assert.match(camera, /loadedDeviceImage === deviceAnalysis\.image/)
+  assert.match(camera, /boxFit="contain"/)
+  assert.doesNotMatch(camera, /: overlayBoxes\}/)
+  const grid = readFileSync('components/camera-detection-grid.tsx', 'utf8')
+  assert.match(grid, /className="absolute inset-0 h-full w-full object-contain"/)
+})

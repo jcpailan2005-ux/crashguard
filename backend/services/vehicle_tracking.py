@@ -15,13 +15,16 @@ from ultralytics.trackers.basetrack import BaseTrack
 from ultralytics.trackers.byte_tracker import BYTETracker
 
 
-SUPPORTED_VEHICLE_LABELS = frozenset({"bicycle", "car", "motorcycle", "bus", "truck"})
+SUPPORTED_VEHICLE_LABELS = frozenset({"bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat"})
 COCO_VEHICLE_CLASS_IDS = {
     "bicycle": 1,
     "car": 2,
     "motorcycle": 3,
+    "airplane": 4,
     "bus": 5,
+    "train": 6,
     "truck": 7,
+    "boat": 8,
 }
 
 

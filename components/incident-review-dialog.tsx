@@ -46,6 +46,7 @@ import {
 import { getAreaLabel } from '@/lib/locations'
 import { getCaseStatusClass } from '@/lib/theme-status'
 import { CrashCase, DetectionBox } from '@/lib/types'
+import { clipAnalysisBoxes, pixelCoordinatePercent } from '@/lib/camera-analysis-view'
 
 interface IncidentReviewDialogProps {
   actorId: string
@@ -198,24 +199,25 @@ function EvidenceImageWithBoxes({
   src: string
 }) {
   const [naturalSize, setNaturalSize] = useState({ width: 1, height: 1 })
-  const visibleBoxes = boxes?.filter((box) => box.width > 0 && box.height > 0) ?? []
-  const toPercent = (value: number, axis: 'x' | 'y') => {
-    if (value <= 1) return value * 100
-    return (value / (axis === 'x' ? naturalSize.width : naturalSize.height)) * 100
-  }
+  const [loadedSource, setLoadedSource] = useState<string | null>(null)
+  const visibleBoxes = loadedSource === src ? clipAnalysisBoxes(boxes ?? [], naturalSize.width, naturalSize.height) : []
+  const toPercent = (value: number, axis: 'x' | 'y') =>
+    pixelCoordinatePercent(value, axis === 'x' ? naturalSize.width : naturalSize.height)
 
   return (
     <div className="flex min-h-64 items-center justify-center">
       <div className="relative inline-block max-w-full">
         <img
+          key={src}
           src={src}
           alt="Possible crash key frame"
-          onError={onError}
+          onError={() => { setLoadedSource(null); onError?.() }}
           onLoad={(event) => {
             setNaturalSize({
               width: event.currentTarget.naturalWidth || 1,
               height: event.currentTarget.naturalHeight || 1,
             })
+            setLoadedSource(src)
             onLoad()
           }}
           className="block max-h-[28rem] max-w-full object-contain"
@@ -348,7 +350,7 @@ export function IncidentReviewDialog({
                       src={media.previewUrl}
                       onError={() => setImageLoadError(true)}
                       onLoad={() => setImageLoadError(false)}
-                      boxes={caseItem.boxes}
+                      boxes={media.previewIsAnnotated ? [] : caseItem.boxes}
                     />
                   )
                 ) : (

@@ -1,3 +1,19 @@
+# Vehicle/collision audit - October 14, 2026
+
+The active routes now use real tracked before/contact/after motion evidence,
+separate display coverage from road collision eligibility, and preserve incidents
+when notification delivery fails. See [the detailed audit](docs/vehicle-boxes-collision-audit-2026-10-14.md)
+for changed files, final automated results, remaining limits and manual checks.
+Real-world collision accuracy and current live-camera visual validation are not
+certified by these automated tests. Restart the backend before manual validation.
+
+Automated checks passed: 417 backend tests, 67 frontend tests and TypeScript
+checking. Both actual models also ran on an empty-frame negative control, with
+zero vehicle boxes and no incident. See the audit for the distinction between
+controlled motion tests and unvalidated real camera/model performance.
+
+The October 13 and April reports below describe their respective earlier checks.
+
 # Current inference verification — October 13, 2026
 
 The detector loads and produces vehicle boxes. A 500 ms packet-delivery deadline

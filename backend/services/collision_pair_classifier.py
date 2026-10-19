@@ -11,7 +11,7 @@ import numpy as np
 
 
 VEHICLE_LABELS = frozenset(
-    {"car", "truck", "bus", "van", "motorcycle", "motorbike", "moped", "vehicle"}
+    {"bicycle", "car", "truck", "bus", "van", "motorcycle", "motorbike", "moped", "vehicle"}
 )
 
 

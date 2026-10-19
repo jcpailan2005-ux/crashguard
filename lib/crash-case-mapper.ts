@@ -51,7 +51,7 @@ export function localCaseToCrashCase(caseItem: LocalCrashCase): CrashCase {
       mediaType: caseItem.videoPath ? 'video' : 'image',
       source: sourceFromLocalCase(caseItem),
       sourceFile: caseItem.cameraName ?? caseItem.sourceCamera ?? null,
-      annotatedKeyFrameUrl: keyFrameUrl ?? thumbnailUrl ?? annotatedUrl,
+      annotatedKeyFrameUrl: caseItem.videoPath ? keyFrameUrl ?? thumbnailUrl : annotatedUrl,
       keyFrameUrl,
       thumbnailUrl,
       videoUrl,
@@ -93,10 +93,14 @@ export function caseMedia(caseItem: CrashCase | null) {
       mediaType: 'image' as const,
       rawPreviewPath: null,
       hasMediaPath: false,
+      previewIsAnnotated: false,
     }
   }
 
+  const annotatedImage = caseItem.media.annotatedKeyFrameUrl ||
+    (caseItem.media.mediaType === 'image' ? caseItem.annotatedPath || caseItem.media.annotatedMediaUrl : null)
   const previewPath =
+    annotatedImage ||
     caseItem.media.keyFrameUrl ||
     caseItem.keyFramePath ||
     caseItem.media.annotatedKeyFrameUrl ||
@@ -119,6 +123,7 @@ export function caseMedia(caseItem: CrashCase | null) {
 
   return {
     previewUrl: resolveBackendMediaUrl(previewPath),
+    previewIsAnnotated: Boolean(annotatedImage && previewPath === annotatedImage),
     fullUrl: resolveBackendMediaUrl(fullPath),
     mediaType:
       caseItem.media.mediaType === 'video' && previewPath === (caseItem.media.videoUrl || caseItem.videoPath)

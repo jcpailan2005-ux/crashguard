@@ -49,6 +49,7 @@ function cameraHealth(camera: CctvCamera, status?: CameraMonitoringStatus) {
 
 function collisionStatus(status?: CameraMonitoringStatus) {
   const result = status?.latestResult
+  if (result?.notificationStatus === 'failed') return 'INCIDENT SAVED - NOTIFICATION RETRY PENDING'
   if (result?.finalDecision === 'confirmed_crash' && (result.incidentCreated || result.incident_created)) {
     return 'INCIDENT SENT'
   }
@@ -114,7 +115,7 @@ function ExactDetectionFrame({
   const boxes = packet ? clipAnalysisBoxes(packet.boxes, width, height) : []
   return (
     <div
-      className={`relative w-full overflow-hidden rounded-md border border-border/60 bg-zinc-950 ${expanded ? 'min-h-[55vh]' : ''}`}
+      className="relative w-full overflow-hidden rounded-md border border-border/60 bg-zinc-950"
       style={{ aspectRatio: width > 0 && height > 0 ? `${width}/${height}` : '16/9' }}
       aria-label={`Exact analyzed detection frame for ${cameraId}`}
     >
@@ -124,7 +125,7 @@ function ExactDetectionFrame({
             key={packetKey}
             src={packet.imageDataUrl}
             alt="Exact analyzed camera frame"
-            className="h-full w-full object-contain"
+            className="absolute inset-0 h-full w-full object-contain"
             onLoad={(event) => setLoadedFrameKey(
               event.currentTarget.naturalWidth === width && event.currentTarget.naturalHeight === height
                 ? packetKey

@@ -32,7 +32,7 @@ from ultralytics import YOLO
 
 from backend.camera_privacy import public_camera_data, redact_camera_text
 from backend.services.camera_sources import is_webcam_reference, resolve_source, open_webcam, load_webcam_registry
-from backend.services.operational_detection import persist_operational_detection, find_pending_camera_incident
+from backend.services.operational_detection import persist_operational_detection, find_pending_camera_incident, retry_incident_notifications
 from backend.phase3.database import DatabaseUnavailable
 from backend.services.inference_execution import bounded_inference, live_camera_inference_scheduler
 from backend.services import live_collision_diagnostics
@@ -186,7 +186,7 @@ def seed_default_users() -> None:
         {
             "uid": "USR-ADMIN-DEFAULT",
             "email": "admin@crashguard.local",
-            "password": "admin123",
+            "password": os.getenv("CRASHGUARD_LEGACY_ADMIN_PASSWORD"),
             "displayName": "System Admin",
             "role": "admin",
             "areaId": None,
@@ -194,7 +194,7 @@ def seed_default_users() -> None:
         {
             "uid": "USR-RESPONDER-DEFAULT",
             "email": "responder@crashguard.local",
-            "password": "responder123",
+            "password": os.getenv("CRASHGUARD_LEGACY_RESPONDER_PASSWORD"),
             "displayName": "Talomo Responder",
             "role": "responder",
             "areaId": "talomo",
@@ -203,6 +203,8 @@ def seed_default_users() -> None:
 
     timestamp = datetime.now().isoformat()
     for acc in default_accounts:
+        if not acc["password"]:
+            continue
         existing = get_user_profile_by_email(acc["email"])
         if existing is None or not existing.get("passwordHash"):
             p_hash, p_salt = hash_password(acc["password"])
@@ -493,6 +495,10 @@ def normalize_detection_label(label: str) -> str:
 # Returned JSON + drawn preview: motor-vehicle road classes and crash labels only (no person, phone, …).
 ALLOWED_DETECTION_OUTPUT_LABELS = frozenset(
     {
+        "bicycle",
+        "airplane",
+        "train",
+        "boat",
         "car",
         "truck",
         "bus",
@@ -509,8 +515,16 @@ ALLOWED_DETECTION_OUTPUT_LABELS = frozenset(
 
 # Used for overlap heuristics only (no generic "vehicle" — avoids noisy COCO false positives).
 VEHICLE_HEURISTIC_LABELS = frozenset(
-    {"car", "truck", "bus", "van", "motorcycle", "motorbike", "moped"}
+    {"bicycle", "car", "truck", "bus", "van", "motorcycle", "motorbike", "moped"}
 )
+
+
+def result_class_label(result, class_id: int, fallback_names) -> str:
+    names = getattr(result, "names", None) or fallback_names
+    try:
+        return str(names[class_id])
+    except (KeyError, IndexError, TypeError):
+        return str(class_id)
 
 
 def is_allowed_detection_output_label(label: str) -> bool:
@@ -525,7 +539,7 @@ def draw_filtered_detection_overlay(bgr: np.ndarray, results) -> np.ndarray:
             continue
         for box in res.boxes:
             class_id = int(box.cls[0].item())
-            label = str(model.names[class_id])
+            label = result_class_label(res, class_id, model.names)
             if not is_allowed_detection_output_label(label):
                 continue
             xyxy = box.xyxy[0].detach().cpu().numpy()
@@ -552,8 +566,9 @@ def draw_filtered_detection_overlay(bgr: np.ndarray, results) -> np.ndarray:
 
 
 VEHICLE_BOX_LABELS = frozenset(
-    {"car", "motorcycle", "bus", "truck", "bicycle", "vehicle", "van", "suv", "automobile", "auto"}
+    {"airplane", "train", "boat", "car", "motorcycle", "bus", "truck", "bicycle", "vehicle", "van", "suv", "automobile", "auto"}
 )
+ROAD_VEHICLE_BOX_LABELS = VEHICLE_BOX_LABELS - {"airplane", "train", "boat"}
 PERSON_LABELS = frozenset({"person"})
 
 
@@ -569,6 +584,11 @@ def box_center(box: dict) -> tuple[float, float]:
         float(box.get("x") or 0.0) + float(box.get("width") or 0.0) / 2.0,
         float(box.get("y") or 0.0) + float(box.get("height") or 0.0) / 2.0,
     )
+
+
+def collision_vehicle_boxes(boxes: list[dict]) -> list[dict]:
+    """Display all model vehicles; collision inference is a road-domain decision."""
+    return [box for box in boxes if normalize_box_label(box.get("label", "")) in ROAD_VEHICLE_BOX_LABELS]
 
 
 def parse_crash_roi(frame_width: int, frame_height: int) -> tuple[float, float, float, float] | None:
@@ -612,7 +632,7 @@ def count_labels_from_results(
             continue
         for raw_box in result.boxes:
             class_id = int(raw_box.cls[0].item())
-            label = normalize_box_label(str(names.get(class_id, class_id)))
+            label = normalize_box_label(result_class_label(result, class_id, names))
             confidence = float(raw_box.conf[0].item())
             if label in labels and confidence >= min_confidence:
                 count += 1
@@ -692,6 +712,7 @@ def evaluate_crash_case_decision(
     aftermath_candidate: bool = False,
     is_static_image: bool = False,
     supported_candidate_vehicle_count: int = 0,
+    temporal_candidate: bool = False,
 ) -> tuple[bool, str | None, str]:
     # Frame quality is checked before anything else: a blurry, too-dark,
     # overexposed, or low-contrast frame makes every downstream signal
@@ -715,7 +736,7 @@ def evaluate_crash_case_decision(
         if aftermath_candidate:
             candidate_decision = "possible_crash_aftermath"
         else:
-            return False, "temporal_not_verified", "candidate" if consecutive_positive_frames > 0 else "ignored"
+            return False, "temporal_not_verified", "candidate" if consecutive_positive_frames > 0 or temporal_candidate else "ignored"
     else:
         # crash_confidence is the accident probability, not the classifier's
         # top-class confidence. The predicted class is kept for logging/debugging,
@@ -907,23 +928,34 @@ class CameraDecisionTracker:
                 consecutive += 1
             return consecutive
 
+    def observe_collision(self, camera_key: str, frame, boxes, **kwargs) -> dict:
+        from backend.services.collision_observation_session import AnalyzedCollisionSession
+        with self.lock:
+            entry = self._entry(camera_key)
+            if "collision_session" not in entry:
+                entry["collision_session"] = AnalyzedCollisionSession(
+                    required_hits=LIVE_CAMERA_REQUIRED_HITS, window_seconds=CRASH_TEMPORAL_WINDOW_SECONDS,
+            classifier_threshold=CRASH_CASE_CONFIDENCE_THRESHOLD)
+            return entry["collision_session"].observe(frame, boxes, **kwargs)
+
     def event_id(self, camera_key: str) -> str:
         with self.lock:
             return self._entry(camera_key)["detector_event_id"]
 
-    def cooldown_ready(self, camera_key: str, *, now: float | None = None) -> bool:
+    def cooldown_ready(self, camera_key: str, *, now: float | None = None, event_id: str | None = None) -> bool:
         now = time.time() if now is None else now
         with self.lock:
             entry = self.entries.get(camera_key)
-            if entry is None:
+            if entry is None or (event_id and entry.get("last_alert_event_id") != event_id):
                 return True
             return now - entry["last_alert_at"] >= LIVE_CAMERA_ALERT_COOLDOWN_SECONDS
 
-    def mark_alert(self, camera_key: str, *, now: float | None = None) -> None:
+    def mark_alert(self, camera_key: str, *, now: float | None = None, event_id: str | None = None) -> None:
         now = time.time() if now is None else now
         with self.lock:
             entry = self._entry(camera_key)
             entry["last_alert_at"] = now
+            entry["last_alert_event_id"] = event_id
             entry["hit_window"].clear()
 
 
@@ -945,15 +977,18 @@ def extract_vehicle_boxes_from_results(
             continue
         for raw_box in result.boxes:
             class_id = int(raw_box.cls[0].item())
-            label = normalize_box_label(str(names.get(class_id, class_id)))
+            label = normalize_box_label(result_class_label(result, class_id, names))
             if label not in VEHICLE_BOX_LABELS:
                 live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, 'class_not_vehicle')
                 continue
             confidence = float(raw_box.conf[0].item())
-            if confidence < threshold:
+            if not np.isfinite(confidence) or confidence < threshold:
                 live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, 'below_vehicle_confidence')
                 continue
             x1, y1, x2, y2 = [float(value) for value in raw_box.xyxy[0].tolist()]
+            if not np.isfinite([x1, y1, x2, y2]).all():
+                live_collision_diagnostics.emit('vehicle', raw_box, label, threshold, 'invalid_bbox')
+                continue
             x1 = max(0.0, min(x1, frame_width))
             x2 = max(0.0, min(x2, frame_width))
             y1 = max(0.0, min(y1, frame_height))
@@ -1404,11 +1439,9 @@ def get_video_frame_skip(total_frames: int, fps: float) -> int:
 
     frame_skip = max(1, int(round((fps or 30.0) / target_analysis_fps)))
 
-    if total_frames >= 3600:
-        return max(frame_skip, 20)
-    if total_frames >= 900:
-        return max(frame_skip, 12)
-    return max(frame_skip, 8)
+    # Fixed minimum skips starved low-FPS and longer clips of contiguous
+    # observations despite VIDEO_ANALYSIS_FPS. Honor the configured cadence.
+    return frame_skip
 
 
 def decode_uploaded_image(file_path: Path):
@@ -1499,7 +1532,7 @@ def extract_detections(results) -> tuple[list[dict], bool, float]:
         for box in result.boxes:
             class_id = int(box.cls[0].item())
             confidence = float(box.conf[0].item())
-            label = str(model.names[class_id])
+            label = result_class_label(result, class_id, model.names)
             bounding_box = [float(value) for value in box.xyxy[0].tolist()]
             lab_n = normalize_detection_label(label)
 
@@ -1856,6 +1889,7 @@ def persist_sqlite_crash_case(
     responder_id: str | None = None,
     boxes: list[dict] | None = None,
     detector_event_id: str | None = None,
+    temporal_evidence: dict | None = None,
 ) -> dict | None:
     log_create_case_attempt(
         route=route,
@@ -1881,7 +1915,8 @@ def persist_sqlite_crash_case(
                 "location": location, "latitude": latitude, "longitude": longitude,
                 "evidenceSummary": {"finalDecision": final_decision, "vehicleCount": vehicle_count,
                     "personCount": person_count, "sceneValid": scene_valid, "motionValid": motion_valid,
-                    "consecutiveCrashHits": consecutive_crash_hits, "boxes": boxes or []},
+                    "consecutiveCrashHits": consecutive_crash_hits, "boxes": boxes or [],
+                    **(temporal_evidence or {})},
                 "media": {"keyFramePath": key_frame_url, "annotatedPath": annotated_url,
                     "videoPath": annotated_download_url, "thumbnailPath": key_frame_url},
             })
@@ -2299,6 +2334,10 @@ class LiveCameraMonitor:
         )
         from backend.services.session_vehicle_tracking import SessionVehicleTracker
         self.vehicle_tracker = SessionVehicleTracker(self.frame_camera_id, self.frame_epoch)
+        from backend.services.collision_observation_session import CollisionObservationSession
+        self.collision_session = CollisionObservationSession(self.frame_camera_id,
+            required_hits=LIVE_CAMERA_REQUIRED_HITS, window_seconds=CRASH_TEMPORAL_WINDOW_SECONDS,
+            classifier_threshold=CRASH_CASE_CONFIDENCE_THRESHOLD)
         self.latest_frame_epoch = self.frame_epoch
         self.last_frame_monotonic: float | None = None
         self.preview_frame_epoch: str | None = None
@@ -2348,6 +2387,7 @@ class LiveCameraMonitor:
         self.last_error: str | None = None
         self.last_alert_at = 0.0
         self.detector_event_id = str(uuid.uuid4())
+        self.last_created_event_id = None
         self.last_confidence: float | None = None
         self.last_created_case_id: str | None = None
         self.last_created_notification_id: str | None = None
@@ -2989,15 +3029,11 @@ class LiveCameraMonitor:
         confidence = accident_probability
         crash_suspected = confidence >= CRASH_UI_CONFIDENCE_THRESHOLD
         all_resized_vehicle_boxes = detect_vehicle_boxes(detection_frame, fallback_results=results)
-        if not all_resized_vehicle_boxes and crash_suspected:
-            all_resized_vehicle_boxes = detect_vehicle_boxes(
-                detection_frame, fallback_results=results, min_confidence=0.15
-            )
         live_collision_diagnostics.emit('inference_end')
         self.model_processing_ms = (time.perf_counter() - models_started) * 1000
         box_inference_finished_at = time.time()
         resized_vehicle_boxes, scene_valid = filter_boxes_in_roi(
-            all_resized_vehicle_boxes,
+            collision_vehicle_boxes(all_resized_vehicle_boxes),
             detection_frame,
         )
         live_collision_diagnostics.emit('roi', all_resized_vehicle_boxes, resized_vehicle_boxes)
@@ -3008,7 +3044,7 @@ class LiveCameraMonitor:
             min_confidence=LIVE_CAMERA_PERSON_CONFIDENCE_THRESHOLD,
         )
         response_boxes = scale_detection_boxes(
-            resized_vehicle_boxes,
+            all_resized_vehicle_boxes,
             scale_x=frame.shape[1] / max(1, detection_frame.shape[1]),
             scale_y=frame.shape[0] / max(1, detection_frame.shape[0]),
         )
@@ -3023,6 +3059,13 @@ class LiveCameraMonitor:
                 response_boxes, frame_width=int(frame.shape[1]), frame_height=int(frame.shape[0]),
                 source_frame=frame,
             )
+            collision_boxes, _ = filter_boxes_in_roi(collision_vehicle_boxes(list(tracking.boxes)), frame)
+            collision_evidence = self.collision_session.observe(
+                session_id=captured_epoch, sequence=analyzed_seq,
+                timestamp=captured_monotonic if captured_monotonic is not None else last_frame_at,
+                boxes=collision_boxes, frame_width=frame.shape[1], frame_height=frame.shape[0],
+                classifier_score=confidence, frame_quality_status=frame_quality_status,
+                scene_valid=scene_valid)
             # Publish tracking and its exact analyzed frame atomically with the
             # session guard. This metadata is never consumed as crash evidence.
             self.latest_box_frame = (frame, {
@@ -3048,7 +3091,7 @@ class LiveCameraMonitor:
         ui_threshold_hit = bool(crash_suspected)
         case_threshold_hit = bool(confidence >= CRASH_CASE_CONFIDENCE_THRESHOLD)
         motion_valid = crash_like_vehicle_interaction(resized_vehicle_boxes)
-        vehicle_count = len(response_boxes)
+        vehicle_count = len(resized_vehicle_boxes)
         # Baseline shared by BOTH outcome tiers (confirmed_crash and
         # high_confidence_review): good frame quality, accident-class score
         # at/above CRASH_CASE_THRESHOLD, an in-ROI vehicle. motion_valid is
@@ -3150,7 +3193,10 @@ class LiveCameraMonitor:
         def save_detection_snapshot() -> tuple[Path | None, str | None, Path | None, str | None]:
             key_frame_name = f"live_camera_keyframe_{uuid.uuid4().hex[:8]}.jpg"
             key_frame_path = OUTPUTS / key_frame_name
-            key_frame_write_succeeded = bool(cv2.imwrite(str(key_frame_path), frame))
+            try:
+                key_frame_write_succeeded = bool(cv2.imwrite(str(key_frame_path), frame))
+            except Exception:
+                key_frame_write_succeeded = False
             key_frame_url = (
                 build_output_url_from_base(self.output_base, key_frame_name)
                 if key_frame_write_succeeded
@@ -3159,8 +3205,11 @@ class LiveCameraMonitor:
 
             annotated_name = f"live_camera_{uuid.uuid4().hex[:8]}.jpg"
             annotated_path = OUTPUTS / annotated_name
-            annotated_frame = draw_detection_boxes_overlay(frame, response_boxes)
-            annotated_write_succeeded = bool(cv2.imwrite(str(annotated_path), annotated_frame))
+            try:
+                annotated_frame = draw_detection_boxes_overlay(frame, response_boxes)
+                annotated_write_succeeded = bool(cv2.imwrite(str(annotated_path), annotated_frame))
+            except Exception:
+                annotated_write_succeeded = False
             annotated_url = (
                 build_output_url_from_base(self.output_base, annotated_name)
                 if annotated_write_succeeded
@@ -3171,6 +3220,8 @@ class LiveCameraMonitor:
                 log_stream(f"Failed to save live camera key frame: {key_frame_path.name}")
             if not annotated_write_succeeded:
                 log_stream(f"Failed to save live camera evidence frame: {annotated_path.name}")
+            if not key_frame_write_succeeded or not annotated_write_succeeded:
+                result_payload["evidenceWarning"] = "Incident detection continues, but some snapshot evidence could not be saved."
 
             return (
                 key_frame_path if key_frame_write_succeeded else None,
@@ -3190,7 +3241,7 @@ class LiveCameraMonitor:
         # qualifying frame, so the duplicate-case check must run that early
         # too, or a second high_confidence_review case could slip through on
         # frame 2 before temporal_ready is ever reached.
-        if pre_temporal_positive:
+        if pre_temporal_positive or collision_evidence["temporalCrashVerified"] or collision_evidence["aftermathCandidate"]:
             existing_case = find_unresolved_camera_case(
                 self.camera_ip,
                 self.camera_id,
@@ -3199,8 +3250,14 @@ class LiveCameraMonitor:
                 location=self.location,
             )
 
-        temporal_verified = bool(temporal_ready and motion_valid)
-        aftermath_candidate = bool(temporal_ready and not motion_valid)
+        temporal_verified = collision_evidence["temporalCrashVerified"]
+        aftermath_candidate = collision_evidence["aftermathCandidate"]
+        self.detector_event_id = collision_evidence["detectorEventId"]
+        cooldown_ready = cooldown_ready or self.last_created_event_id != self.detector_event_id
+        if temporal_verified and existing_case and existing_case.get("operational") and existing_case.get("detectorEventId") != self.detector_event_id:
+            existing_case = None
+        collision_evidence["sourceFrame"] = dict(source_identity)
+        result_payload.update(collision_evidence)
 
         should_create_case, rejection_reason, final_decision = evaluate_crash_case_decision(
             crash_class=crash_class,
@@ -3215,6 +3272,7 @@ class LiveCameraMonitor:
             frame_quality_status=frame_quality_status,
             quality_rejection_reason=quality_rejection_reason,
             temporal_verified=temporal_verified,
+            temporal_candidate=collision_evidence["temporalCrashCandidate"],
             aftermath_candidate=aftermath_candidate,
             is_static_image=False,
         )
@@ -3224,7 +3282,7 @@ class LiveCameraMonitor:
         result_payload["temporalCrashVerified"] = bool(
             temporal_verified and frame_quality_status == "good" and scene_valid and vehicle_count > 0
         )
-        result_payload["temporalCrashCandidate"] = pre_temporal_positive and not temporal_verified
+        result_payload["temporalCrashCandidate"] = collision_evidence["temporalCrashCandidate"] and not temporal_verified
         result_payload["existingCase"] = existing_case is not None
         result_payload["activeBlockingCaseId"] = (existing_case or {}).get("caseId")
         live_collision_diagnostics.emit(
@@ -3233,6 +3291,8 @@ class LiveCameraMonitor:
         )
 
         if final_decision == "duplicate_active_case" and existing_case:
+                if existing_case.get("operational"):
+                    result_payload.update(retry_incident_notifications(self.detector_event_id, collision_evidence))
                 (
                     duplicate_key_frame_path,
                     duplicate_key_frame_url,
@@ -3295,6 +3355,7 @@ class LiveCameraMonitor:
                     consecutive_crash_hits=consecutive_hits,
                     route="LiveCameraMonitor.analyze_current_frame",
                     detector_event_id=self.detector_event_id,
+                    temporal_evidence=collision_evidence,
                     source_camera=self.label,
                     area_id=self.area_id or "demo",
                     camera_ip=self.camera_ip,
@@ -3328,6 +3389,7 @@ class LiveCameraMonitor:
                 )
                 if persistence_status == "created":
                     self.last_alert_at = time.time()
+                    self.last_created_event_id = self.detector_event_id
                 result_payload.update(
                     {
                         "accident_detected": True,
@@ -3336,6 +3398,8 @@ class LiveCameraMonitor:
                         "incidentId": (sqlite_case or {}).get("incidentId"),
                         "incidentCreated": bool((sqlite_case or {}).get("incidentCreated")),
                         "notificationCount": int((sqlite_case or {}).get("notificationCount", 0)),
+                        "notificationStatus": (sqlite_case or {}).get("notificationStatus"),
+                        "notificationWarning": (sqlite_case or {}).get("notificationWarning"),
                         "detectionMode": (sqlite_case or {}).get("detectionMode"),
                         "reviewCaseId": (sqlite_case or {}).get("reviewCaseId"),
                         "notificationId": created_notification_id,
@@ -3438,7 +3502,7 @@ class LiveCameraMonitor:
         result_payload["accident_detected"] = result_payload["temporalCrashVerified"]
         result_payload["accidentDetected"] = result_payload["temporalCrashVerified"]
         if final_decision in {"candidate", "verifying"}:
-            message = "Checking motion ? no collision confirmed yet"
+            message = "Checking motion - no collision confirmed yet"
         elif final_decision == "confirmed_crash":
             message = "Collision detected. Review the incident."
 
@@ -3757,15 +3821,15 @@ def image_detection_response_from_bgr(
     crash_suspected = best_confidence >= CRASH_UI_CONFIDENCE_THRESHOLD
     accident_detected = crash_suspected
     response_boxes = detect_vehicle_boxes(decoded_image, fallback_results=results)
-    response_boxes, scene_valid = filter_boxes_in_roi(response_boxes, decoded_image)
+    collision_boxes, scene_valid = filter_boxes_in_roi(collision_vehicle_boxes(response_boxes), decoded_image)
     person_count = count_labels_from_results(
         results,
         getattr(model, "names", {}),
         PERSON_LABELS,
         min_confidence=LIVE_CAMERA_PERSON_CONFIDENCE_THRESHOLD,
     )
-    vehicle_count = len(response_boxes)
-    motion_valid = crash_like_vehicle_interaction(response_boxes)
+    vehicle_count = len(collision_boxes)
+    motion_valid = crash_like_vehicle_interaction(collision_boxes)
     log_fn(
         "Detection complete: "
         f"{len(detections)} objects detected, "
@@ -3829,17 +3893,22 @@ def image_detection_response_from_bgr(
         and vehicle_count > 0
         and scene_valid
     )
+    collision_evidence = {}
     if is_camera_detection:
+        collision_evidence = CAMERA_DECISION_TRACKER.observe_collision(camera_key, decoded_image, collision_boxes,
+            timestamp=time.monotonic(), classifier_score=best_confidence,
+            frame_quality_status=frame_quality_status, scene_valid=scene_valid)
         consecutive_positive_frames = CAMERA_DECISION_TRACKER.record_frame(
             camera_key, pre_temporal_positive
         )
-        cooldown_ready = CAMERA_DECISION_TRACKER.cooldown_ready(camera_key)
+        cooldown_ready = CAMERA_DECISION_TRACKER.cooldown_ready(camera_key,
+            event_id=collision_evidence.get("detectorEventId"))
         # Checked whenever THIS frame alone could create a case, not just
         # once the 3-frame confirmed_crash streak is reached — a
         # high_confidence_review case can be created on the very first
         # qualifying frame, so the duplicate-case check must run that early
         # too, or a second high_confidence_review case could slip through.
-        if pre_temporal_positive:
+        if pre_temporal_positive or collision_evidence["temporalCrashVerified"] or collision_evidence["aftermathCandidate"]:
             existing_case = find_unresolved_camera_case(
                 camera_ip,
                 camera_id,
@@ -3853,6 +3922,8 @@ def image_detection_response_from_bgr(
         consecutive_positive_frames = LIVE_CAMERA_REQUIRED_HITS
         cooldown_ready = True
 
+    if collision_evidence.get("temporalCrashVerified") and existing_case and existing_case.get("operational") and existing_case.get("detectorEventId") != collision_evidence["detectorEventId"]:
+        existing_case = None
     should_create_case, rejection_reason, final_decision = evaluate_crash_case_decision(
         crash_class=crash_class,
         crash_confidence=best_confidence,
@@ -3865,19 +3936,19 @@ def image_detection_response_from_bgr(
         cooldown_ready=cooldown_ready,
         frame_quality_status=frame_quality_status,
         quality_rejection_reason=quality_rejection_reason,
-        temporal_verified=bool(is_camera_detection and motion_valid and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS),
-        aftermath_candidate=bool(is_camera_detection and not motion_valid and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS),
+        temporal_verified=collision_evidence.get("temporalCrashVerified") if is_camera_detection else None,
+        temporal_candidate=collision_evidence.get("temporalCrashCandidate", False),
+        aftermath_candidate=collision_evidence.get("aftermathCandidate", False),
         is_static_image=not is_camera_detection,
     )
 
     if is_camera_detection:
-        accident_detected = bool(
-            pre_temporal_positive and motion_valid
-            and consecutive_positive_frames >= LIVE_CAMERA_REQUIRED_HITS
-        )
+        accident_detected = collision_evidence["temporalCrashVerified"]
 
     if not should_create_case and final_decision == "duplicate_active_case" and existing_case:
         sqlite_case = dict(existing_case)
+        if existing_case.get("operational"):
+            sqlite_case.update(retry_incident_notifications(collision_evidence["detectorEventId"], collision_evidence))
         blocked_reason = (
             "Alert blocked because an active case already exists for this same recent incident: "
             f"{existing_case['caseId']}"
@@ -3963,7 +4034,8 @@ def image_detection_response_from_bgr(
             crash_score=best_confidence,
             consecutive_crash_hits=consecutive_positive_frames,
             route="image_detection_response_from_bgr",
-            detector_event_id=CAMERA_DECISION_TRACKER.event_id(camera_key) if is_camera_detection else None,
+            detector_event_id=collision_evidence.get("detectorEventId"),
+            temporal_evidence=collision_evidence,
             source_camera=source_camera or source_file,
             area_id=case_area_id,
             camera_ip=camera_ip,
@@ -3991,7 +4063,7 @@ def image_detection_response_from_bgr(
         else:
             persistence_reason = "case_created"
         if is_camera_detection and persistence_reason == "case_created":
-            CAMERA_DECISION_TRACKER.mark_alert(camera_key)
+            CAMERA_DECISION_TRACKER.mark_alert(camera_key, event_id=collision_evidence.get("detectorEventId"))
 
     created_notification_id = (
         sqlite_case.get("createdNotificationId")
@@ -4042,11 +4114,14 @@ def image_detection_response_from_bgr(
         "incidentId": (sqlite_case or {}).get("incidentId"),
         "incidentCreated": bool((sqlite_case or {}).get("incidentCreated")),
         "notificationCount": int((sqlite_case or {}).get("notificationCount", 0)),
+                        "notificationStatus": (sqlite_case or {}).get("notificationStatus"),
+                        "notificationWarning": (sqlite_case or {}).get("notificationWarning"),
         "detectionMode": (sqlite_case or {}).get("detectionMode"),
         "reviewCaseId": (sqlite_case or {}).get("reviewCaseId"),
         "notificationId": created_notification_id,
         "status": sqlite_case.get("status") if sqlite_case else None,
         "finalDecision": final_decision,
+        **collision_evidence,
         "consecutiveCrashHits": consecutive_positive_frames,
         "requiredConsecutiveCrashHits": LIVE_CAMERA_REQUIRED_HITS,
         "confidence": best_confidence,
@@ -5399,6 +5474,7 @@ def detect_video(request: Request, file: UploadFile = File(...)):
     output_url = None
     browser_preview_safe = False
     processing_notes = None
+    evidence_warning = None
 
     try:
         if file is None:
@@ -5461,6 +5537,7 @@ def detect_video(request: Request, file: UploadFile = File(...)):
         best_confidence = 0.0
         best_key_frame = None
         best_key_frame_time_s = None
+        best_frame_boxes = []
         detection_samples = []
         detection_box_samples = []
         max_detection_samples = 20
@@ -5484,6 +5561,13 @@ def detect_video(request: Request, file: UploadFile = File(...)):
 
         log_video(f"Total frames: {total_frames}, frame_skip: {frame_skip}")
         last_annotated_frame = None
+        from backend.services.collision_observation_session import AnalyzedCollisionSession
+        video_collision_session = AnalyzedCollisionSession(
+            required_hits=LIVE_CAMERA_REQUIRED_HITS, window_seconds=CRASH_TEMPORAL_WINDOW_SECONDS,
+            classifier_threshold=CRASH_CASE_CONFIDENCE_THRESHOLD)
+        best_collision_evidence = {}
+        video_temporal_verified = False
+        video_aftermath_candidate = False
 
         while True:
             success, frame = cap.read()
@@ -5495,9 +5579,10 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             # Process the first frame, then sample the rest for faster CPU demos.
             should_process_frame = frame_count == 1 or (frame_count - 1) % frame_skip == 0
             if not should_process_frame:
-                # Reuse previous annotated frame for skipped frames (if available)
-                if writer is not None and last_annotated_frame is not None:
-                    writer.write(last_annotated_frame)
+                # Skipped frames have no matching detections. Never burn boxes
+                # from a different timestamp onto them or repeat frozen footage.
+                if writer is not None:
+                    writer.write(frame)
                 continue
 
             processed_frames += 1
@@ -5510,12 +5595,15 @@ def detect_video(request: Request, file: UploadFile = File(...)):
 
             # Detect objects in the current frame, then draw boxes and labels.
             results = model.predict(frame, verbose=False)
-            frame_detections, frame_has_accident, frame_best_confidence = extract_detections(results)
+            frame_detections, _raw_accident, _raw_confidence = extract_detections(results)
+            frame_classifier = classify_crash_frame(frame)
+            frame_best_confidence = normalize_confidence_fraction(frame_classifier.get("accidentProbability", 0.0))
+            frame_has_accident = frame_best_confidence >= CRASH_UI_CONFIDENCE_THRESHOLD
             frame_boxes = detect_vehicle_boxes(frame, fallback_results=results)
             annotated_frame = draw_detection_boxes_overlay(frame, frame_boxes)
             last_annotated_frame = annotated_frame
 
-            roi_frame_boxes, frame_scene_valid = filter_boxes_in_roi(frame_boxes, frame)
+            roi_frame_boxes, frame_scene_valid = filter_boxes_in_roi(collision_vehicle_boxes(frame_boxes), frame)
             frame_motion_valid = crash_like_vehicle_interaction(roi_frame_boxes)
             frame_person_count = count_labels_from_results(
                 results,
@@ -5537,6 +5625,13 @@ def detect_video(request: Request, file: UploadFile = File(...)):
                 and frame_scene_valid
                 and frame_motion_valid
             )
+            frame_collision = video_collision_session.observe(frame, roi_frame_boxes,
+                timestamp=(frame_count-1)/fps, classifier_score=frame_best_confidence,
+                frame_quality_status=frame_quality_result["frameQualityStatus"], scene_valid=frame_scene_valid)
+            frame_verified = frame_collision["temporalCrashVerified"]
+            frame_aftermath = frame_collision["aftermathCandidate"]
+            if frame_collision["temporalCrashCandidate"] and not best_collision_evidence:
+                best_collision_evidence = frame_collision
             crash_positive_streak = crash_positive_streak + 1 if frame_positive else 0
             max_crash_positive_streak = max(
                 max_crash_positive_streak, crash_positive_streak
@@ -5552,8 +5647,11 @@ def detect_video(request: Request, file: UploadFile = File(...)):
 
             if frame_has_accident:
                 accident_detected = True
-                if frame_best_confidence >= best_confidence:
+                if (frame_verified or frame_aftermath or not best_collision_evidence) and (
+                    not video_temporal_verified or frame_verified):
+                    best_collision_evidence = frame_collision
                     best_key_frame = annotated_frame
+                    best_frame_boxes = [dict(box) for box in frame_boxes]
                     best_frame_vehicle_count = len(roi_frame_boxes)
                     best_frame_person_count = frame_person_count
                     best_frame_scene_valid = frame_scene_valid
@@ -5570,6 +5668,26 @@ def detect_video(request: Request, file: UploadFile = File(...)):
                     except Exception:
                         best_key_frame_time_s = None
                 best_confidence = max(best_confidence, frame_best_confidence)
+            if frame_verified:
+                # Keep the verified frame even with a weak classifier: motion
+                # proof cannot be lost to a later high-scoring unrelated frame.
+                video_temporal_verified = True
+                best_collision_evidence = frame_collision
+                best_key_frame = annotated_frame
+                best_key_frame_time_s = (frame_count-1)/fps
+                best_frame_boxes = [dict(box) for box in frame_boxes]
+                best_collision_evidence["videoTimeSeconds"] = best_key_frame_time_s
+                best_frame_vehicle_count = len(roi_frame_boxes)
+                best_frame_person_count = frame_person_count
+                best_frame_scene_valid = frame_scene_valid
+                best_frame_motion_valid = frame_motion_valid
+                best_frame_quality_status = frame_quality_result["frameQualityStatus"]
+                best_frame_quality_rejection_reason = frame_quality_result["qualityRejectionReason"]
+                best_frame_blur_score = frame_quality_result["blurScore"]
+                best_frame_brightness_score = frame_quality_result["brightnessScore"]
+                best_frame_contrast_score = frame_quality_result["contrastScore"]
+                accident_detected = True
+            video_aftermath_candidate = video_aftermath_candidate or frame_aftermath
 
         if processed_frames == 0:
             log_video("No readable frames found in uploaded video")
@@ -5647,6 +5765,7 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             else:
                 if key_path.exists():
                     key_path.unlink()
+                evidence_warning = "Incident detection completed, but the video key frame could not be saved."
 
         if output_url is None and writer_info["writer"] is None:
             annotated_media_warning = (
@@ -5703,12 +5822,6 @@ def detect_video(request: Request, file: UploadFile = File(...)):
         # the raw classifier signal for the crashClass field in the response.
         raw_crash_class = "accident" if accident_detected else "non_accident"
 
-        video_temporal_verified = bool(
-            gating_motion_valid and max_crash_positive_streak >= LIVE_CAMERA_REQUIRED_HITS
-        )
-        video_aftermath_candidate = bool(
-            max_crash_positive_streak >= LIVE_CAMERA_REQUIRED_HITS and not gating_motion_valid
-        )
 
         should_create_case, rejection_reason, final_decision = evaluate_crash_case_decision(
             crash_class=raw_crash_class,
@@ -5723,6 +5836,7 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             frame_quality_status=gating_frame_quality_status,
             quality_rejection_reason=gating_quality_rejection_reason,
             temporal_verified=video_temporal_verified,
+            temporal_candidate=best_collision_evidence.get("temporalCrashCandidate", False),
             aftermath_candidate=video_aftermath_candidate,
             is_static_image=False,
         )
@@ -5773,8 +5887,10 @@ def detect_video(request: Request, file: UploadFile = File(...)):
                 crash_score=best_confidence,
                 consecutive_crash_hits=max_crash_positive_streak,
                 route="detect_video",
+                detector_event_id=best_collision_evidence.get("detectorEventId"),
+                temporal_evidence=best_collision_evidence,
                 source_camera=file.filename or "uploaded_video",
-                boxes=detection_box_samples,
+                boxes=best_frame_boxes,
             )
             persistence_status = (
                 sqlite_case.get("casePersistenceStatus")
@@ -5798,6 +5914,7 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             if sqlite_case and persistence_status == "created"
             else None
         )
+        accident_detected = bool(video_temporal_verified)
         create_incident_record(
             media_type="video",
             source_file=file.filename or "uploaded_video",
@@ -5830,6 +5947,8 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             "incidentId": (sqlite_case or {}).get("incidentId"),
             "incidentCreated": bool((sqlite_case or {}).get("incidentCreated")),
             "notificationCount": int((sqlite_case or {}).get("notificationCount", 0)),
+                        "notificationStatus": (sqlite_case or {}).get("notificationStatus"),
+                        "notificationWarning": (sqlite_case or {}).get("notificationWarning"),
             "detectionMode": (sqlite_case or {}).get("detectionMode"),
             "reviewCaseId": (sqlite_case or {}).get("reviewCaseId"),
             "notificationId": created_notification_id,
@@ -5865,6 +5984,8 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             "contrastScore": best_frame_contrast_score,
             "frameQualityStatus": gating_frame_quality_status,
             "qualityRejectionReason": gating_quality_rejection_reason,
+            **best_collision_evidence,
+            "temporalCrashVerified": video_temporal_verified,
             "consecutiveCrashHits": max_crash_positive_streak,
             "requiredConsecutiveCrashHits": LIVE_CAMERA_REQUIRED_HITS,
             "casePersistenceStatus": sqlite_case.get("casePersistenceStatus") if sqlite_case else persistence_status,
@@ -5876,13 +5997,14 @@ def detect_video(request: Request, file: UploadFile = File(...)):
             "timestamp": timestamp,
             "location": "Uploaded Video",
             "detections": detection_samples,
-            "boxes": detection_box_samples,
+            "boxes": best_frame_boxes,
             "annotated_media_url": annotated_media_url,
             "annotated_media_available": output_url is not None,
             "annotated_media_previewable": annotated_media_previewable,
             "annotated_media_download_url": output_url,
             "annotated_key_frame_url": annotated_key_frame_url,
             "annotated_key_frame_time_s": annotated_key_frame_time_s_out,
+            "evidenceWarning": evidence_warning,
             "annotated_media_format": get_output_format(output_name),
             "annotated_media_warning": annotated_media_warning,
             "processing_notes": processing_notes,

@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   DispatcherIncidentAlarmTracker,
+  collisionResultLabel,
   getOperationalIncidentId,
   isCurrentCrashConfirmed,
   shouldEmitOperationalAlarm,
@@ -86,4 +87,12 @@ test('candidate, verifying and aftermath states cannot claim a detected collisio
   for (const finalDecision of ['candidate', 'verifying', 'possible_crash_aftermath']) {
     assert.equal(isCurrentCrashConfirmed({ accident_detected: true, finalDecision }), false)
   }
+})
+
+test('result labels distinguish objects, provisional evidence, aftermath and classified collision', () => {
+  assert.equal(collisionResultLabel({ accident_detected: false, finalDecision: 'ignored' }), 'No collision classified')
+  assert.equal(collisionResultLabel({ accident_detected: false, finalDecision: 'candidate' }), 'Potential collision - verifying')
+  assert.equal(collisionResultLabel({ accident_detected: false, finalDecision: 'possible_crash_aftermath' }), 'Possible aftermath - review required')
+  assert.equal(collisionResultLabel({ accident_detected: true, finalDecision: 'possible_crash' }), 'Possible crash - review required')
+  assert.equal(collisionResultLabel(confirmed), 'Collision detected - review required')
 })

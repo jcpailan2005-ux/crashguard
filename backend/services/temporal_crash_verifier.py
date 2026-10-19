@@ -378,6 +378,7 @@ class TemporalCrashVerifier:
         frame_width: int,
         frame_height: int,
         timestamp: float | None = None,
+        reported_interactions: frozenset = frozenset(),
     ) -> TemporalCrashDecision:
         started = time.perf_counter()
         timestamp = time.monotonic() if timestamp is None else float(timestamp)
@@ -419,6 +420,14 @@ class TemporalCrashVerifier:
                 )
                 interaction = camera_pairs.get(key)
                 near = self._is_near(distance)
+                if (interaction is not None and interaction.state == "VERIFIED"
+                        and not near and interaction.possible_contact_at is not None
+                        and timestamp-interaction.possible_contact_at > self.config.post_contact_window_seconds):
+                    # Recorded incidents survive in storage. Vehicles separating
+                    # must not keep a live collision latched forever or prevent
+                    # a later interaction of the same vehicles being examined.
+                    camera_pairs.pop(key, None)
+                    interaction = None
                 if interaction is None and not near:
                     continue
                 if interaction is None:
@@ -607,7 +616,10 @@ class TemporalCrashVerifier:
                 )
             best = max(
                 current_decisions,
-                key=lambda item: (item.is_verified, item.score),
+                key=lambda item: (
+                    item.is_verified and (item.involved_track_ids, item.contact_timestamp) not in reported_interactions,
+                    item.is_verified, item.score,
+                ),
             )
             return TemporalCrashDecision(
                 is_candidate=best.is_candidate,

@@ -43,6 +43,8 @@ def persist_operational_detection(data: dict) -> PersistenceResult | None:
         'detectionMode': payload['detectionMode'],
         'detectorEventId': payload['detectorEventId'],
         'reviewCaseId': result.get('reviewCaseId'),
+        'notificationStatus': result.get('notificationStatus'),
+        'notificationWarning': result.get('notificationWarning'),
         **payload.get('media', {}),
     }
 
@@ -58,3 +60,12 @@ def find_pending_camera_incident(camera_ip=None, camera_id=None, source_camera=N
             'status': 'pending_review' if row['review_status'] == 'PENDING_REVIEW' else 'under_review',
             'operational': True, 'detectorEventId': row['detector_event_id'],
             **(row.get('media') or {})}
+
+
+def retry_incident_notifications(detector_event_id: str, evidence: dict | None = None) -> dict:
+    try:
+        return service.retry_ai_incident_notifications(detector_event_id, evidence) or {}
+    except Exception:
+        # Existing data is preserved; exception text can contain private values.
+        return {'notificationStatus': 'failed', 'notificationCount': 0,
+                'notificationWarning': 'Incident preserved. Dispatcher notification retry failed.'}

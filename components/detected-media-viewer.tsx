@@ -22,6 +22,7 @@ interface DetectedMediaViewerProps {
   title: string
   warning?: string | null
   boxes?: DetectionBox[]
+  imageIsAnnotated?: boolean
 }
 
 export function DetectedMediaViewer({
@@ -37,6 +38,7 @@ export function DetectedMediaViewer({
   title,
   warning,
   boxes,
+  imageIsAnnotated = false,
 }: DetectedMediaViewerProps) {
   const [open, setOpen] = useState(initialOpen)
 
@@ -75,6 +77,7 @@ export function DetectedMediaViewer({
         description={description}
         warning={warning}
         boxes={boxes}
+        imageIsAnnotated={imageIsAnnotated}
         actions={actions}
         actionsClassName={actionsClassName}
         compact={compact}

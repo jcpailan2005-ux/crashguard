@@ -553,6 +553,10 @@ export function LiveCamera({
   const [isProcessingFrame, setIsProcessingFrame] = useState(false)
   const [error, setError] = useState('')
   const [latestResult, setLatestResult] = useState<DetectionResponse | null>(null)
+  const [deviceAnalysis, setDeviceAnalysis] = useState<{
+    image: string; boxes: DetectionBox[]; width: number; height: number
+  } | null>(null)
+  const [loadedDeviceImage, setLoadedDeviceImage] = useState('')
   const [history, setHistory] = useState<DetectionHistoryEntry[]>([])
   const [liveOverlayLabels, setLiveOverlayLabels] = useState<string[]>([])
   const [liveOverlayBoxes, setLiveOverlayBoxes] = useState<DetectionBox[]>([])
@@ -1004,6 +1008,8 @@ export function LiveCamera({
     setCctvConnectionStatus('')
     setCctvFrameError('')
     setLiveOverlayBoxes([])
+    setDeviceAnalysis(null)
+    setLoadedDeviceImage('')
 
     if (cctvStatusIntervalRef.current) {
       clearInterval(cctvStatusIntervalRef.current)
@@ -1215,6 +1221,15 @@ export function LiveCamera({
           return
         }
 
+        const capturedStream = videoRef.current?.srcObject
+        const width = canvasRef.current!.width, height = canvasRef.current!.height
+        const image = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(String(reader.result))
+          reader.onerror = () => reject(new Error('Captured frame could not be read.'))
+          reader.readAsDataURL(frameFile)
+        })
+
         result = await detectFromFile(frameFile, 'image', {
           triggerStatus: 'camera_detection',
           sourceCamera: sourceCamera ?? cameraName ?? 'Device Live Camera',
@@ -1223,6 +1238,8 @@ export function LiveCamera({
           cameraName: cameraName ?? sourceCamera ?? 'Device Live Camera',
           location: sourceCamera ?? cameraName ?? 'Device Live Camera',
         })
+        if (videoRef.current?.srcObject !== capturedStream || sourceTabRef.current !== 'device') return
+        setDeviceAnalysis({ image, width, height, boxes: getDetectionOverlayBoxes(result) })
       }
 
       setError('')
@@ -1636,23 +1653,24 @@ export function LiveCamera({
             annotatedPreviewUrl={sourceTab === 'cctv' ? null : resolvedAnnotatedMediaUrl}
             boxes={sourceTab === 'cctv'
               ? (loadedAnalysisKey === analysisKey ? analysisPacket?.boxes ?? [] : [])
-              : overlayBoxes}
-            boxFit={stream ? 'cover' : 'contain'}
+              : deviceAnalysis ? (loadedDeviceImage === deviceAnalysis.image ? deviceAnalysis.boxes : []) : []}
+            boxFit="contain"
             isDetecting={isDetecting}
             isLive={isStreaming}
             labels={overlayStatusLabels}
             emptyDetectionLabel={emptyDetectionLabel}
-            sourceHeight={sourceTab === 'cctv' && analysisPacket ? analysisPacket.sourceFrame.height : overlaySourceSize?.height ?? null}
-            sourceWidth={sourceTab === 'cctv' && analysisPacket ? analysisPacket.sourceFrame.width : overlaySourceSize?.width ?? null}
+            sourceHeight={sourceTab === 'cctv' && analysisPacket ? analysisPacket.sourceFrame.height : deviceAnalysis?.height ?? overlaySourceSize?.height ?? null}
+            sourceWidth={sourceTab === 'cctv' && analysisPacket ? analysisPacket.sourceFrame.width : deviceAnalysis?.width ?? overlaySourceSize?.width ?? null}
             timestamp={overlayTimestamp}
           >
             {stream ? (
+              <>
               <video
                 ref={videoRef}
                 autoPlay
                 playsInline
                 muted
-                className="h-full w-full object-cover"
+                className={deviceAnalysis ? 'absolute inset-0 h-full w-full opacity-0' : 'h-full w-full object-contain'}
                 onLoadedMetadata={(event) => {
                   updateOverlaySourceSize(
                     event.currentTarget.videoWidth,
@@ -1660,6 +1678,16 @@ export function LiveCamera({
                   )
                 }}
               />
+              {deviceAnalysis ? <>
+                <img src={deviceAnalysis.image} alt="Exact analyzed browser camera frame"
+                  className="absolute inset-0 h-full w-full object-contain"
+                  onLoad={event => setLoadedDeviceImage(
+                    event.currentTarget.naturalWidth === deviceAnalysis.width &&
+                    event.currentTarget.naturalHeight === deviceAnalysis.height ? deviceAnalysis.image : '')}
+                  onError={() => setLoadedDeviceImage('')} />
+                <Badge className="absolute bottom-12 left-3 z-10 bg-black/85 text-white">Last analyzed frame</Badge>
+              </> : null}
+              </>
             ) : isCctvLive && analysisPacket ? (
               <>
                 <img key={analysisKey} src={analysisPacket.imageDataUrl}
@@ -1890,6 +1918,12 @@ export function LiveCamera({
                           <span className="font-semibold">Status:</span>{' '}
                           {isAdvancedMode ? getCrashAlertStatusText(crashAlert) : simpleCrashStatus}
                         </p>
+                        {crashAlert.result.notificationWarning ? (
+                          <p role="alert">{crashAlert.result.notificationWarning}</p>
+                        ) : null}
+                        {crashAlert.result.evidenceWarning ? (
+                          <p role="alert">{crashAlert.result.evidenceWarning}</p>
+                        ) : null}
                         {isAdvancedMode ? (
                           <>
                             <p className="break-all">

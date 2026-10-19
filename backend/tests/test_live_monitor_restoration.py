@@ -98,6 +98,17 @@ class CurrentEvidenceTests(unittest.TestCase):
         quality = dict(frameQualityStatus='good', qualityRejectionReason=None,
             blurScore=100, brightnessScore=100, contrastScore=100)
         with ExitStack() as stack:
+            # These tests exercise post-verification persistence/UI contracts.
+            # Motion verification itself is covered by the real-observation
+            # session and actual route tests, not by forced classifier streaks.
+            stack.enter_context(patch.object(m.collision_session, 'observe', return_value={
+                'temporalCrashVerified': bool(positive and motion and hit_count >= app.LIVE_CAMERA_REQUIRED_HITS),
+                'temporalCrashCandidate': positive,
+                'aftermathCandidate': bool(positive and not motion and hit_count >= app.LIVE_CAMERA_REQUIRED_HITS),
+                'detectorEventId': 'SYNTHETIC-BOUNDARY-EVENT',
+                'trackingSessionId': m.frame_epoch, 'involvedTrackIds': [1,2],
+                'temporalEvidence': {'post_contact_disruption': bool(motion)},
+            }))
             values = dict(analyze_frame_quality=quality, extract_detections=([], False, 0),
                 classify_crash_frame=dict(crashClass='accident', accidentProbability=.99 if positive else .01),
                 detect_vehicle_boxes=[box], filter_boxes_in_roi=([box], True),

@@ -12,6 +12,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { DetectionBox } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { clipAnalysisBoxes, pixelCoordinatePercent } from '@/lib/camera-analysis-view'
 
 type DialogActions = ReactNode | ((close: () => void) => ReactNode)
 
@@ -28,6 +29,7 @@ interface MediaPreviewDialogProps {
   title: string
   warning?: string | null
   boxes?: DetectionBox[]
+  imageIsAnnotated?: boolean
 }
 
 export function MediaPreviewDialog({
@@ -43,14 +45,16 @@ export function MediaPreviewDialog({
   title,
   warning,
   boxes,
+  imageIsAnnotated = false,
 }: MediaPreviewDialogProps) {
   const [videoFailed, setVideoFailed] = useState(false)
   const [naturalSize, setNaturalSize] = useState({ width: 1, height: 1 })
+  const [loadedSource, setLoadedSource] = useState<string | null>(null)
   const showVideoElement = mediaType === 'video' && mediaUrl && !videoFailed
-  const visibleBoxes = boxes?.filter((box) => box.width > 0 && box.height > 0) ?? []
+  const visibleBoxes = !imageIsAnnotated && loadedSource === mediaUrl
+    ? clipAnalysisBoxes(boxes ?? [], naturalSize.width, naturalSize.height) : []
   const toPercent = (value: number, axis: 'x' | 'y') => {
-    if (value <= 1) return value * 100
-    return (value / (axis === 'x' ? naturalSize.width : naturalSize.height)) * 100
+    return pixelCoordinatePercent(value, axis === 'x' ? naturalSize.width : naturalSize.height)
   }
 
   useEffect(() => {
@@ -115,6 +119,7 @@ export function MediaPreviewDialog({
           <div className="flex justify-center">
             <div className="relative inline-block max-w-full">
               <img
+                key={mediaUrl}
                 src={mediaUrl}
                 alt="Detected annotated result"
                 className={cn(
@@ -126,7 +131,9 @@ export function MediaPreviewDialog({
                     width: event.currentTarget.naturalWidth || 1,
                     height: event.currentTarget.naturalHeight || 1,
                   })
+                  setLoadedSource(mediaUrl)
                 }}
+                onError={() => setLoadedSource(null)}
               />
               {visibleBoxes.length > 0 ? (
                 <div className="pointer-events-none absolute inset-0">

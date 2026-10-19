@@ -35,7 +35,7 @@ import { Card } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useToast } from '@/hooks/use-toast'
 import { playAccidentAlert } from '@/lib/accident-alert'
-import { shouldEmitOperationalAlarm } from '@/lib/incident-alarm-contract'
+import { collisionResultLabel, shouldEmitOperationalAlarm } from '@/lib/incident-alarm-contract'
 import {
   detectFromFile,
   detectMediaTypeFromFile,
@@ -261,8 +261,8 @@ export default function UploadPage() {
         annotatedMediaAvailable: detectionResult.annotated_media_available,
       })
 
-      if (detectionResult.accident_detected) {
-        setCreatedCaseId(detectionResult.incidentId ?? detectionResult.incident_id ?? null)
+      setCreatedCaseId(detectionResult.incidentId ?? detectionResult.incident_id ?? detectionResult.caseId ?? null)
+      if (detectionResult.accident_detected || ['possible_crash', 'possible_crash_aftermath'].includes(detectionResult.finalDecision ?? '')) {
 
         const incidentId = detectionResult.incidentId ?? detectionResult.incident_id ?? null
         if (
@@ -278,10 +278,9 @@ export default function UploadPage() {
         }
 
         toast({
-          title: 'Possible Crash Detected',
-          description: `A pending review case was created with ${(
-            detectionResult.confidence * 100
-          ).toFixed(0)}% confidence.`,
+          title: collisionResultLabel(detectionResult),
+          description: detectionResult.notificationWarning ?? detectionResult.persistenceSkippedReason ??
+            (detectionResult.caseCreated ? 'An incident was saved for review.' : 'Review the detection result and persistence status.'),
         })
       } else {
         toast({
@@ -698,18 +697,24 @@ export default function UploadPage() {
                   <h2 className="text-2xl font-bold">Detection Result</h2>
                   <Badge
                     className={
-                      result.accident_detected
+                      result.accident_detected || ['possible_crash_aftermath', 'candidate', 'verifying'].includes(result.finalDecision ?? '')
                         ? 'min-w-[10.5rem] justify-center border-destructive/50 bg-destructive/20 text-destructive'
                         : 'min-w-[10.5rem] justify-center border-[var(--status-resolved)] bg-[color:var(--status-resolved-bg)] text-[var(--status-resolved)]'
                     }
                     variant="outline"
                   >
-                    {result.accident_detected ? 'Possible Crash' : 'No crash flagged'}
+                    {collisionResultLabel(result)}
                   </Badge>
                 </div>
               </div>
 
               <div className="space-y-6 p-6">
+                {result.notificationWarning || result.evidenceWarning || result.persistenceStatus === 'failed' ? (
+                  <Alert variant="destructive">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertDescription>{result.notificationWarning ?? result.evidenceWarning ?? result.persistenceSkippedReason ?? 'The incident could not be saved. Review the backend connection.'}</AlertDescription>
+                  </Alert>
+                ) : null}
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="min-h-24 rounded-lg border border-border/50 bg-card/50 p-4">
                     <p className="text-sm text-muted-foreground">Confidence</p>
@@ -807,6 +812,7 @@ export default function UploadPage() {
                             buttonLabel="View Detection Popup"
                             actions={keyFrameActions}
                             boxes={result.boxes}
+                            imageIsAnnotated
                           />
                           <p className="text-xs text-muted-foreground">
                             This preview shows where the possible crash was detected.
@@ -824,6 +830,7 @@ export default function UploadPage() {
                         buttonLabel={previewButtonLabel}
                         warning={result.annotated_media_warning}
                         boxes={result.boxes}
+                        imageIsAnnotated
                       />
                     </div>
                   )}
