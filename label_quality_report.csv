@@ -1,0 +1,10 @@
+Sample File,Event / Origin,Current Label,Verified Visual Status,Confidence Score,Category,Audit Notes
+public/samples/vehicle-03.jpg,CCTV Crash Scene,accident,Positive (Impact / Debris),0.9577,High-Impact Collision,True crash. High model confidence. Previous false negative was temporal gating failure.
+public/samples/accident-01.jpg,CCTV Intersection,accident,Positive (Aftermath / Overturned),0.8834,Overturned Aftermath,True crash aftermath. High classifier score.
+carcrash1cctv_test15_10.jpg,c1_test15_accident,accident,Positive (Distant Crash),0.3812,Distant Collision,False negative frame. Vehicle collision at far edge of CCTV camera; low contrast.
+carcrash1cctv_test22_19.jpg,c1_test22_non_accident,non_accident,Negative (Close Traffic),0.8731,Traffic Congestion,False positive frame. Two black sedans traveling very close at intersection misclassified as collision.
+carcrash2cctv_13052.jpg,c2_non_accident_ev_0077,non_accident,Negative (Headlight Glare),0.8609,Night Glare / Compression,False positive frame. Low resolution 320x240 nighttime feed with heavy headlight flare.
+carcrash2cctv_14606.jpg,c2_non_accident_ev_0096,non_accident,Negative (Truck Passing),0.9401,Large Vehicle Overlap,False positive frame. Perspective occlusion between bus and passing van mimics collision bounding overlap.
+carcrash2cctv_4751.jpg,c2_non_accident_ev_0158,non_accident,Negative (Roadside Parking),0.8588,Parked Roadside Vehicles,False positive frame. Vehicles parked diagonally on roadside shoulder mistaken for crash aftermath.
+carcrash2cctv_1361.jpg,c2_accident_ev_0001,accident,Ambiguous (Pre-Impact Motion),0.2546,Pre-Impact Frame,"True sequence, but frame captured ~0.5s prior to actual contact. Vehicles not yet touching."
+carcrash2cctv_3982.jpg,c2_accident_ev_0163,accident,Ambiguous (Severe Motion Blur),0.1209,Motion Blur / Occlusion,Severe interlacing and video compression artifacts obliterate vehicle boundary.

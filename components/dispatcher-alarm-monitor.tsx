@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Volume2, VolumeX } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { armAccidentAlertAudio, classifyAlarmPlaybackError, playAccidentAlert, playAccidentAlertWithResult } from '@/lib/accident-alert'
+import { accidentAlertArmedAt, subscribeAccidentAlertArmed, disarmAccidentAlertAudio, armAccidentAlertAudio, classifyAlarmPlaybackError, playAccidentAlert, playAccidentAlertWithResult } from '@/lib/accident-alert'
 import { enqueueFreshDispatcherAlarms } from '@/lib/dispatcher-alarm-delivery'
 import { DispatcherIncidentAlarmTracker } from '@/lib/incident-alarm-contract'
 import { phase3 } from '@/lib/phase3-api'
@@ -22,6 +22,11 @@ export function DispatcherAlarmMonitor() {
   const pollingRef = useRef(false)
   const queueRef = useRef<Promise<void>>(Promise.resolve())
 
+  useEffect(() => subscribeAccidentAlertArmed((value) => {
+    armedRef.current = value
+    setArmed(value)
+  }), [])
+
   useEffect(() => {
     const audio = new Audio('/alert-sound.mp3')
     audio.preload = 'auto'
@@ -34,7 +39,7 @@ export function DispatcherAlarmMonitor() {
       pollingRef.current = true
       try {
         const [notificationResponse, incidentResponse] = await Promise.all([
-          phase3.notifications(),
+          phase3.notifications().catch(() => ({ notifications: [] })),
           phase3.incidents(),
         ])
         if (stopped) return
@@ -70,7 +75,9 @@ export function DispatcherAlarmMonitor() {
                   setPlaybackStatus('PLAY_RESOLVED · buzzer after MP3 media error')
                 }
               }
-              setError('')
+              setError(result.mp3Rejection
+                ? `Browser siren playback was rejected: ${result.mp3Rejection}. Fallback buzzer played. Check sound permission and arm again.`
+                : '')
             } catch (playbackError) {
               const category = classifyAlarmPlaybackError(playbackError)
               setPlaybackStatus(`PLAY_REJECTED · ${category}`)
@@ -78,7 +85,8 @@ export function DispatcherAlarmMonitor() {
             } finally {
               setPlaying(false)
             }
-          }
+          },
+          accidentAlertArmedAt() ?? undefined,
         )
         queueRef.current = delivery.pending
         if (delivery.eligible.length > 0) {
@@ -109,13 +117,14 @@ export function DispatcherAlarmMonitor() {
 
   const toggle = async () => {
     if (armedRef.current) {
+      disarmAccidentAlertAudio()
       armedRef.current = false
       audioRef.current?.pause()
       setPlaying(false)
       setArmed(false)
       return
     }
-    const ready = await armAccidentAlertAudio()
+    const ready = await armAccidentAlertAudio(audioRef.current)
     if (!ready) {
       setError('Browser audio could not be armed. Check sound permissions and try again.')
       return

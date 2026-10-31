@@ -16,7 +16,7 @@ test('alarm preference is persisted and gates both operational alarm surfaces', 
   const liveCamera = readFileSync('components/live-camera.tsx', 'utf8')
   const upload = readFileSync('app/dashboard/upload/page.tsx', 'utf8')
   assert.match(settings, /alarmAudio/)
-  assert.match(liveCamera, /if \(alarmAudioEnabled && profile\?\.role !== 'dispatcher'\)/)
+  assert.match(liveCamera, /if \(alarmAudioEnabled && accidentAlertArmedAt\(\) !== null && profile\?\.role !== 'dispatcher'\)/)
   assert.match(upload, /alarmAudioEnabled\s*&&\s*shouldEmitOperationalAlarm/)
 })
 
@@ -28,7 +28,7 @@ test('dispatcher alarm polling and arming live in the persistent dispatcher shel
   assert.match(monitor, /phase3\.notifications\(\)/)
   assert.match(monitor, /phase3\.incidents\(\)/)
   assert.match(monitor, /window\.setInterval\(\(\) => void poll\(\), 5_000\)/)
-  assert.match(monitor, /armAccidentAlertAudio\(\)/)
+  assert.match(monitor, /armAccidentAlertAudio\(audioRef\.current\)/)
   assert.doesNotMatch(alerts, /playAccidentAlert|DispatcherIncidentAlarmTracker/)
 })
 

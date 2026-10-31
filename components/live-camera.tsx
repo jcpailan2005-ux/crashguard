@@ -26,8 +26,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/components/auth-provider'
-import { armAccidentAlertAudio, playAccidentAlert } from '@/lib/accident-alert'
+import { subscribeAccidentAlertArmed, accidentAlertArmedAt, armAccidentAlertAudio, playAccidentAlert } from '@/lib/accident-alert'
 import { APP_CONFIG } from '@/lib/app-config'
+import { cameraCollisionResult } from '@/lib/camera-collision-state'
 import {
   createCameraStreamAccess,
   subscribeCameraBoxes,
@@ -543,6 +544,7 @@ export function LiveCamera({
   const cctvLastRecoveryAtRef = useRef(0)
   const cctvStartedAtRef = useRef<number | null>(null)
   const cctvLastFrameAtRef = useRef<number | null>(null)
+  const cctvSessionRef = useRef<string | null>(null)
   const detectionSamplesRef = useRef<LiveDetectionSample[]>([])
   const boxHoldUntilRef = useRef(0)
   const dismissedCrashAlertIdsRef = useRef<Set<string>>(new Set())
@@ -609,11 +611,13 @@ export function LiveCamera({
 
   const armAlarmAudio = () => {
     if (!alarmAudioEnabled) return
-    void armAccidentAlertAudio().then((armed) => {
+    void armAccidentAlertAudio(audioRef.current).then((armed) => {
       setAlarmAudioArmed(armed)
       setAlarmAudioError(armed ? '' : 'Browser alarm audio is blocked. Click Arm Alarm Sound again.')
     })
   }
+
+  useEffect(() => subscribeAccidentAlertArmed(setAlarmAudioArmed), [])
 
   useEffect(() => {
     const el = new Audio('/alert-sound.mp3')
@@ -960,7 +964,7 @@ export function LiveCamera({
     if (isCurrentCrashConfirmed(result)) showCrashAlert(displayResult)
 
     if (liveAlarmTracker.consume(result)) {
-      if (alarmAudioEnabled && profile?.role !== 'dispatcher') {
+      if (alarmAudioEnabled && accidentAlertArmedAt() !== null && profile?.role !== 'dispatcher') {
         void playAccidentAlert(audioRef.current, alertVolume, { beepRepeats: 3 }).catch(
           () => setAlarmAudioError('Browser alarm audio was blocked. Click Arm Alarm Sound to enable it.')
         )
@@ -1008,6 +1012,9 @@ export function LiveCamera({
     setCctvConnectionStatus('')
     setCctvFrameError('')
     setLiveOverlayBoxes([])
+    setLatestResult(null)
+    setCrashAlert(null)
+    cctvSessionRef.current = null
     setDeviceAnalysis(null)
     setLoadedDeviceImage('')
 
@@ -1296,6 +1303,15 @@ export function LiveCamera({
   const pollCctvMonitor = async (monitorId: string) => {
     try {
       const status = await getCameraMonitoringStatus(monitorId)
+      if (cctvMonitorIdRef.current !== monitorId) return
+      const sessionId = status.latestFrameIdentity?.sessionId ?? status.latestResult?.sourceFrame?.sessionId
+      if (sessionId && sessionId !== cctvSessionRef.current) {
+        cctvSessionRef.current = sessionId
+        detectionSamplesRef.current = []
+        setLatestResult(null)
+        setCrashAlert(null)
+        setLiveOverlayBoxes([])
+      }
       if (
         status.status === 'disconnected' &&
         autoStartCctv && cameraId?.trim() === monitorId && detectionEnabledRef.current &&
@@ -1321,7 +1337,7 @@ export function LiveCamera({
         return
       }
       setCctvConnectionStatus(
-        status.message ||
+        (cameraCollisionResult(status)?.finalDecision === 'confirmed_crash' ? 'Collision detected. Review the incident.' : status.message) ||
           (status.detectionRunning ? 'Monitoring live' : status.status || 'Connected')
       )
       if (status.latestFrameAvailable || status.latestFrameReceived || status.previewAvailable) {
@@ -1341,8 +1357,9 @@ export function LiveCamera({
       if (status.lastError && !isAdvancedMode) {
         setCctvFrameError('Unable to load CCTV frame. Ask admin to check this camera.')
       }
-      if (status.latestResult) {
-        handleCctvMonitorResult(status.latestResult)
+      const collisionResult = cameraCollisionResult(status)
+      if (collisionResult) {
+        handleCctvMonitorResult(collisionResult)
       }
     } catch (statusError) {
       setCctvConnectionStatus(

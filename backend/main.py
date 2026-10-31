@@ -2377,6 +2377,9 @@ class LiveCameraMonitor:
         self.jpeg_send_age_ms: float | None = None
         self.jpeg_replaced_age_ms: float | None = None
         self.latest_result: dict | None = None
+        # Presentation-only receipt: a one-frame confirmation must survive the
+        # slower status poll. Never fed back into collision verification.
+        self.collision_confirmation: dict | None = None
         self.last_checked_at: str | None = None
         self.last_frame_at: float | None = None
         self.capture_worker_running = False
@@ -2423,6 +2426,7 @@ class LiveCameraMonitor:
         self.running = False
         with self.lock:
             self.vehicle_tracker.reset(None)
+            self.collision_confirmation = None
         self.stop_event.set()
         self.frame_available.set()
         if self.stream_url.startswith("webcam://"):
@@ -2774,6 +2778,7 @@ class LiveCameraMonitor:
                             "lastFrameAt": last_frame_at,
                             "frameAgeMs": frame_age_ms,
                             "latestResult": result,
+                            "collisionConfirmation": self._current_collision_confirmation(),
                         }
                     payload_key = json.dumps(
                         {
@@ -2809,6 +2814,13 @@ class LiveCameraMonitor:
                     time.sleep(1.0)
         finally:
             log_stream(f"SSE disconnected cameraId={self.camera_id or ''} label={self.label}")
+
+    def _current_collision_confirmation(self) -> dict | None:
+        receipt = self.collision_confirmation
+        if (receipt and receipt["expiresAt"] > time.time()
+                and receipt["result"]["sourceFrame"]["sessionId"] == self.frame_epoch):
+            return receipt
+        return None
 
     def snapshot_status(self) -> dict:
         blocking_case = find_unresolved_camera_case(
@@ -2940,6 +2952,7 @@ class LiveCameraMonitor:
                 "lastError": self.last_error,
                 "reconnecting": self.reconnecting or status == "reconnecting",
                 "latestResult": result,
+                "collisionConfirmation": self._current_collision_confirmation(),
                 "previewAvailable": self.latest_frame is not None,
                 "existingCaseMessage": (
                     self.alert_blocked_reason
@@ -3257,6 +3270,9 @@ class LiveCameraMonitor:
         if temporal_verified and existing_case and existing_case.get("operational") and existing_case.get("detectorEventId") != self.detector_event_id:
             existing_case = None
         collision_evidence["sourceFrame"] = dict(source_identity)
+        # Save only observations from these exact pixels, including identity.
+        response_boxes = [dict(box) for box in tracking.boxes]
+        collision_evidence["boxes"] = response_boxes
         result_payload.update(collision_evidence)
 
         should_create_case, rejection_reason, final_decision = evaluate_crash_case_decision(
@@ -3554,6 +3570,15 @@ class LiveCameraMonitor:
         result_payload["inferenceSourceAgeAtCompletionMs"] = self.inference_completion_age_ms
 
         with self.lock:
+            if captured_epoch != self.frame_epoch:
+                raise ValueError("Discarded analyzed result from retired camera session.")
+            if (self.latest_result and self.latest_result.get("sourceFrame", {}).get("sessionId") == captured_epoch
+                    and self.latest_result["sourceFrame"]["sequence"] >= analyzed_seq):
+                raise ValueError("Discarded out-of-order analyzed result.")
+            if final_decision == "confirmed_crash" and result_payload["accident_detected"]:
+                self.collision_confirmation = {"result": dict(result_payload), "expiresAt": time.time() + 10.0}
+            elif final_decision == "possible_crash_aftermath":
+                self.collision_confirmation = None
             self.last_checked_at = checked_at
             self.last_confidence = visible_confidence
             self.last_detection_label = best_label

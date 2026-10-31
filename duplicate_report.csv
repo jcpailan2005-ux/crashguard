@@ -1,0 +1,6 @@
+Duplicate Type,Scope,Duplicate Count,Percentage,Finding / Notes
+Exact Bitwise Duplicates (MD5),"Overall Dataset (13,301 images)",0 images,0.0%,"No identical file hashes exist across the 13,301 images. Frame indexing ensured distinct image files."
+Perceptual Near-Duplicates (pHash dist <= 4),Consecutive CCTV Video Frames,"7,612 images",57.2%,Extracted at high frame rates (10-30 fps). Adjacent frames differ by only minor camera sensor noise.
+Cross-Split Near-Duplicates (Train <-> Val),Current Split (Train vs Val),"1,480 images",76.2% of Val set,Direct consequence of frame-level shuffling. Validation set is heavily contaminated with train duplicates.
+Cross-Split Near-Duplicates (Train <-> Test),Current Split (Train vs Test),"1,512 images",77.9% of Test set,"Test frames share near-identical visual features with training frames, artificially boosting test accuracy."
+Cross-Split Duplicates in Event-Split (v2),Proposed Clean Split Manifest,0 images,0.0%,Strict event boundary containment guarantees zero cross-split near duplicates.

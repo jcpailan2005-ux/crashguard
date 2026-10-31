@@ -11,9 +11,10 @@ export function enqueueFreshDispatcherAlarms(
   incidents: DispatcherAlarmIncident[],
   armed: boolean,
   pending: Promise<void>,
-  attempt: (incidentId: string) => Promise<void>
+  attempt: (incidentId: string) => Promise<void>,
+  notBefore?: number,
 ): { pending: Promise<void>; eligible: string[]; attempted: string[] } {
-  const eligible = tracker.consume(notifications, incidents)
+  const eligible = tracker.consume(notifications, incidents, notBefore)
   const attempted = armed ? eligible : []
   for (const incidentId of attempted) {
     // An earlier failed attempt must not suppress the next new incident.

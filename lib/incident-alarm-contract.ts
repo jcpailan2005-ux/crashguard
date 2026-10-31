@@ -76,6 +76,7 @@ export interface DispatcherAlarmIncident {
   id: string
   detectionMode: string
   createdAt?: string
+  evidenceSummary?: { finalDecision?: unknown }
 }
 
 /** Only a newly delivered confirmed-collision incident can trigger once. */
@@ -84,15 +85,15 @@ export class DispatcherIncidentAlarmTracker {
   private readonly startedAt: number
   constructor(startedAt = Date.now()) { this.startedAt = startedAt }
 
-  consume(notifications: DispatcherAlarmNotification[], incidents: DispatcherAlarmIncident[]): string[] {
-    const byId = new Map(incidents.map((incident) => [incident.id, incident]))
+  consume(_notifications: DispatcherAlarmNotification[], incidents: DispatcherAlarmIncident[], notBefore = this.startedAt): string[] {
     const fresh: string[] = []
-    for (const notification of notifications) {
-      if (notification.type !== 'NEW_CRASH_REVIEW' || !notification.incidentId) continue
-      const incident = byId.get(notification.incidentId)
-      if (!incident || incident.detectionMode !== 'temporal_collision') continue
-      const createdAt = Date.parse(incident.createdAt ?? notification.createdAt)
-      if (!Number.isFinite(createdAt) || createdAt < this.startedAt) continue
+    // The committed incident is authoritative even if notification delivery is
+    // delayed or the two polling snapshots straddle its creation transaction.
+    for (const incident of incidents) {
+      if (incident.detectionMode !== 'temporal_collision' ||
+          incident.evidenceSummary?.finalDecision != null && incident.evidenceSummary.finalDecision !== 'confirmed_crash') continue
+      const createdAt = Date.parse(incident.createdAt ?? '')
+      if (!Number.isFinite(createdAt) || createdAt < Math.max(this.startedAt, notBefore)) continue
       if (this.seen.has(incident.id)) continue
       this.seen.add(incident.id)
       fresh.push(incident.id)

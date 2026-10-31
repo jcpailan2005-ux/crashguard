@@ -26,6 +26,7 @@ import {
   subscribeCameraBoxes,
 } from '@/lib/api-client'
 import type { CctvCamera, LiveBoxView } from '@/lib/types'
+import { cameraCollisionResult } from '@/lib/camera-collision-state'
 
 type CameraFilter = 'all' | 'cctv' | 'usb'
 
@@ -48,7 +49,7 @@ function cameraHealth(camera: CctvCamera, status?: CameraMonitoringStatus) {
 }
 
 function collisionStatus(status?: CameraMonitoringStatus) {
-  const result = status?.latestResult
+  const result = status ? cameraCollisionResult(status) : null
   if (result?.notificationStatus === 'failed') return 'INCIDENT SAVED - NOTIFICATION RETRY PENDING'
   if (result?.finalDecision === 'confirmed_crash' && (result.incidentCreated || result.incident_created)) {
     return 'INCIDENT SENT'

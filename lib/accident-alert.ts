@@ -64,22 +64,56 @@ export async function playAccidentAlertWithResult(
 }
 
 let armedAudioContext: AudioContext | null = null
+let armedAt: number | null = null
+const armedListeners = new Set<(armed: boolean) => void>()
+export const accidentAlertArmedAt = () => armedAt
+export function subscribeAccidentAlertArmed(listener: (armed: boolean) => void) {
+  armedListeners.add(listener)
+  listener(armedAt !== null)
+  return () => { armedListeners.delete(listener) }
+}
+export function disarmAccidentAlertAudio() {
+  armedAt = null
+  armedListeners.forEach((listener) => listener(false))
+}
 
 /** Call directly from the dispatcher's Arm button to satisfy browser gesture rules. */
-export async function armAccidentAlertAudio(): Promise<boolean> {
-  if (armedAudioContext?.state === 'running') return true
+export async function armAccidentAlertAudio(audio?: HTMLAudioElement | null): Promise<boolean> {
+  // Start both unlock operations in the click stack, before the first await.
+  const mediaReady = audio ? (() => {
+    try {
+      audio.muted = true
+      return audio.play().then(() => {
+        audio.pause()
+        audio.currentTime = 0
+        audio.muted = false
+        return true
+      }, () => { audio.muted = false; return false })
+    } catch {
+      audio.muted = false
+      return Promise.resolve(false)
+    }
+  })() : Promise.resolve(false)
   let ctx: AudioContext | null = null
+  let contextReady = false
   try {
-    ctx = getAudioContext()
-    if (!ctx) return false
-    await ctx.resume()
-    if (ctx.state !== 'running') return false
-    armedAudioContext = ctx
-    return true
+    ctx = armedAudioContext ?? getAudioContext()
+    if (ctx) {
+      await ctx.resume()
+      if (ctx.state === 'running') {
+        armedAudioContext = ctx
+        contextReady = true
+      }
+    }
   } catch {
     if (ctx) void ctx.close()
-    return false
   }
+  const ready = await mediaReady || contextReady
+  if (ready) {
+    armedAt ??= Date.now()
+    armedListeners.forEach((listener) => listener(true))
+  }
+  return ready
 }
 
 function getAudioContext(): AudioContext | null {

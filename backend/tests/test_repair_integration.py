@@ -135,6 +135,33 @@ class ControlledIntegrationTests(unittest.TestCase):
         with connection() as conn:
             self.assertEqual(conn.execute('SELECT stream_reference FROM cameras WHERE id=%s', (camera_id,)).fetchone()['stream_reference'], secret_url)
 
+    def test_exact_evidence_survives_persistence_api_and_later_event_merge(self):
+        payload = self.payload()
+        source = dict(cameraId=payload['camera_id'], sessionId='EXACT-SESSION', sequence=11,
+                      capturedAt=1000., capturedMonotonic=500., width=1920, height=1080)
+        boxes = [dict(label='car', classId=2, confidence=.96, trackId=7, x=192., y=108.,
+                      width=384., height=216., cameraId=source['cameraId'], sessionId='EXACT-SESSION', sequence=11)]
+        payload.update(boxes=boxes, key_frame_url='/outputs/exact-raw.jpg', annotated_url='/outputs/exact-boxes.jpg',
+            temporal_evidence=dict(sourceFrame=source, trackingSessionId='EXACT-SESSION',
+                                   temporalCrashVerified=True, involvedTrackIds=[7, 8]))
+        result = app.persist_sqlite_crash_case(**payload)
+        incident_id = result['incidentId']
+        # Later verified contacts may add participants, never replace pixels/boxes.
+        later = {**payload['temporal_evidence'], 'sourceFrame': {**source, 'sequence': 12},
+                 'involvedTrackIds': [7, 8, 9], 'boxes': [{**boxes[0], 'x': 999., 'sequence': 12}]}
+        service.retry_ai_incident_notifications(payload['detector_event_id'], later)
+        with patch.object(app.model, 'predict', side_effect=AssertionError('Evidence reads cannot infer')):
+            response = self.clients['DISPATCHER'].get(f'/api/v3/incidents/{incident_id}')
+            self.assertEqual(response.status_code, 200, response.text)
+            incident = response.json()['incident']
+            listing = self.clients['DISPATCHER'].get('/api/v3/incidents').json()['incidents']
+        evidence = incident['evidence_summary']
+        self.assertEqual(evidence['sourceFrame'], source)
+        self.assertEqual(evidence['boxes'], boxes)
+        self.assertEqual(evidence['involvedTrackIds'], [7, 8, 9])
+        self.assertEqual(incident['media']['keyFramePath'], '/outputs/exact-raw.jpg')
+        self.assertEqual(next(row for row in listing if row['id'] == incident_id)['evidence_summary']['boxes'], boxes)
+
     def test_z_camera_ticket_uses_sqlite_session_and_revokes_on_logout(self):
         admin = self.clients['ADMIN']
         token = admin.cookies.get('crashguard_session')

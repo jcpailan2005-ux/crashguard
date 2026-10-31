@@ -43,3 +43,12 @@ test('unarmed, old, aftermath, decline, and analyzing fixtures make no play atte
   await analyzing.pending
   assert.deepEqual(played, [])
 })
+
+test('arming never backfills an incident committed while unarmed but delivered later', async () => {
+  const tracker = new DispatcherIncidentAlarmTracker(started)
+  const played: string[] = []
+  const result = enqueueFreshDispatcherAlarms(tracker, [], [incident('PRE-ARM')], true,
+    Promise.resolve(), async id => { played.push(id) }, started + 2000)
+  await result.pending
+  assert.deepEqual(played, [])
+})

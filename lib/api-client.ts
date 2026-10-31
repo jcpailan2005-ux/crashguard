@@ -20,6 +20,9 @@ import {
 import { APP_CONFIG } from '@/lib/app-config'
 import { fetchWithBackendTimeout } from '@/lib/backend-fetch'
 import { acceptLiveBoxPacket, cameraAnalysisPacketUrl, createLiveBoxCursor } from '@/lib/camera-analysis-view'
+import { CameraStatusTracker, type CollisionConfirmation } from '@/lib/camera-collision-state'
+
+const cameraStatusTracker = new CameraStatusTracker()
 
 export const BACKEND_URL = APP_CONFIG.backendUrl
 const USE_MOCK_DATA = APP_CONFIG.useMockData
@@ -116,6 +119,10 @@ function normalizeCameraMonitoringStatus(
     latestResult: status.latestResult
       ? normalizeDetectionResponse(status.latestResult)
       : status.latestResult,
+    collisionConfirmation: status.collisionConfirmation ? {
+      ...status.collisionConfirmation,
+      result: normalizeDetectionResponse(status.collisionConfirmation.result),
+    } : status.collisionConfirmation,
   }
 }
 
@@ -585,6 +592,7 @@ export async function testCameraConnection(
 }
 
 export interface CameraMonitoringStatus {
+  collisionConfirmation?: CollisionConfirmation | null
   latestFrameIdentity?: LiveFrameIdentity | null
   sourceReportedFps?: number | null
   modelProcessingMs?: number | null
@@ -676,7 +684,7 @@ export async function getCameraMonitoringStatus(
   const status = await apiCall<CameraMonitoringStatus>(
     `/api/cameras/${encodeURIComponent(cameraIdOrIp.trim())}/status`
   )
-  return normalizeCameraMonitoringStatus(status)
+  return cameraStatusTracker.accept(cameraIdOrIp.trim(), normalizeCameraMonitoringStatus(status))
 }
 
 export function getCameraPreviewFrameUrl(cameraIp: string): string {
@@ -859,7 +867,7 @@ export async function startCctvMonitoring(cameraId: string): Promise<CameraMonit
     `/api/cameras/${encodeURIComponent(cameraId)}/monitor/start`,
     { method: 'POST' }
   )
-  return normalizeCameraMonitoringStatus(status)
+  return cameraStatusTracker.accept(cameraId, normalizeCameraMonitoringStatus(status))
 }
 
 export async function stopCctvMonitoring(cameraId: string): Promise<{ ok: boolean; cameraId: string; status: string }> {

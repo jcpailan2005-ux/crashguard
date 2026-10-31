@@ -46,8 +46,9 @@ import {
   type CameraMonitoringStatus,
 } from '@/lib/api-client'
 import { liveAlarmTracker } from '@/lib/incident-alarm-contract'
+import { cameraCollisionResult } from '@/lib/camera-collision-state'
 import { canManageCamera, isProtectedCamera } from '@/lib/camera-management-permissions'
-import { playAccidentAlert } from '@/lib/accident-alert'
+import { accidentAlertArmedAt, playAccidentAlert } from '@/lib/accident-alert'
 import { useDisplayMode } from '@/lib/display-mode'
 import { CctvCamera, DetectionResponse } from '@/lib/types'
 
@@ -316,7 +317,7 @@ function cameraSourceType(camera: CctvCamera) {
 }
 
 function collisionStatus(status?: CameraMonitoringStatus) {
-  const result = status?.latestResult
+  const result = status ? cameraCollisionResult(status) : null
   const decision = result?.finalDecision
   if (decision === 'confirmed_crash' && (result?.incidentCreated || result?.incident_created)) return 'INCIDENT SENT'
   if (decision === 'confirmed_crash') return 'CONFIRMED CRASH'
@@ -671,7 +672,7 @@ export function CctvMonitorWorkspace({ managementMode = false, initialCameraId }
 
     pairs.forEach(([cameraId, status]) => {
       if (cameraId !== activeCamera?.cameraId && status.latestResult &&
-          liveAlarmTracker.consume(status.latestResult) && alarmAudioEnabled && normalizedRole !== 'dispatcher') {
+          liveAlarmTracker.consume(status.latestResult) && alarmAudioEnabled && accidentAlertArmedAt() !== null && normalizedRole !== 'dispatcher') {
         void playAccidentAlert(workspaceAudioRef.current, 1, { beepRepeats: 3 }).catch(() => {
           setCameraError('Browser alarm audio was blocked. Arm sound in Live Monitor or dispatcher alerts.')
         })
@@ -1115,7 +1116,8 @@ export function CctvMonitorWorkspace({ managementMode = false, initialCameraId }
                     )
                   }
 
-                  const status = cameraStatuses[camera.cameraId]
+                  const rawStatus = cameraStatuses[camera.cameraId]
+                  const status = rawStatus ? { ...rawStatus, latestResult: cameraCollisionResult(rawStatus) } : undefined
                   const badges = cameraStatusBadges(status, camera)
                   const selected = activeCamera?.cameraId === camera.cameraId
                   const previewUrl = cameraPreviewUrls[camera.cameraId]

@@ -31,6 +31,7 @@ import {
 } from 'lucide-react'
 
 import { useAuth } from '@/components/auth-provider'
+import { OperationalIncidentEvidence } from '@/components/operational-incident-evidence'
 import { PageHeading } from '@/components/page-heading'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -616,6 +617,7 @@ export default function ReviewQueuePage() {
                   </div>
 
                   {/* Incident AI Evidence Gauge & Details Grid */}
+                  <OperationalIncidentEvidence incident={incident} />
                   <div className="grid gap-3 sm:grid-cols-3 text-xs">
                     <div className="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-1.5">
                       <span className="text-muted-foreground font-medium block">AI Verification Score</span>
