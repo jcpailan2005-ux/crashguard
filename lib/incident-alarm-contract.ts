@@ -42,9 +42,7 @@ export class LiveAlarmTracker {
       this.seen.add(id)
       return false
     }
-    const alarmWorthy = isCurrentCrashConfirmed(result) ||
-      (result.finalDecision === 'possible_crash_aftermath' && result.caseCreated === true)
-    if (!created || !alarmWorthy) return false
+    if (!created || !isCurrentCrashConfirmed(result)) return false
     this.seen.add(id)
     return true
   }
@@ -81,7 +79,7 @@ export interface DispatcherAlarmIncident {
   evidenceSummary?: { finalDecision?: unknown }
 }
 
-/** Only a newly delivered confirmed collision or saved crash aftermath can trigger once. */
+/** Only a newly delivered confirmed-collision incident can trigger once. */
 export class DispatcherIncidentAlarmTracker {
   private seen = new Set<string>()
   private readonly startedAt: number
@@ -91,15 +89,9 @@ export class DispatcherIncidentAlarmTracker {
     const fresh: string[] = []
     // The committed incident is authoritative even if notification delivery is
     // delayed or the two polling snapshots straddle its creation transaction.
-    // Persistent, high-confidence aftermath reviews also require an immediate
-    // dispatcher response, even though impact was not observed on camera.
     for (const incident of incidents) {
-      const decision = incident.evidenceSummary?.finalDecision
-      const confirmedCollision = incident.detectionMode === 'temporal_collision' &&
-        (decision == null || decision === 'confirmed_crash')
-      const crashAftermath = incident.detectionMode === 'aftermath_review' &&
-        decision === 'possible_crash_aftermath'
-      if (!confirmedCollision && !crashAftermath) continue
+      if (incident.detectionMode !== 'temporal_collision' ||
+          incident.evidenceSummary?.finalDecision != null && incident.evidenceSummary.finalDecision !== 'confirmed_crash') continue
       const createdAt = Date.parse(incident.createdAt ?? '')
       if (!Number.isFinite(createdAt) || createdAt < Math.max(this.startedAt, notBefore)) continue
       if (this.seen.has(incident.id)) continue

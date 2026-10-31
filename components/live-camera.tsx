@@ -963,16 +963,14 @@ export function LiveCamera({
 
     if (isCurrentCrashConfirmed(result)) showCrashAlert(displayResult)
 
-    if (result.finalDecision === 'possible_crash_aftermath' && result.caseCreated && !result.existingCase) {
-      showCrashAlert(displayResult)
-    }
-
     if (liveAlarmTracker.consume(result)) {
       if (alarmAudioEnabled && accidentAlertArmedAt() !== null && profile?.role !== 'dispatcher') {
         void playAccidentAlert(audioRef.current, alertVolume, { beepRepeats: 3 }).catch(
           () => setAlarmAudioError('Browser alarm audio was blocked. Click Arm Alarm Sound to enable it.')
         )
       }
+    } else if (result.finalDecision === 'possible_crash_aftermath' && result.caseCreated && !result.existingCase) {
+      showCrashAlert(displayResult)
     }
 
     return surfacedResult

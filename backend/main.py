@@ -19,7 +19,6 @@ import threading
 import time
 import sqlite3
 import uuid
-from types import SimpleNamespace
 
 import cv2
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
@@ -783,20 +782,17 @@ def classify_collision_pair_regions(
     frame_h, frame_w = frame.shape[:2]
     pairs = select_plausible_pairs(boxes, frame_width=frame_w, frame_height=frame_h)
     pair_region_score = None
-    pair_region_non_accident_score = None
     if pairs:
         best_pair = pairs[0]
         region = build_pair_region(frame, best_pair)
         if region.valid and region.crop is not None:
             res = classify_crash_frame(region.crop)
             pair_region_score = float(res.get("accidentProbability") or 0.0)
-            pair_region_non_accident_score = float(res.get("nonAccidentProbability") or 0.0)
 
     visual_evidence_score = supporting_visual_evidence(full_frame_score, pair_region_score)
     return {
         "fullFrameCrashScore": full_frame_score,
         "pairRegionCrashScore": pair_region_score,
-        "pairRegionNonAccidentScore": pair_region_non_accident_score,
         "visualEvidenceScore": visual_evidence_score,
         "accident_detected": False,
     }
@@ -3040,8 +3036,6 @@ class LiveCameraMonitor:
         accident_probability = normalize_confidence_fraction(
             classifier_result.get("accidentProbability", classifier_result.get("crashConfidence"))
         )
-        full_frame_accident_probability = accident_probability
-        pair_region_accident_probability = None
         non_accident_probability = normalize_confidence_fraction(
             classifier_result.get("nonAccidentProbability")
         )
@@ -3055,36 +3049,6 @@ class LiveCameraMonitor:
             collision_vehicle_boxes(all_resized_vehicle_boxes),
             detection_frame,
         )
-        # A crash shown inside a phone/display can be diluted by the surrounding
-        # room in the full camera frame. Reclassify only the bounded crop around
-        # one plausible, trusted vehicle pair and use the stronger accident
-        # probability as supporting live evidence. Temporal motion verification
-        # still owns confirmed-crash decisions; static aftermath still requires
-        # the existing persistence and quality gates.
-        if len(resized_vehicle_boxes) >= 2:
-            trusted_pair_boxes = [
-                {**box, "detectionState": "TRUSTED"}
-                for box in resized_vehicle_boxes
-            ]
-            pair_classifier_result = classify_collision_pair_regions(
-                detection_frame,
-                SimpleNamespace(tracker_input=trusted_pair_boxes),
-                full_frame_score=full_frame_accident_probability,
-                camera_id=self.frame_camera_id,
-            )
-            raw_pair_score = pair_classifier_result.get("pairRegionCrashScore")
-            if raw_pair_score is not None:
-                pair_region_accident_probability = normalize_confidence_fraction(raw_pair_score)
-                if pair_region_accident_probability > accident_probability:
-                    accident_probability = pair_region_accident_probability
-                    confidence = pair_region_accident_probability
-                    non_accident_probability = normalize_confidence_fraction(
-                        pair_classifier_result.get("pairRegionNonAccidentScore")
-                    )
-                    crash_class = "accident"
-                    predicted_class = "accident"
-                    predicted_class_confidence = pair_region_accident_probability
-        crash_suspected = confidence >= CRASH_UI_CONFIDENCE_THRESHOLD
         live_collision_diagnostics.emit('roi', all_resized_vehicle_boxes, resized_vehicle_boxes)
         person_count = count_labels_from_results(
             results,
@@ -3200,8 +3164,6 @@ class LiveCameraMonitor:
             "crashScore": confidence,
             "crashScorePercent": round(confidence * 100, 1),
             "accidentProbability": accident_probability,
-            "fullFrameAccidentProbability": full_frame_accident_probability,
-            "pairRegionAccidentProbability": pair_region_accident_probability,
             "nonAccidentProbability": non_accident_probability,
             "predictedClass": predicted_class,
             "predictedClassConfidence": predicted_class_confidence,
