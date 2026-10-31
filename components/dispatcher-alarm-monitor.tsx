@@ -93,7 +93,7 @@ export function DispatcherAlarmMonitor() {
           setCollisionIncidentId(delivery.eligible[delivery.eligible.length - 1])
         }
         if (!armedRef.current && delivery.eligible.length > 0) {
-          setError('A new confirmed incident arrived while the siren was unarmed. Arm the siren for future incidents.')
+          setError('A new crash review arrived while the siren was unarmed. Arm the siren for future incidents.')
         }
       } catch {
         if (!stopped) setError('Dispatcher alarm feed is unavailable. Retrying automatically.')
@@ -139,7 +139,7 @@ export function DispatcherAlarmMonitor() {
       {collisionIncidentId ? (
         <div role="alert" className="fixed right-4 top-20 z-50 flex items-center gap-3 rounded-lg border border-red-500 bg-red-950 p-4 text-white shadow-lg">
           <Link href={`/dispatcher/review?incident=${encodeURIComponent(collisionIncidentId)}`} className="font-semibold underline">
-            Collision Detected — Review Incident
+            Crash Alert — Review Incident
           </Link>
           <Button type="button" variant="secondary" size="sm" onClick={() => setCollisionIncidentId(null)}>Dismiss</Button>
         </div>
