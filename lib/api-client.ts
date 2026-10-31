@@ -722,10 +722,7 @@ export function subscribeCameraBoxes(
     inFlight = true
     controller = new AbortController()
     const requestController = controller
-    // Live inference can take close to a second on CPU. Leave room for JPEG
-    // encoding and transfer of the base64 analysis packet before declaring
-    // the backend unreachable.
-    const timeout = setTimeout(() => requestController.abort(), 5000)
+    const timeout = setTimeout(() => requestController.abort(), 2000)
     const started = performance.now()
     try {
       const response = await fetch(cameraAnalysisPacketUrl(NORMALIZED_BACKEND_URL, cameraId, eventsUrl), {
@@ -753,12 +750,10 @@ export function subscribeCameraBoxes(
         fallback = true
         reportIssue?.('Detection frame expired in transit. Retrying automatically.')
       }
-    } catch (error) {
+    } catch {
       fallback = true
       if (!stopped) {
-        reportIssue?.(error instanceof DOMException && error.name === 'AbortError'
-          ? 'Backend analysis frame request timed out. Retrying automatically.'
-          : 'Detection frames could not be received. Check the backend connection.')
+        reportIssue?.('Detection frames could not be received. Check the backend connection.')
         receive(null)
       }
     } finally {
